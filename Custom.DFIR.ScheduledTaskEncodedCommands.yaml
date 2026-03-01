@@ -1,0 +1,134 @@
+name: Custom.DFIR.ScheduledTaskEncodedCommands
+description: |
+  Hunt for scheduled tasks created or modified via schtasks.exe that include
+  encoded or obfuscated command-line arguments (e.g., Base64-encoded payloads,
+  PowerShell -EncodedCommand, cmd /c with caret obfuscation).
+
+  Adversaries abuse Windows Task Scheduler (T1053.005) to establish persistence
+  or execute payloads. A strong indicator of malice is the use of encoded
+  commands passed to PowerShell or cmd.exe within the task action.
+
+  This artifact:
+  - Enumerates all scheduled task XML files under C:/Windows/System32/Tasks
+  - Extracts task name, author, registration time, action command, and arguments
+  - Flags entries whose arguments match an encoded-command pattern
+  - Optionally uploads matching task XML files for deeper analysis
+
+  author: Yaniv Radunsky @ tenroot & Hohit (AI)
+
+reference:
+  - https://attack.mitre.org/techniques/T1053.005/
+  - https://docs.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema
+
+type: CLIENT
+
+parameters:
+  - name: TaskGlob
+    type: glob
+    default: "C:/Windows/System32/Tasks/**"
+    description: Glob pattern to locate scheduled task XML files.
+
+  - name: EncodedCmdRegex
+    type: regex
+    default: "(?i)(-EncodedCommand|-enc|-ec|FromBase64String|cmd\\.exe.*/c.*\\^|powershell.*-[eE][nN][cC])"
+    description: Regex to flag encoded or obfuscated command patterns.
+
+  - name: AuthorFilterRegex
+    type: regex
+    default: "."
+    description: Optional regex to restrict results to a specific task author.
+
+  - name: UploadFiles
+    type: bool
+    default: false
+    description: If true, upload the raw task XML files that match.
+
+sources:
+  - name: EncodedScheduledTasks
+    description: Scheduled tasks with encoded or obfuscated command arguments.
+    query: |
+      LET TaskFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=TaskGlob)
+        WHERE NOT IsDir
+
+      LET ParsedTasks = SELECT
+          OSPath,
+          Mtime,
+          Size,
+          parse_xml(file=OSPath) AS XML
+        FROM TaskFiles
+
+      LET FlatTasks = SELECT
+          OSPath,
+          Mtime,
+          XML.Task.RegistrationInfo.Date    AS RegisteredTime,
+          XML.Task.RegistrationInfo.Author  AS Author,
+          XML.Task.RegistrationInfo.Description AS TaskDescription,
+          XML.Task.Actions.Exec.Command     AS Command,
+          XML.Task.Actions.Exec.Arguments   AS Arguments,
+          XML.Task.Triggers                 AS Triggers,
+          XML.Task.Principals.Principal.UserId AS RunAsUser
+        FROM ParsedTasks
+        WHERE XML.Task.Actions.Exec.Command != NULL
+
+      LET Flagged = SELECT *
+        FROM FlatTasks
+        WHERE Arguments =~ EncodedCmdRegex
+          AND Author     =~ AuthorFilterRegex
+
+      SELECT
+          OSPath                              AS TaskFile,
+          timestamp(string=RegisteredTime)    AS RegisteredTime,
+          Author,
+          TaskDescription,
+          RunAsUser,
+          Command,
+          Arguments,
+          Mtime
+        FROM Flagged
+
+  - name: UploadedTaskFiles
+    description: Raw XML uploads for flagged tasks (only when UploadFiles=true).
+    query: |
+      LET TaskFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=TaskGlob)
+        WHERE NOT IsDir
+
+      LET ParsedTasks = SELECT
+          OSPath,
+          parse_xml(file=OSPath) AS XML
+        FROM TaskFiles
+
+      LET FlatTasks = SELECT
+          OSPath,
+          XML.Task.RegistrationInfo.Author AS Author,
+          XML.Task.Actions.Exec.Arguments  AS Arguments
+        FROM ParsedTasks
+        WHERE XML.Task.Actions.Exec.Command != NULL
+
+      LET Flagged = SELECT OSPath
+        FROM FlatTasks
+        WHERE Arguments =~ EncodedCmdRegex
+          AND Author     =~ AuthorFilterRegex
+
+      SELECT * FROM if(
+        condition=UploadFiles,
+        then={
+          SELECT
+              OSPath,
+              upload(file=OSPath) AS Upload
+            FROM Flagged
+        },
+        else={
+          SELECT OSPath, "UploadFiles not enabled" AS Upload
+          FROM Flagged
+          WHERE FALSE
+        })
+
+column_types:
+  - name: RegisteredTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: TaskFile
+    type: path

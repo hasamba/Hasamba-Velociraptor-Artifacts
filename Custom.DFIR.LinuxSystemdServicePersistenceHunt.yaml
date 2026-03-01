@@ -1,0 +1,117 @@
+name: Custom.DFIR.LinuxSystemdServicePersistenceHunt
+description: |
+  Hunt for potential attacker-installed systemd service persistence on Linux endpoints.
+
+  This artifact enumerates common systemd unit locations, parses service unit content,
+  applies regex-based suspicious content matching, and highlights recently modified units.
+  It supports optional file upload for deeper triage.
+
+  author: Yaniv Radunsky @ tenroot & Hohit (AI)
+reference:
+  - https://attack.mitre.org/techniques/T1543/002/
+  - https://www.freedesktop.org/software/systemd/man/systemd.service.html
+type: CLIENT
+parameters:
+  - name: UnitGlobs
+    description: Systemd unit file globs to inspect
+    type: glob
+    default: '["/etc/systemd/system/*.service","/etc/systemd/system/**/*.service","/usr/lib/systemd/system/*.service","/lib/systemd/system/*.service","/run/systemd/system/*.service","/home/*/.config/systemd/user/*.service","/home/*/.config/systemd/user/**/*.service"]'
+  - name: SuspiciousRegex
+    description: Regex for suspicious ExecStart/content patterns
+    type: regex
+    default: "(?i)(curl\\s+|wget\\s+|bash\\s+-c|sh\\s+-c|python\\s+-c|perl\\s+-e|nc\\s+|ncat\\s+|socat\\s+|/tmp/|/dev/shm/|base64\\s+-d|systemctl\\s+enable)"
+  - name: ServiceNameRegex
+    description: Regex to filter service file names
+    type: regex
+    default: "."
+  - name: ModifiedWithinDays
+    description: Return units modified within this many days (0 disables time filter)
+    type: int
+    default: 30
+  - name: MaxReadBytes
+    description: Maximum bytes to read from each unit file
+    type: int
+    default: 65536
+  - name: UploadMatching
+    description: Upload matching unit files
+    type: bool
+    default: "N"
+sources:
+  - name: SuspiciousSystemdUnits
+    description: Suspicious or recently modified systemd service units
+    query: |
+      LET Units <= SELECT OSPath, Size, Mtime, Ctime, Atime, Btime, Mode
+      FROM glob(globs=UnitGlobs)
+      WHERE Size > 0 AND OSPath =~ ServiceNameRegex
+
+      LET Parsed <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Ctime,
+          Atime,
+          Btime,
+          Mode,
+          read_file(filename=OSPath, length=MaxReadBytes) AS Content
+      FROM Units
+
+      LET Flagged <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Ctime,
+          Atime,
+          Btime,
+          Mode,
+          hash(path=OSPath, hashselect="MD5,SHA1,SHA256") AS Hash,
+          Content
+      FROM Parsed
+      WHERE
+        Content =~ SuspiciousRegex OR
+        (ModifiedWithinDays > 0 AND Mtime > timestamp(epoch=now() - (ModifiedWithinDays * 86400))) OR
+        OSPath =~ "(?i)(/etc/systemd/system/|/run/systemd/system/|/home/.*/\\.config/systemd/user/)"
+
+      SELECT * FROM if(
+        condition=UploadMatching,
+        then={
+          SELECT
+            OSPath,
+            Size,
+            Mtime,
+            Ctime,
+            Atime,
+            Btime,
+            Mode,
+            Hash,
+            upload(file=OSPath) AS Upload,
+            Content
+          FROM Flagged
+        },
+        else={
+          SELECT
+            OSPath,
+            Size,
+            Mtime,
+            Ctime,
+            Atime,
+            Btime,
+            Mode,
+            Hash,
+            Content
+          FROM Flagged
+        })
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Size
+    type: mb
+  - name: Hash
+    type: hash

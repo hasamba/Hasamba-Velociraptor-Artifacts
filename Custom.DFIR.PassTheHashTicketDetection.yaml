@@ -1,0 +1,220 @@
+name: Custom.DFIR.PassTheHashTicketDetection
+description: |
+  Detects potential Pass-the-Hash (PtH) and Pass-the-Ticket (PtT) lateral movement
+  by hunting Windows Security Event ID 4624 Logon Type 3 (Network Logon) entries with
+  indicators of credential reuse attacks.
+
+  Pass-the-Hash indicators (MITRE T1550.002):
+  - Logon Type 3 with NTLM authentication (NtLmSsp)
+  - KeyLength = 0 (hash used instead of password)
+  - Blank or null WorkstationName combined with NTLM
+  - AuthenticationPackageName = NTLM
+
+  Pass-the-Ticket indicators:
+  - Logon Type 3 with Kerberos auth and anomalous source IP
+  - TargetUserName is a privileged account
+
+  Correlates events across all collected Security.evtx files and filters by
+  optional regex on subject/target account names or source IPs.
+
+  author: Yaniv Radunsky @ tenroot & Hohit (AI)
+
+reference:
+  - https://attack.mitre.org/techniques/T1550.002/
+  - https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=4624
+  - https://stealthbits.com/blog/passing-the-hash-with-mimikatz/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityEvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+    description: Glob pattern for Security event log files
+
+  - name: AccountFilterRegex
+    type: regex
+    default: "."
+    description: Regex filter on TargetUserName (default matches all)
+
+  - name: SourceIPFilterRegex
+    type: regex
+    default: "."
+    description: Regex filter on source IP address (default matches all)
+
+  - name: ExcludeLocalhost
+    type: bool
+    default: "Y"
+    description: Exclude loopback/localhost source addresses (127.0.0.1, ::1)
+
+  - name: OnlyNTLM
+    type: bool
+    default: "N"
+    description: When true, only return NTLM-authenticated events (strongest PtH signal)
+
+  - name: MaxEvents
+    type: int
+    default: "5000"
+    description: Maximum number of raw 4624/Type3 events to examine
+
+sources:
+  - name: PassTheHashCandidates
+    description: |
+      Network logon events (4624 Type 3) with Pass-the-Hash indicators:
+      NTLM auth package, KeyLength=0, or suspicious patterns.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET RawEvents <= SELECT *
+      FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Computer AS ComputerName,
+            EventData.SubjectUserName AS SubjectUserName,
+            EventData.SubjectDomainName AS SubjectDomain,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.TargetDomainName AS TargetDomain,
+            EventData.LogonType AS LogonType,
+            EventData.LogonProcessName AS LogonProcess,
+            EventData.AuthenticationPackageName AS AuthPackage,
+            EventData.WorkstationName AS WorkstationName,
+            EventData.IpAddress AS SourceIP,
+            EventData.IpPort AS SourcePort,
+            EventData.KeyLength AS KeyLength,
+            EventData.ElevatedToken AS ElevatedToken,
+            OSPath AS SourceFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4624
+            AND EventData.LogonType = "3"
+        })
+
+      LET Filtered <= SELECT *
+      FROM RawEvents
+      WHERE TargetUserName =~ AccountFilterRegex
+        AND SourceIP =~ SourceIPFilterRegex
+        AND if(condition=ExcludeLocalhost,
+               then=NOT (SourceIP = "127.0.0.1" OR SourceIP = "::1" OR SourceIP = "-"),
+               else=TRUE)
+        AND if(condition=OnlyNTLM,
+               then=AuthPackage =~ "(?i)NTLM",
+               else=TRUE)
+        AND NOT TargetUserName =~ "(?i)ANONYMOUS LOGON"
+
+      LET PtHCandidates <= SELECT
+        EventTime,
+        ComputerName,
+        SubjectUserName,
+        SubjectDomain,
+        TargetUserName,
+        TargetDomain,
+        LogonType,
+        LogonProcess,
+        AuthPackage,
+        WorkstationName,
+        SourceIP,
+        SourcePort,
+        KeyLength,
+        ElevatedToken,
+        SourceFile,
+        if(condition=AuthPackage =~ "(?i)NTLM" AND KeyLength = "0",
+           then="HIGH - NTLM + KeyLength=0 (classic PtH)",
+           else=if(condition=AuthPackage =~ "(?i)NTLM" AND (WorkstationName = "-" OR WorkstationName = ""),
+                   then="MEDIUM - NTLM + blank workstation",
+                   else=if(condition=AuthPackage =~ "(?i)NTLM",
+                           then="LOW - NTLM network logon",
+                           else="INFO - Non-NTLM network logon"))) AS RiskScore
+      FROM Filtered
+      LIMIT 5000
+
+      SELECT *
+      FROM PtHCandidates
+      ORDER BY EventTime DESC
+
+  - name: PassTheTicketCandidates
+    description: |
+      Network logon events (4624 Type 3) with Kerberos auth from external/unexpected
+      source IPs — potential Pass-the-Ticket activity.
+    query: |
+      LET EvtxFiles2 <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET KerbEvents <= SELECT *
+      FROM foreach(
+        row=EvtxFiles2,
+        query={
+          SELECT
+            timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+            System.Computer AS ComputerName,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.TargetDomainName AS TargetDomain,
+            EventData.LogonProcessName AS LogonProcess,
+            EventData.AuthenticationPackageName AS AuthPackage,
+            EventData.WorkstationName AS WorkstationName,
+            EventData.IpAddress AS SourceIP,
+            EventData.IpPort AS SourcePort,
+            EventData.TransmittedServices AS TransmittedServices,
+            EventData.ElevatedToken AS ElevatedToken,
+            OSPath AS SourceFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4624
+            AND EventData.LogonType = "3"
+            AND EventData.AuthenticationPackageName =~ "(?i)Kerberos"
+        })
+
+      SELECT
+        EventTime,
+        ComputerName,
+        TargetUserName,
+        TargetDomain,
+        LogonProcess,
+        AuthPackage,
+        WorkstationName,
+        SourceIP,
+        SourcePort,
+        TransmittedServices,
+        ElevatedToken,
+        SourceFile,
+        "Kerberos Type3 - Review for PtT" AS Note
+      FROM KerbEvents
+      WHERE TargetUserName =~ AccountFilterRegex
+        AND SourceIP =~ SourceIPFilterRegex
+        AND if(condition=ExcludeLocalhost,
+               then=NOT (SourceIP = "127.0.0.1" OR SourceIP = "::1" OR SourceIP = "-"),
+               else=TRUE)
+        AND NOT TargetUserName =~ "(?i)ANONYMOUS LOGON"
+      ORDER BY EventTime DESC
+      LIMIT 5000
+
+  - name: EventSummary
+    description: Statistical summary of 4624/Type3 events grouped by auth package and risk.
+    query: |
+      LET EvtxFiles3 <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET AllType3 <= SELECT *
+      FROM foreach(
+        row=EvtxFiles3,
+        query={
+          SELECT
+            EventData.AuthenticationPackageName AS AuthPackage,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.IpAddress AS SourceIP,
+            EventData.KeyLength AS KeyLength
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4624
+            AND EventData.LogonType = "3"
+        })
+
+      SELECT
+        AuthPackage,
+        count() AS EventCount,
+        count(items={ SELECT TargetUserName FROM AllType3 WHERE KeyLength = "0" }) AS KeyLength0Count
+      FROM AllType3
+      GROUP BY AuthPackage
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: SourceFile
+    type: preview_upload
