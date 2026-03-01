@@ -14,7 +14,7 @@ description: |
   - Flags entries whose arguments match an encoded-command pattern
   - Optionally uploads matching task XML files for deeper analysis
 
-  author: Yaniv Radunsky @ tenroot & Hohit (AI)
+  authors: Yaniv Radunsky @ tenroot & Hohit (AI)
 
 reference:
   - https://attack.mitre.org/techniques/T1053.005/

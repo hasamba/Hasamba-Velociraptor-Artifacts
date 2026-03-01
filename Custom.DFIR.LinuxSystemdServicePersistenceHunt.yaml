@@ -6,7 +6,7 @@ description: |
   applies regex-based suspicious content matching, and highlights recently modified units.
   It supports optional file upload for deeper triage.
 
-  author: Yaniv Radunsky @ tenroot & Hohit (AI)
+  authors: Yaniv Radunsky @ tenroot & Hohit (AI)
 reference:
   - https://attack.mitre.org/techniques/T1543/002/
   - https://www.freedesktop.org/software/systemd/man/systemd.service.html

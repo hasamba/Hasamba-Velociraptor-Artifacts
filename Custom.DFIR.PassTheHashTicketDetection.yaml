@@ -17,7 +17,7 @@ description: |
   Correlates events across all collected Security.evtx files and filters by
   optional regex on subject/target account names or source IPs.
 
-  author: Yaniv Radunsky @ tenroot & Hohit (AI)
+  authors: Yaniv Radunsky @ tenroot & Hohit (AI)
 
 reference:
   - https://attack.mitre.org/techniques/T1550.002/
