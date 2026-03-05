@@ -45,11 +45,11 @@ jobs:
                       if not data or field not in data:
                           errors.append(f"{filepath}: missing required field '{field}'")
 
-                  # MITRE reference check
+                  # MITRE reference check (warning only — not required)
                   content = open(filepath).read()
                   has_mitre = bool(re.search(r'T\d{4}(\.\d{3})?', content))
                   if not has_mitre:
-                      warnings.append(f"{filepath}: no MITRE ATT&CK reference found")
+                      warnings.append(f"{filepath}: no MITRE ATT&CK reference (optional)")
 
                   # Sources must have VQL
                   if data and 'sources' in data:
