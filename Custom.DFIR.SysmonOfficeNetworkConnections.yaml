@@ -1,0 +1,157 @@
+name: Custom.DFIR.SysmonOfficeNetworkConnections
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects suspicious outbound network connections initiated by Microsoft Office applications
+  (Word, Excel, PowerPoint, Outlook, etc.) via Sysmon Event ID 3.
+
+  Office applications making direct network connections — especially to non-Microsoft destinations —
+  can indicate macro-based malware, phishing payloads, or C2 beaconing activity (MITRE T1071).
+
+  This artifact parses the Sysmon Operational event log for Event ID 3 (NetworkConnect),
+  filtering on common Office process names. Results include destination IP, port, and
+  process metadata to support triage and correlation.
+
+reference:
+  - https://attack.mitre.org/techniques/T1071/
+  - https://docs.microsoft.com/en-us/sysinternals/downloads/sysmon
+
+type: CLIENT
+
+parameters:
+  - name: SysmonEvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+    description: Path to Sysmon Operational event log
+
+  - name: OfficeProcessRegex
+    type: regex
+    default: "(?i)(winword|excel|powerpnt|outlook|mspub|msaccess|onenote|teams)\\.exe"
+    description: Regex matching Office process names to filter on
+
+  - name: ExcludeDestinationRegex
+    type: regex
+    default: "(?i)(microsoft\\.com|office\\.com|office365\\.com|live\\.com|windows\\.net|msn\\.com|bing\\.com)"
+    description: Regex of trusted destinations to exclude (set to ^ to include all)
+
+  - name: MinPort
+    type: int
+    default: 1
+    description: Minimum destination port to include
+
+  - name: UploadArtifacts
+    type: bool
+    default: false
+    description: If true, upload the raw EVTX file for deeper analysis
+
+sources:
+  - name: OfficeNetworkConnections
+    description: Network connections from Office applications per Sysmon Event ID 3
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row={ SELECT OSPath FROM EvtxFiles },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 3
+        })
+
+      LET FilteredEvents <= SELECT
+        EventTime,
+        EventData.Image AS ProcessImage,
+        EventData.ProcessId AS ProcessId,
+        EventData.User AS Username,
+        EventData.SourceIp AS SourceIP,
+        EventData.SourcePort AS SourcePort,
+        EventData.DestinationIp AS DestinationIP,
+        EventData.DestinationPort AS DestinationPort,
+        EventData.DestinationHostname AS DestinationHostname,
+        EventData.Protocol AS Protocol,
+        EventData.Initiated AS Initiated
+      FROM RawEvents
+      WHERE ProcessImage =~ OfficeProcessRegex
+        AND int(int=EventData.DestinationPort) >= MinPort
+
+      SELECT
+        EventTime,
+        ProcessImage,
+        ProcessId,
+        Username,
+        SourceIP,
+        SourcePort,
+        DestinationIP,
+        DestinationPort,
+        DestinationHostname,
+        Protocol,
+        Initiated
+      FROM FilteredEvents
+      WHERE NOT DestinationHostname =~ ExcludeDestinationRegex
+
+  - name: SuspiciousSummary
+    description: Summary of unique Office process to destination pairs
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row={ SELECT OSPath FROM EvtxFiles },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 3
+        })
+
+      LET FilteredEvents <= SELECT
+        EventTime,
+        EventData.Image AS ProcessImage,
+        EventData.ProcessId AS ProcessId,
+        EventData.DestinationIp AS DestinationIP,
+        EventData.DestinationPort AS DestinationPort,
+        EventData.DestinationHostname AS DestinationHostname,
+        EventData.User AS Username
+      FROM RawEvents
+      WHERE EventData.Image =~ OfficeProcessRegex
+        AND int(int=EventData.DestinationPort) >= MinPort
+        AND NOT EventData.DestinationHostname =~ ExcludeDestinationRegex
+
+      SELECT
+        ProcessImage,
+        DestinationIP,
+        DestinationPort,
+        DestinationHostname,
+        Username,
+        count() AS ConnectionCount,
+        min(item=EventTime) AS FirstSeen,
+        max(item=EventTime) AS LastSeen
+      FROM FilteredEvents
+      GROUP BY ProcessImage, DestinationIP, DestinationPort
+
+  - name: EvtxUpload
+    description: Upload raw Sysmon EVTX for offline analysis (only if UploadArtifacts=true)
+    query: |
+      SELECT * FROM if(
+        condition=UploadArtifacts,
+        then={
+          SELECT OSPath, upload(file=OSPath) AS Upload
+          FROM glob(globs=SysmonEvtxGlob)
+        },
+        else={
+          SELECT OSPath, "Upload disabled" AS Upload
+          FROM glob(globs=SysmonEvtxGlob)
+        })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp
+  - name: ProcessImage
+    type: preview_upload

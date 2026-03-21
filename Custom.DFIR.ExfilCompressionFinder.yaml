@@ -1,0 +1,34 @@
+name: Custom.DFIR.ExfilCompressionFinder
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Finds evidence of data compressed for exfiltration via zip, tar, or 7z archives in common temporary directories.
+  Focuses on files modified or created recently, which may indicate exfiltration attempts.
+reference:
+  - https://attack.mitre.org/techniques/T1560.001/
+type: CLIENT
+
+parameters:
+  - name: TempGlob
+    type: glob
+    # Covers common temp directories on Windows, Linux, macOS, case-insensitive extensions
+    default: "C:/Users/*/AppData/Local/Temp/*.zip,C:/Users/*/AppData/Local/Temp/*.tar,C:/Users/*/AppData/Local/Temp/*.7z,C:/Users/*/AppData/Local/Temp/*.ZIP,C:/Users/*/AppData/Local/Temp/*.TAR,C:/Users/*/AppData/Local/Temp/*.7Z,C:/Windows/Temp/*.zip,C:/Windows/Temp/*.tar,C:/Windows/Temp/*.7z,C:/Windows/Temp/*.ZIP,C:/Windows/Temp/*.TAR,C:/Windows/Temp/*.7Z,/tmp/*.zip,/tmp/*.tar,/tmp/*.7z,/tmp/*.ZIP,/tmp/*.TAR,/tmp/*.7Z,/var/tmp/*.zip,/var/tmp/*.tar,/var/tmp/*.7z,/var/tmp/*.ZIP,/var/tmp/*.TAR,/var/tmp/*.7Z,~/.cache/*.zip,~/.cache/*.tar,~/.cache/*.7z,~/.cache/*.ZIP,~/.cache/*.TAR,~/.cache/*.7Z,/home/*/Downloads/*.zip,/home/*/Downloads/*.tar,/home/*/Downloads/*.7z,/home/*/Downloads/*.ZIP,/home/*/Downloads/*.TAR,/home/*/Downloads/*.7Z"
+  - name: FilterRegex
+    type: regex
+    default: "" # No default filter, use all found by TempGlob
+
+sources:
+  - name: CompressionArchives
+    query: |
+      LET ArchiveFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=TempGlob)
+      SELECT
+        OSPath,
+        Size,
+        Mtime
+      FROM ArchiveFiles
+      WHERE
+        OSPath =~ FilterRegex AND
+        Size > 0
+
+column_types:
+  - name: Mtime
+    type: timestamp

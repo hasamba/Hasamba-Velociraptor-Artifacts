@@ -1,0 +1,163 @@
+name: Custom.DFIR.RDPLateralMovementDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects RDP lateral movement activity by parsing Windows Security Event Log
+  for events 4624 (successful logon, type 10 = RemoteInteractive), 4648
+  (explicit credential logon), and 4778 (RDP session reconnect).
+
+  Useful for identifying unauthorized lateral movement via Remote Desktop Protocol.
+  Maps to MITRE ATT&CK T1021.001 (Remote Services: Remote Desktop Protocol).
+
+  Correlates source IP, target account, and logon time to surface suspicious
+  RDP activity across the environment.
+
+reference:
+  - https://attack.mitre.org/techniques/T1021.001/
+  - https://docs.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4624
+  - https://docs.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4778
+
+type: CLIENT
+
+parameters:
+  - name: SecurityEvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+    description: Path glob to the Security event log file.
+
+  - name: AccountFilterRegex
+    type: regex
+    default: "."
+    description: Regex filter on target account name (e.g. "Administrator|admin").
+
+  - name: SourceIPFilterRegex
+    type: regex
+    default: "."
+    description: Regex filter on source IP address (e.g. "10\\.0\\.|192\\.168\\.").
+
+  - name: StartTime
+    type: timestamp
+    default: "2000-01-01T00:00:00Z"
+    description: Only include events after this timestamp.
+
+  - name: EndTime
+    type: timestamp
+    default: "2100-01-01T00:00:00Z"
+    description: Only include events before this timestamp.
+
+sources:
+  - name: RDPSuccessfulLogons
+    description: Event 4624 with LogonType 10 — successful RDP logons.
+    query: |
+      LET SecurityLogs <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET RawEvents <= SELECT *
+        FROM foreach(
+          row=SecurityLogs,
+          query={
+            SELECT
+              System.TimeCreated.SystemTime AS EventTime,
+              System.EventID.Value AS EventID,
+              System.Computer AS ComputerName,
+              EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4624
+          })
+
+      SELECT
+        timestamp(epoch=EventTime) AS EventTimestamp,
+        EventID,
+        ComputerName,
+        EventData.TargetUserName AS TargetAccount,
+        EventData.TargetDomainName AS TargetDomain,
+        EventData.LogonType AS LogonType,
+        EventData.IpAddress AS SourceIP,
+        EventData.IpPort AS SourcePort,
+        EventData.WorkstationName AS SourceWorkstation,
+        EventData.LogonProcessName AS LogonProcess,
+        EventData.AuthenticationPackageName AS AuthPackage,
+        EventData.SubjectUserName AS InitiatingUser
+      FROM RawEvents
+      WHERE LogonType = "10"
+        AND TargetAccount =~ AccountFilterRegex
+        AND SourceIP =~ SourceIPFilterRegex
+        AND EventTimestamp >= StartTime
+        AND EventTimestamp <= EndTime
+
+  - name: ExplicitCredentialLogons
+    description: Event 4648 — logon attempted with explicit credentials (credential relay / pass-the-hash indicator).
+    query: |
+      LET SecurityLogs <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET RawEvents4648 <= SELECT *
+        FROM foreach(
+          row=SecurityLogs,
+          query={
+            SELECT
+              System.TimeCreated.SystemTime AS EventTime,
+              System.EventID.Value AS EventID,
+              System.Computer AS ComputerName,
+              EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4648
+          })
+
+      SELECT
+        timestamp(epoch=EventTime) AS EventTimestamp,
+        EventID,
+        ComputerName,
+        EventData.TargetUserName AS TargetAccount,
+        EventData.TargetDomainName AS TargetDomain,
+        EventData.TargetServerName AS TargetServer,
+        EventData.SubjectUserName AS InitiatingUser,
+        EventData.SubjectDomainName AS InitiatingDomain,
+        EventData.IpAddress AS SourceIP,
+        EventData.IpPort AS SourcePort,
+        EventData.ProcessName AS InitiatingProcess
+      FROM RawEvents4648
+      WHERE TargetAccount =~ AccountFilterRegex
+        AND SourceIP =~ SourceIPFilterRegex
+        AND EventTimestamp >= StartTime
+        AND EventTimestamp <= EndTime
+
+  - name: RDPSessionReconnects
+    description: Event 4778 — RDP session was reconnected to an existing Window Station.
+    query: |
+      LET SecurityLogs <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET RawEvents4778 <= SELECT *
+        FROM foreach(
+          row=SecurityLogs,
+          query={
+            SELECT
+              System.TimeCreated.SystemTime AS EventTime,
+              System.EventID.Value AS EventID,
+              System.Computer AS ComputerName,
+              EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4778
+          })
+
+      SELECT
+        timestamp(epoch=EventTime) AS EventTimestamp,
+        EventID,
+        ComputerName,
+        EventData.AccountName AS TargetAccount,
+        EventData.AccountDomain AS TargetDomain,
+        EventData.ClientName AS ClientName,
+        EventData.ClientAddress AS SourceIP,
+        EventData.SessionName AS SessionName
+      FROM RawEvents4778
+      WHERE TargetAccount =~ AccountFilterRegex
+        AND SourceIP =~ SourceIPFilterRegex
+        AND EventTimestamp >= StartTime
+        AND EventTimestamp <= EndTime
+
+column_types:
+  - name: EventTimestamp
+    type: timestamp
+  - name: SourceIP
+    type: string
+  - name: TargetAccount
+    type: string
+  - name: InitiatingProcess
+    type: string

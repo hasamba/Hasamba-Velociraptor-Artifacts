@@ -1,0 +1,51 @@
+name: Custom.DFIR.SuspiciousOfficeNetworkConnections
+description: |
+  Detects suspicious network connections initiated by Office applications
+  using Sysmon Event ID 3. This artifact helps identify potential C2
+  communication or data exfiltration attempts from Office applications.
+
+reference:
+  - https://attack.mitre.org/techniques/T1071/
+  - https://docs.microsoft.com/en-us/sysinternals/downloads/sysmon
+
+type: CLIENT
+
+parameters:
+  - name: SysmonLogGlob
+    description: Path glob to Sysmon event logs
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Sysmon.evtx"
+  - name: OfficeRegex
+    description: Regex to filter Office applications
+    type: regex
+    default: "(?i)winword.exe|excel.exe|powerpnt.exe|outlook.exe"
+  - name: NetworkRegex
+    description: Regex to filter suspicious network connections
+    type: regex
+    default: ".*"
+
+sources:
+  - name: OfficeNetworkConnections
+    description: Detects network connections from Office applications
+    query: |
+      LET SysmonEvents <= SELECT System.TimeCreated.SystemTime AS EventTime,
+                                EventData.Image AS Image,
+                                EventData.DestinationIp AS DestinationIp,
+                                EventData.DestinationPort AS DestinationPort,
+                                EventData.Protocol AS Protocol
+                         FROM parse_evtx(filename=SysmonLogGlob)
+                         WHERE System.EventID.Value = 3
+
+      SELECT EventTime,
+             Image,
+             DestinationIp,
+             DestinationPort,
+             Protocol
+      FROM SysmonEvents
+      WHERE Image =~ OfficeRegex AND DestinationIp =~ NetworkRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: DestinationPort
+    type: int

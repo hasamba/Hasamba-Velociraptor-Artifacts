@@ -1,0 +1,98 @@
+name: Custom.DFIR.NTFSAlternateDataStreams
+description: |
+  Detects NTFS Alternate Data Streams (ADS) used to hide malicious content per MITRE ATT&CK T1564.004.
+
+  Alternate Data Streams are a feature of the NTFS filesystem that allow additional data
+  to be associated with a file without changing its visible size or appearance. Attackers
+  abuse ADS to conceal executables, scripts, and payloads inside benign-looking files.
+  Common abuse includes Zone.Identifier streams (Mark-of-the-Web), but malicious streams
+  may contain hidden EXEs, PowerShell scripts, or C2 configuration.
+
+  This artifact enumerates files with non-standard alternate data streams in user-writable
+  and suspicious directories, extracts stream metadata, and optionally uploads stream content.
+
+reference:
+  - https://attack.mitre.org/techniques/T1564.004/
+  - https://docs.microsoft.com/en-us/sysinternals/downloads/streams
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/Users/**/*"
+  - name: AdditionalGlob
+    type: glob
+    default: "C:/Windows/Temp/**/*"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: ExcludeZoneIdentifier
+    description: Exclude common Zone.Identifier streams (Mark-of-the-Web)
+    type: bool
+    default: false
+  - name: MinStreamSize
+    description: Minimum stream size in bytes to report
+    type: int
+    default: 1
+  - name: UploadStreams
+    description: Upload matching stream content to server
+    type: bool
+    default: false
+
+sources:
+  - name: AlternateDataStreams
+    description: NTFS files with alternate data streams detected in target paths
+    query: |
+      LET Globs <= SELECT * FROM chain(
+        a={ SELECT TargetGlob AS Glob FROM scope() },
+        b={ SELECT AdditionalGlob AS Glob FROM scope() }
+      )
+
+      LET AllEntries <= SELECT OSPath, Size, Mtime, Atime, Ctime, IsDir
+        FROM foreach(
+          row=Globs,
+          query={
+            SELECT OSPath, Size, Mtime, Atime, Ctime, IsDir
+            FROM glob(globs=Glob, accessor="ntfs")
+          }
+        )
+
+      LET StreamEntries <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM AllEntries
+        WHERE NOT IsDir
+          AND Size >= MinStreamSize
+          AND OSPath =~ ":[^\\\\]"
+          AND NOT OSPath =~ "::\\$DATA$"
+          AND OSPath =~ FilterRegex
+
+      LET Filtered <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM StreamEntries
+        WHERE if(
+          condition=ExcludeZoneIdentifier,
+          then=NOT OSPath =~ ":Zone\\.Identifier",
+          else=TRUE
+        )
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        hash(path=OSPath, accessor="ntfs", hashselect="MD5,SHA256") AS Hash,
+        read_file(filename=OSPath, accessor="ntfs", length=512) AS StreamPreview,
+        if(condition=UploadStreams,
+           then=upload(file=OSPath, accessor="ntfs"),
+           else=NULL) AS Upload
+      FROM Filtered
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: preview_upload

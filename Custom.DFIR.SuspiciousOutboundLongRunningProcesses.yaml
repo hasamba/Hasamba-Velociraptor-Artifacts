@@ -1,0 +1,162 @@
+name: Custom.DFIR.SuspiciousOutboundLongRunningProcesses
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for suspicious outbound network connections from long-running processes.
+
+  Long-running processes that maintain persistent outbound connections may indicate
+  command-and-control (C2) beaconing or data exfiltration (MITRE ATT&CK T1041 —
+  Exfiltration Over C2 Channel). Attackers often inject into or abuse legitimate
+  long-lived processes (e.g., browsers, system services) to blend in with normal traffic.
+
+  This artifact correlates netstat() active connections with pslist() process metadata
+  to surface processes with high uptime making outbound connections, especially those
+  running from suspicious filesystem locations or connecting to non-standard ports.
+
+  Platform: Windows / Linux (cross-platform).
+
+reference:
+  - https://attack.mitre.org/techniques/T1041/
+  - https://attack.mitre.org/techniques/T1071/
+
+type: CLIENT
+
+parameters:
+  - name: MinUptimeSeconds
+    description: Minimum process uptime in seconds to flag as long-running (default 3600 = 1 hour)
+    type: int
+    default: 3600
+  - name: SuspiciousPortRegex
+    description: Regex of remote ports considered high-risk for outbound connections
+    type: regex
+    default: "^(4444|8080|8443|1337|31337|9999|6666|12345|54321|8888|9001|9030|1234|7777)$"
+  - name: SuspiciousPathRegex
+    description: Regex matching executable paths that are inherently suspicious
+    type: regex
+    default: "(?i)(Temp|AppData.Local.Temp|ProgramData|Users.Public|/tmp|/dev/shm|/var/tmp|\\.ps1|\\.vbs|\\.bat|\\.sh)"
+  - name: ExcludeProcessRegex
+    description: Regex of known-good process names to exclude from results
+    type: regex
+    default: "(?i)(svchost\\.exe|lsass\\.exe|services\\.exe|smss\\.exe|csrss\\.exe|wininit\\.exe|MsMpEng\\.exe|spoolsv\\.exe)"
+  - name: ExcludeRemoteIPRegex
+    description: Regex of remote IP ranges to exclude (loopback and RFC1918 private space)
+    type: regex
+    default: "^(127\\.|0\\.0\\.0\\.0|::1$|fd[0-9a-f]{2}:|fe80:)"
+
+sources:
+  - name: LongRunningOutbound
+    description: All established outbound connections from long-running processes with risk scoring
+    query: |
+      LET ProcsLongRunning <= SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime,
+        now() - CreateTime.Unix AS UptimeSeconds
+      FROM pslist()
+      WHERE now() - CreateTime.Unix > MinUptimeSeconds
+        AND NOT Name =~ ExcludeProcessRegex
+
+      LET OutboundConns <= SELECT
+        Pid AS ConnPid,
+        Status,
+        Laddr.IP AS LocalIP,
+        Laddr.Port AS LocalPort,
+        Raddr.IP AS RemoteIP,
+        Raddr.Port AS RemotePort
+      FROM netstat()
+      WHERE Status = "ESTABLISHED"
+        AND Raddr.IP != ""
+        AND NOT Raddr.IP =~ ExcludeRemoteIPRegex
+
+      SELECT
+        ConnPid AS Pid,
+        p.Name AS ProcessName,
+        p.Exe AS ExecutablePath,
+        p.CommandLine AS CommandLine,
+        p.Username AS RunningAs,
+        p.UptimeSeconds AS UptimeSeconds,
+        p.CreateTime AS ProcessStartTime,
+        LocalIP,
+        LocalPort,
+        RemoteIP,
+        RemotePort,
+        if(condition=str(str=RemotePort) =~ SuspiciousPortRegex,
+           then="HIGH", else="LOW") AS PortRisk,
+        if(condition=p.Exe =~ SuspiciousPathRegex,
+           then="HIGH", else="LOW") AS PathRisk
+      FROM foreach(
+        row=OutboundConns,
+        query={
+          SELECT *, ConnPid FROM ProcsLongRunning WHERE Pid = ConnPid
+        }
+      )
+      WHERE ProcessName != ""
+
+  - name: HighRiskWithHashes
+    description: High-risk findings (suspicious port or path) enriched with executable hashes for threat intel
+    query: |
+      LET ProcsLR <= SELECT
+        Pid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime,
+        now() - CreateTime.Unix AS UptimeSeconds
+      FROM pslist()
+      WHERE now() - CreateTime.Unix > MinUptimeSeconds
+        AND NOT Name =~ ExcludeProcessRegex
+
+      LET OutConns <= SELECT
+        Pid AS ConnPid,
+        Raddr.IP AS RemoteIP,
+        Raddr.Port AS RemotePort
+      FROM netstat()
+      WHERE Status = "ESTABLISHED"
+        AND Raddr.IP != ""
+        AND NOT Raddr.IP =~ ExcludeRemoteIPRegex
+
+      LET Matches <= SELECT
+        ConnPid AS Pid,
+        p.Name AS ProcessName,
+        p.Exe AS ExecutablePath,
+        p.CommandLine AS CommandLine,
+        p.Username AS RunningAs,
+        p.UptimeSeconds AS UptimeSeconds,
+        p.CreateTime AS ProcessStartTime,
+        RemoteIP,
+        RemotePort
+      FROM foreach(
+        row=OutConns,
+        query={
+          SELECT *, ConnPid FROM ProcsLR WHERE Pid = ConnPid
+        }
+      )
+      WHERE ProcessName != ""
+        AND (str(str=RemotePort) =~ SuspiciousPortRegex
+             OR ExecutablePath =~ SuspiciousPathRegex)
+
+      SELECT
+        Pid,
+        ProcessName,
+        ExecutablePath,
+        CommandLine,
+        RunningAs,
+        UptimeSeconds,
+        ProcessStartTime,
+        RemoteIP,
+        RemotePort,
+        hash(path=ExecutablePath, hashselect="MD5,SHA256") AS ExecutableHashes
+      FROM Matches
+      WHERE ExecutablePath != ""
+
+column_types:
+  - name: ProcessStartTime
+    type: timestamp
+  - name: UptimeSeconds
+    type: number
+  - name: ExecutableHashes
+    type: string

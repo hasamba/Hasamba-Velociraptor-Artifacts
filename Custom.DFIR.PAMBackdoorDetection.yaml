@@ -1,0 +1,152 @@
+name: Custom.DFIR.PAMBackdoorDetection
+description: |
+  Detects PAM module backdoors on Linux endpoints by scanning /etc/pam.d configuration
+  files for suspicious module references and computing cryptographic hashes of PAM
+  shared libraries to identify tampered or unauthorized modules.
+
+  PAM (Pluggable Authentication Modules) backdoors (T1556.003) allow adversaries to
+  intercept authentication credentials or bypass authentication entirely by replacing
+  or injecting malicious PAM modules. This artifact enumerates all PAM configuration
+  entries, resolves referenced library paths, and hashes them for integrity verification.
+
+reference:
+  - https://attack.mitre.org/techniques/T1556.003/
+  - https://linux-pam.org/Linux-PAM-html/
+  - https://www.man7.org/linux/man-pages/man5/pam.d.5.html
+
+type: CLIENT
+
+parameters:
+  - name: PamConfigGlob
+    type: glob
+    default: "/etc/pam.d/*"
+    description: Glob pattern for PAM configuration files
+
+  - name: PamLibGlob
+    type: glob
+    default: "/lib/x86_64-linux-gnu/security/*.so*"
+    description: Glob pattern for PAM library files (adjust arch as needed)
+
+  - name: PamLibGlob2
+    type: glob
+    default: "/lib64/security/*.so*"
+    description: Secondary glob for PAM libraries (RHEL/CentOS layout)
+
+  - name: PamLibGlob3
+    type: glob
+    default: "/usr/lib/x86_64-linux-gnu/security/*.so*"
+    description: Tertiary glob for PAM libraries (newer Debian/Ubuntu)
+
+  - name: SuspiciousModuleRegex
+    type: regex
+    default: "(pam_exec|pam_script|pam_python|pam_perl|pam_prelude|pam_cap)"
+    description: Regex matching potentially suspicious or unusual PAM module names
+
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Additional filter regex applied to PAM config file paths
+
+  - name: UploadSuspicious
+    type: bool
+    default: "N"
+    description: If true, upload suspicious PAM library files for further analysis
+
+sources:
+  - name: PAMConfigEntries
+    description: Parsed PAM configuration entries from /etc/pam.d showing all module references
+    query: |
+      LET PamFiles <= SELECT OSPath FROM glob(globs=PamConfigGlob)
+      LET ParsedLines = SELECT * FROM foreach(
+        row=PamFiles,
+        query={
+          SELECT
+            OSPath AS ConfigFile,
+            Line
+          FROM split_records(
+            filenames=OSPath,
+            regex="\n",
+            columns=["Line"]
+          )
+          WHERE Line =~ "^[^#]" AND Line =~ "\\S"
+        }
+      )
+      LET Tokenized = SELECT
+        ConfigFile,
+        Line,
+        split(string=Line, sep="\\s+")[0] AS ServiceType,
+        split(string=Line, sep="\\s+")[1] AS Control,
+        split(string=Line, sep="\\s+")[2] AS Module,
+        split(string=Line, sep="\\s+")[3] AS ModuleArgs
+      FROM ParsedLines
+      SELECT
+        ConfigFile,
+        ServiceType,
+        Control,
+        Module,
+        ModuleArgs,
+        Line AS RawEntry,
+        if(condition=Module =~ SuspiciousModuleRegex,
+           then="SUSPICIOUS",
+           else="OK") AS RiskLevel
+      FROM Tokenized
+      WHERE ConfigFile =~ FilterRegex
+
+  - name: PAMLibraryHashes
+    description: Cryptographic hashes of all PAM shared libraries for integrity verification
+    query: |
+      LET Lib1 <= SELECT OSPath, Size, Mtime FROM glob(globs=PamLibGlob)
+      LET Lib2 <= SELECT OSPath, Size, Mtime FROM glob(globs=PamLibGlob2)
+      LET Lib3 <= SELECT OSPath, Size, Mtime FROM glob(globs=PamLibGlob3)
+      LET AllLibs = SELECT * FROM chain(
+        a=Lib1,
+        b=Lib2,
+        c=Lib3
+      )
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256,
+        if(condition=UploadSuspicious,
+           then=upload(file=OSPath),
+           else=NULL) AS Upload
+      FROM AllLibs
+      WHERE Size > 0
+
+  - name: SuspiciousLibraries
+    description: PAM libraries with unusual paths or matching suspicious name patterns
+    query: |
+      LET AllLibPaths1 <= SELECT OSPath, Size, Mtime FROM glob(globs=PamLibGlob)
+      LET AllLibPaths2 <= SELECT OSPath, Size, Mtime FROM glob(globs=PamLibGlob2)
+      LET AllLibPaths3 <= SELECT OSPath, Size, Mtime FROM glob(globs=PamLibGlob3)
+      LET AllLibs2 = SELECT * FROM chain(
+        a=AllLibPaths1,
+        b=AllLibPaths2,
+        c=AllLibPaths3
+      )
+      LET Hashed = SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256
+      FROM AllLibs2
+      WHERE Size > 0 AND (
+        OSPath =~ SuspiciousModuleRegex OR
+        OSPath =~ "\\.so\\.[0-9]+$"
+      )
+      SELECT * FROM Hashed
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: ConfigFile
+    type: preview_upload
+  - name: OSPath
+    type: preview_upload
+  - name: MD5
+    type: string
+  - name: SHA256
+    type: string

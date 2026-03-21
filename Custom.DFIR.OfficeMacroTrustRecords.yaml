@@ -1,0 +1,108 @@
+name: Custom.DFIR.OfficeMacroTrustRecords
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Identifies evidence of Office macro execution via registry TrustRecords and recent document lists.
+
+  When a user enables macros on a document, Office stores a TrustRecord entry in the registry
+  under HKCU\SOFTWARE\Microsoft\Office\<version>\<App>\Security\Trusted Documents\TrustRecords.
+  These entries persist after document closure or deletion, providing durable forensic evidence
+  of macro enablement. The artifact also collects Most Recently Used (MRU) file lists to
+  correlate trusted macro documents with recent access patterns.
+
+  Key forensic value:
+    - TrustRecords entries survive document deletion — they prove a user once enabled macros.
+    - MRU entries show which Office files were recently opened, enabling timeline reconstruction.
+    - Cross-referencing both sources can surface macro-enabled lure documents in phishing chains.
+
+  Aligned with MITRE ATT&CK T1137.001 — Office Application Startup: Office Template Macros.
+
+reference:
+  - https://attack.mitre.org/techniques/T1137.001/
+  - https://support.microsoft.com/en-us/office/enable-or-disable-macros-in-microsoft-365-files-12b036fd-d140-4e74-b45e-16fed1a7e5c6
+
+type: CLIENT
+
+parameters:
+  - name: TrustRecordsGlob
+    type: glob
+    default: "HKEY_USERS/*/SOFTWARE/Microsoft/Office/*/*/Security/Trusted Documents/TrustRecords/*"
+    description: Registry glob pattern for TrustRecords across all users and Office versions
+  - name: MRUGlob
+    type: glob
+    default: "HKEY_USERS/*/SOFTWARE/Microsoft/Office/*/*/File MRU/*"
+    description: Registry glob pattern for recent Office file MRU entries
+  - name: FilePathFilter
+    type: regex
+    default: "."
+    description: Filter results by document path (regex)
+  - name: SIDFilter
+    type: regex
+    default: "."
+    description: Filter results by user SID (regex)
+
+sources:
+  - name: MacroTrustRecords
+    description: Registry TrustRecords entries showing documents where macros were enabled by users
+    query: |
+      LET TrustKeys <= SELECT OSPath, Name, Data FROM glob(
+        globs=TrustRecordsGlob,
+        accessor="registry")
+
+      LET Parsed <= SELECT
+        OSPath,
+        Name AS DocumentPath,
+        Data.value AS RawTrustValue,
+        Data.type AS RegistryType,
+        split(string=OSPath, sep="/")[1] AS UserSID,
+        split(string=OSPath, sep="/")[5] AS OfficeVersion,
+        split(string=OSPath, sep="/")[6] AS OfficeApplication
+      FROM TrustKeys
+
+      SELECT
+        UserSID,
+        OfficeVersion,
+        OfficeApplication,
+        DocumentPath,
+        RawTrustValue,
+        RegistryType,
+        OSPath AS RegistryKeyPath
+      FROM Parsed
+      WHERE DocumentPath =~ FilePathFilter
+        AND UserSID =~ SIDFilter
+
+  - name: RecentDocumentsMRU
+    description: Most Recently Used Office document list from registry File MRU keys
+    query: |
+      LET MRUKeys <= SELECT OSPath, Name, Data FROM glob(
+        globs=MRUGlob,
+        accessor="registry")
+
+      LET MRUParsed <= SELECT
+        OSPath,
+        Name AS MRUEntryName,
+        Data.value AS RawFilePath,
+        Data.type AS RegistryType,
+        split(string=OSPath, sep="/")[1] AS UserSID,
+        split(string=OSPath, sep="/")[5] AS OfficeVersion,
+        split(string=OSPath, sep="/")[6] AS OfficeApplication
+      FROM MRUKeys
+      WHERE Name =~ "^Item "
+
+      SELECT
+        UserSID,
+        OfficeVersion,
+        OfficeApplication,
+        MRUEntryName,
+        RawFilePath,
+        OSPath AS RegistryKeyPath
+      FROM MRUParsed
+      WHERE RawFilePath =~ FilePathFilter
+        AND UserSID =~ SIDFilter
+
+column_types:
+  - name: DocumentPath
+    type: path
+  - name: RawFilePath
+    type: path
+  - name: RegistryKeyPath
+    type: path

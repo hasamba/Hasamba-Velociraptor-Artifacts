@@ -14,8 +14,6 @@ description: |
   - Flags entries whose arguments match an encoded-command pattern
   - Optionally uploads matching task XML files for deeper analysis
 
-  authors: Yaniv Radunsky @ tenroot & Hohit (AI)
-
 reference:
   - https://attack.mitre.org/techniques/T1053.005/
   - https://docs.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema

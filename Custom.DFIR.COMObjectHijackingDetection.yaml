@@ -1,0 +1,94 @@
+name: Custom.DFIR.COMObjectHijackingDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects COM object hijacking persistence by identifying CLSID registrations
+  in the user registry hive (HKCU\Software\Classes\CLSID) that shadow legitimate
+  system objects registered under HKLM\Software\Classes\CLSID.
+
+  Attackers use this technique (MITRE ATT&CK T1546.015) to gain persistence
+  without administrative privileges. Windows resolves COM objects by checking
+  HKCU before HKLM, so a user-level CLSID entry can redirect execution to a
+  malicious DLL or EXE every time the targeted COM object is instantiated.
+
+  The artifact enumerates InprocServer32 and LocalServer32 overrides across all
+  user hives, flags paths in suspicious locations (AppData, Temp, Downloads, etc.),
+  and hashes any matching files on disk for threat intelligence correlation.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.015/
+  - https://bohops.com/2018/08/18/abusing-the-com-registry-structure-part-2-loading-techniques-for-evasion-and-persistence/
+  - https://attack.mitre.org/software/S0111/
+
+type: CLIENT
+
+parameters:
+  - name: InprocGlob
+    type: glob
+    default: "HKEY_USERS/*/Software/Classes/CLSID/*/InprocServer32/@"
+    description: Glob for in-process COM server (DLL) overrides in user hive
+  - name: LocalServerGlob
+    type: glob
+    default: "HKEY_USERS/*/Software/Classes/CLSID/*/LocalServer32/@"
+    description: Glob for local COM server (EXE) overrides in user hive
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Filter registry paths by regex pattern
+  - name: SuspiciousPathRegex
+    type: regex
+    default: "(?i)(appdata|\\btemp\\b|\\btmp\\b|programdata|public|downloads|desktop|roaming|localappdata)"
+    description: Regex pattern to flag high-risk COM server payload paths
+
+sources:
+  - name: COMHijackCandidates
+    description: User-hive CLSID entries that may override HKLM COM registrations
+    query: |
+      LET InprocEntries <= SELECT OSPath, Data.value AS ServerPath, Mtime
+        FROM glob(globs=InprocGlob, accessor="registry")
+        WHERE OSPath =~ FilterRegex
+
+      LET LocalEntries <= SELECT OSPath, Data.value AS ServerPath, Mtime
+        FROM glob(globs=LocalServerGlob, accessor="registry")
+        WHERE OSPath =~ FilterRegex
+
+      SELECT
+        OSPath AS RegistryKey,
+        ServerPath,
+        Mtime AS LastModified,
+        if(condition=ServerPath =~ SuspiciousPathRegex,
+           then="HIGH",
+           else="MEDIUM") AS RiskLevel
+      FROM chain(a=InprocEntries, b=LocalEntries)
+      ORDER BY RiskLevel
+
+  - name: SuspiciousFileDetails
+    description: On-disk details and cryptographic hashes for high-risk COM payloads
+    query: |
+      LET InprocSusp <= SELECT Data.value AS ServerPath
+        FROM glob(globs=InprocGlob, accessor="registry")
+        WHERE Data.value =~ SuspiciousPathRegex
+
+      LET LocalSusp <= SELECT Data.value AS ServerPath
+        FROM glob(globs=LocalServerGlob, accessor="registry")
+        WHERE Data.value =~ SuspiciousPathRegex
+
+      LET SuspFiles <= SELECT ServerPath FROM chain(a=InprocSusp, b=LocalSusp)
+
+      SELECT
+        ServerPath AS FilePath,
+        Size,
+        Mtime AS LastModified,
+        hash(path=ServerPath, hashselect="MD5,SHA256") AS FileHashes
+      FROM foreach(
+        row=SuspFiles,
+        query={
+          SELECT ServerPath, Size, Mtime
+          FROM stat(filename=ServerPath)
+        })
+      WHERE Size > 0
+
+column_types:
+  - name: LastModified
+    type: timestamp
+  - name: FilePath
+    type: preview_url

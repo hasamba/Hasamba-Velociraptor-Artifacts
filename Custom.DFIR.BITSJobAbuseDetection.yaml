@@ -1,0 +1,105 @@
+name: Custom.DFIR.BITSJobAbuseDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects BITS (Background Intelligent Transfer Service) job abuse for persistence or unauthorized file downloads.
+
+  Attackers abuse BITS to download malicious payloads from remote URLs, establish persistence via
+  notification callbacks, and evade detection since BITS traffic blends with legitimate Windows update activity.
+
+  This artifact examines:
+  - BITS operational event log for job creation and transfer events (EventIDs 3, 4, 5, 59, 60, 16403)
+  - BITS queue manager database files for persisted job records
+  - BITS registry configuration entries for policy tampering indicators
+
+reference:
+  - https://attack.mitre.org/techniques/T1197/
+  - https://www.mandiant.com/resources/blog/bits-jobs-and-bitsadmin
+
+type: CLIENT
+
+parameters:
+  - name: BITSEventLog
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Bits-Client%4Operational.evtx"
+    description: Path to BITS operational event log
+  - name: BITSDbGlob
+    type: glob
+    default: "C:/ProgramData/Microsoft/Network/Downloader/{qmgr*.dat,qmgr.db}"
+    description: Glob for BITS queue manager database files
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: General filter regex applied to results
+  - name: SuspiciousUrlRegex
+    type: regex
+    default: "(?i)(http|https|ftp)://"
+    description: Regex to match URLs in BITS events
+  - name: UploadFiles
+    type: bool
+    default: "N"
+    description: Upload BITS database files for offline analysis
+
+sources:
+  - name: BITSEventLog
+    description: BITS operational event log entries showing job lifecycle and transfer activity
+    query: |
+      LET EventLogFile <= SELECT OSPath FROM glob(globs=BITSEventLog)
+      SELECT
+        System.TimeCreated.SystemTime AS EventTime,
+        System.EventID.Value AS EventID,
+        System.Computer AS Computer,
+        System.Security.UserID AS UserID,
+        get(item=EventData, field="jobTitle") AS JobTitle,
+        get(item=EventData, field="jobId") AS JobID,
+        get(item=EventData, field="jobOwner") AS JobOwner,
+        get(item=EventData, field="url") AS URL,
+        get(item=EventData, field="processPath") AS ProcessPath,
+        get(item=EventData, field="bytesTotal") AS BytesTotal,
+        get(item=EventData, field="bytesTransferred") AS BytesTransferred
+      FROM foreach(
+        row=EventLogFile,
+        query={
+          SELECT * FROM parse_evtx(filename=OSPath)
+        })
+      WHERE System.EventID.Value IN (3, 4, 5, 59, 60, 16403)
+
+  - name: BITSDatabaseFiles
+    description: BITS queue manager database files containing persisted job data
+    query: |
+      LET DBFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=BITSDbGlob)
+        WHERE OSPath =~ FilterRegex
+      SELECT * FROM if(
+        condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Atime, Ctime,
+            upload(file=OSPath) AS Upload
+          FROM DBFiles
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Atime, Ctime
+          FROM DBFiles
+        })
+
+  - name: BITSRegistryConfig
+    description: BITS registry configuration entries for tampering detection
+    query: |
+      LET BITSRegEntries <= SELECT OSPath, Data.value AS Value, Data.type AS Type, Mtime
+        FROM glob(
+          globs=[
+            "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/BITS/**",
+            "HKEY_LOCAL_MACHINE/SOFTWARE/Policies/Microsoft/Windows/BITS/**"
+          ],
+          accessor="registry")
+      SELECT OSPath, Value, Type, Mtime
+      FROM BITSRegEntries
+      WHERE OSPath =~ FilterRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp

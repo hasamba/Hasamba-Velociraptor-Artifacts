@@ -1,0 +1,104 @@
+name: Custom.DFIR.SystemdServicePersistenceDetector
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects systemd service unit files potentially installed for persistence (T1543.002).
+
+  Attackers abuse systemd service units to maintain persistence on Linux systems by
+  dropping malicious .service files into standard systemd directories. This artifact
+  enumerates all service units across system-wide and per-user paths, parses key
+  execution fields (ExecStart, User, WorkingDirectory), computes SHA256/MD5 hashes,
+  and highlights entries matching suspicious execution patterns such as reverse shells,
+  loaders from writable directories (/tmp, /dev/shm), encoded payloads, or exfiltration
+  tools.
+
+reference:
+  - https://attack.mitre.org/techniques/T1543.002/
+  - https://www.freedesktop.org/software/systemd/man/systemd.service.html
+
+type: CLIENT
+
+parameters:
+  - name: ServiceGlobs
+    type: glob
+    default: "{/etc/systemd/system/*.service,/etc/systemd/system/**/*.service,/usr/lib/systemd/system/*.service,/lib/systemd/system/*.service,/run/systemd/system/*.service,/home/**/.config/systemd/user/*.service,/root/.config/systemd/user/*.service}"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousExecRegex
+    type: regex
+    default: "(/tmp/|/dev/shm/|/var/tmp/|\\bcurl\\b|\\bwget\\b|bash\\s+-i|python[23]?\\s+-c|perl\\s+-e|base64\\s+-d|mkfifo|/proc/self)"
+  - name: UploadServiceFiles
+    type: bool
+    description: Upload matching .service files for offline forensic analysis
+    default: "N"
+
+sources:
+  - name: AllServiceUnits
+    description: All systemd service unit files with parsed fields and cryptographic hashes
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=ServiceGlobs)
+        WHERE OSPath =~ FilterRegex AND Size > 0
+
+      LET Enriched <= SELECT
+        OSPath, Size, Mtime, Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS H,
+        read_file(filename=OSPath, length=8192) AS Content
+        FROM Files
+
+      SELECT
+        OSPath, Mtime, Ctime, Size,
+        H.MD5 AS MD5,
+        H.SHA256 AS SHA256,
+        parse_string_with_regex(string=Content, regex="(?m)^Description=(?P<Description>[^\n]+)").Description AS Description,
+        parse_string_with_regex(string=Content, regex="(?m)^ExecStart=(?P<ExecStart>[^\n]+)").ExecStart AS ExecStart,
+        parse_string_with_regex(string=Content, regex="(?m)^ExecStartPre=(?P<ExecStartPre>[^\n]+)").ExecStartPre AS ExecStartPre,
+        parse_string_with_regex(string=Content, regex="(?m)^User=(?P<User>[^\n]+)").User AS ServiceUser,
+        parse_string_with_regex(string=Content, regex="(?m)^WorkingDirectory=(?P<WorkingDirectory>[^\n]+)").WorkingDirectory AS WorkingDirectory,
+        parse_string_with_regex(string=Content, regex="(?m)^WantedBy=(?P<WantedBy>[^\n]+)").WantedBy AS WantedBy,
+        Content AS RawContent
+        FROM Enriched
+
+  - name: SuspiciousServiceUnits
+    description: Service units matching suspicious execution patterns indicating attacker-installed persistence
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=ServiceGlobs)
+        WHERE OSPath =~ FilterRegex AND Size > 0
+
+      LET Enriched <= SELECT
+        OSPath, Size, Mtime, Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS H,
+        read_file(filename=OSPath, length=8192) AS Content
+        FROM Files
+
+      SELECT
+        OSPath, Mtime, Ctime, Size,
+        H.MD5 AS MD5,
+        H.SHA256 AS SHA256,
+        parse_string_with_regex(string=Content, regex="(?m)^ExecStart=(?P<ExecStart>[^\n]+)").ExecStart AS ExecStart,
+        parse_string_with_regex(string=Content, regex="(?m)^User=(?P<User>[^\n]+)").User AS ServiceUser,
+        parse_string_with_regex(string=Content, regex="(?m)^WorkingDirectory=(?P<WorkingDirectory>[^\n]+)").WorkingDirectory AS WorkingDirectory,
+        Content AS RawContent
+        FROM Enriched
+        WHERE Content =~ SuspiciousExecRegex
+
+  - name: UploadedServiceFiles
+    description: Uploads all matching service files for offline forensic analysis
+    query: |
+      SELECT * FROM if(
+        condition=UploadServiceFiles,
+        then={
+          SELECT OSPath, upload(file=OSPath) AS Upload
+          FROM glob(globs=ServiceGlobs)
+          WHERE OSPath =~ FilterRegex
+        },
+        else={
+          SELECT "UploadServiceFiles parameter is disabled" AS Status FROM scope()
+        })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp

@@ -1,0 +1,137 @@
+name: Custom.DFIR.ShadowCopyDeletionDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects shadow copy deletion commands executed via wmic.exe or vssadmin.exe in process logs.
+
+  Ransomware and destructive malware commonly delete or resize Volume Shadow Copies
+  to prevent system recovery. This artifact hunts for process creation events
+  containing known deletion patterns in the Windows Security Event Log (Event ID 4688),
+  Sysmon Event Log (Event ID 1), and live running processes.
+
+  Common patterns detected:
+    - vssadmin delete shadows /all /quiet
+    - vssadmin resize shadowstorage /maxsize=401MB
+    - wmic shadowcopy delete
+    - wmic shadowcopy where "ID='...'" call delete
+
+  MITRE ATT&CK: T1490 - Inhibit System Recovery
+
+reference:
+  - https://attack.mitre.org/techniques/T1490/
+  - https://docs.microsoft.com/en-us/windows-server/administration/windows-commands/vssadmin
+
+type: CLIENT
+
+parameters:
+  - name: SecurityLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+    description: Path to the Windows Security Event Log
+
+  - name: SysmonLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+    description: Path to the Sysmon Operational Event Log
+
+  - name: CommandLineRegex
+    type: regex
+    default: "(?i)(vssadmin.{0,30}(delete|resize)|wmic.{0,50}(shadowcopy|shadow).{0,30}(delete|call))"
+    description: Regex pattern to match suspicious shadow copy deletion commands
+
+sources:
+  - name: SecurityLog4688
+    description: Process creation events from Windows Security Event Log (Event ID 4688)
+    query: |
+      LET SecurityLogs <= SELECT OSPath FROM glob(globs=SecurityLogGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=SecurityLogs,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.Computer AS Computer,
+            EventData.SubjectUserName AS UserName,
+            EventData.SubjectDomainName AS Domain,
+            EventData.NewProcessName AS ProcessPath,
+            EventData.CommandLine AS CommandLine,
+            EventData.ParentProcessName AS ParentProcess,
+            EventData.ProcessId AS ProcessId,
+            EventData.ParentProcessId AS ParentProcessId,
+            OSPath AS SourceLog
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+        })
+
+      SELECT
+        EventTime,
+        Computer,
+        UserName + "@" + Domain AS UserAccount,
+        ProcessPath,
+        CommandLine,
+        ParentProcess,
+        ProcessId,
+        ParentProcessId,
+        SourceLog
+      FROM RawEvents
+      WHERE CommandLine =~ CommandLineRegex
+
+  - name: SysmonLog1
+    description: Process creation events from Sysmon Event ID 1
+    query: |
+      LET SysmonLogs <= SELECT OSPath FROM glob(globs=SysmonLogGlob)
+
+      LET RawSysmonEvents <= SELECT * FROM foreach(
+        row=SysmonLogs,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.Computer AS Computer,
+            EventData.User AS UserAccount,
+            EventData.Image AS ProcessPath,
+            EventData.CommandLine AS CommandLine,
+            EventData.ParentImage AS ParentProcess,
+            EventData.ParentCommandLine AS ParentCommandLine,
+            EventData.ProcessId AS ProcessId,
+            EventData.ParentProcessId AS ParentProcessId,
+            EventData.Hashes AS Hashes,
+            EventData.IntegrityLevel AS IntegrityLevel,
+            OSPath AS SourceLog
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+        })
+
+      SELECT
+        EventTime,
+        Computer,
+        UserAccount,
+        ProcessPath,
+        CommandLine,
+        ParentProcess,
+        ParentCommandLine,
+        ProcessId,
+        ParentProcessId,
+        Hashes,
+        IntegrityLevel,
+        SourceLog
+      FROM RawSysmonEvents
+      WHERE CommandLine =~ CommandLineRegex
+
+  - name: LiveProcesses
+    description: Currently running processes matching shadow copy deletion patterns
+    query: |
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe AS ProcessPath,
+        CommandLine,
+        Username,
+        CreateTime
+      FROM pslist()
+      WHERE CommandLine =~ CommandLineRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp

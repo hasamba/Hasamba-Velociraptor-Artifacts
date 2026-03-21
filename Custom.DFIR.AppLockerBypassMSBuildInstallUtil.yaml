@@ -1,0 +1,208 @@
+name: Custom.DFIR.AppLockerBypassMSBuildInstallUtil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects AppLocker bypass attempts using MSBuild.exe and InstallUtil.exe.
+
+  Both MSBuild.exe and InstallUtil.exe are Microsoft-signed binaries that can
+  execute arbitrary code inline, bypassing AppLocker application whitelisting
+  policies. Attackers abuse these trusted binaries to run malicious payloads
+  defined in project files or .NET assembly code without triggering AppLocker.
+
+  This artifact hunts across:
+  - Sysmon Event ID 1 (Process Create) in Microsoft-Windows-Sysmon/Operational
+  - Windows Security Event ID 4688 (A new process has been created)
+
+  Indicators of bypass include:
+  - MSBuild.exe invoked with inline task XML files outside normal build paths
+  - InstallUtil.exe loading assemblies from temp/user-writable locations
+  - Suspicious parent processes (cmd.exe, powershell.exe, wscript.exe, mshta.exe)
+  - Command lines referencing temp folders, AppData, or network paths
+
+reference:
+  - https://attack.mitre.org/techniques/T1218.004/
+  - https://lolbas-project.github.io/lolbas/Binaries/Msbuild/
+  - https://lolbas-project.github.io/lolbas/Binaries/Installutil/
+
+type: CLIENT
+
+parameters:
+  - name: SysmonEvtxGlob
+    description: Path glob for Sysmon operational log
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+
+  - name: SecurityEvtxGlob
+    description: Path glob for Windows Security log
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+
+  - name: TargetProcessRegex
+    description: Regex to match suspicious binary names
+    type: regex
+    default: "(?i)(MSBuild|InstallUtil)\\.exe"
+
+  - name: SuspiciousPathRegex
+    description: Regex matching paths that indicate bypass (temp, appdata, network)
+    type: regex
+    default: "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\ProgramData\\\\|\\\\Users\\\\Public\\\\|\\\\Downloads\\\\|\\\\Desktop\\\\|UNC\\\\|\\\\\\\\[0-9])"
+
+  - name: SuspiciousParentRegex
+    description: Regex to match suspicious parent processes
+    type: regex
+    default: "(?i)(cmd\\.exe|powershell\\.exe|wscript\\.exe|cscript\\.exe|mshta\\.exe|rundll32\\.exe|regsvr32\\.exe|wmic\\.exe|mmc\\.exe)"
+
+  - name: DateAfter
+    description: Only include events after this date (YYYY-MM-DD), leave empty for all
+    default: ""
+
+sources:
+  - name: SysmonProcessCreate
+    description: Process creation events from Sysmon (Event ID 1) matching MSBuild or InstallUtil
+    query: |
+      LET date_filter = DateAfter
+      LET sysmon_files <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET raw_events = SELECT * FROM foreach(
+        row={ SELECT OSPath FROM sysmon_files },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Computer AS Computer,
+            EventData.RuleName AS RuleName,
+            EventData.UtcTime AS UtcTime,
+            EventData.ProcessGuid AS ProcessGuid,
+            EventData.ProcessId AS ProcessId,
+            EventData.Image AS Image,
+            EventData.FileVersion AS FileVersion,
+            EventData.Description AS Description,
+            EventData.Product AS Product,
+            EventData.Company AS Company,
+            EventData.OriginalFileName AS OriginalFileName,
+            EventData.CommandLine AS CommandLine,
+            EventData.CurrentDirectory AS CurrentDirectory,
+            EventData.User AS User,
+            EventData.LogonGuid AS LogonGuid,
+            EventData.LogonId AS LogonId,
+            EventData.TerminalSessionId AS TerminalSessionId,
+            EventData.IntegrityLevel AS IntegrityLevel,
+            EventData.Hashes AS Hashes,
+            EventData.ParentProcessGuid AS ParentProcessGuid,
+            EventData.ParentProcessId AS ParentProcessId,
+            EventData.ParentImage AS ParentImage,
+            EventData.ParentCommandLine AS ParentCommandLine
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+        }
+      )
+
+      LET filtered = SELECT * FROM raw_events
+        WHERE Image =~ TargetProcessRegex
+          AND (CommandLine =~ SuspiciousPathRegex
+               OR ParentImage =~ SuspiciousParentRegex
+               OR CurrentDirectory =~ SuspiciousPathRegex)
+
+      SELECT
+        EventTime,
+        Computer,
+        User,
+        Image AS ProcessImage,
+        CommandLine,
+        CurrentDirectory,
+        ParentImage AS ParentProcess,
+        ParentCommandLine,
+        IntegrityLevel,
+        Hashes,
+        ProcessId,
+        ParentProcessId,
+        "Sysmon-EID1" AS Source
+      FROM filtered
+      WHERE if(condition=date_filter,
+              then=EventTime > timestamp(string=date_filter + "T00:00:00Z"),
+              else=TRUE)
+      ORDER BY EventTime DESC
+
+  - name: SecurityAuditProcessCreate
+    description: Process creation events from Windows Security log (Event ID 4688) matching MSBuild or InstallUtil
+    query: |
+      LET date_filter = DateAfter
+      LET sec_files <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+
+      LET raw_sec = SELECT * FROM foreach(
+        row={ SELECT OSPath FROM sec_files },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Computer AS Computer,
+            EventData.SubjectUserName AS SubjectUser,
+            EventData.SubjectDomainName AS SubjectDomain,
+            EventData.NewProcessName AS NewProcessName,
+            EventData.CommandLine AS CommandLine,
+            EventData.ParentProcessName AS ParentProcessName,
+            EventData.NewProcessId AS NewProcessId,
+            EventData.ProcessId AS CallerProcessId,
+            EventData.TokenElevationType AS TokenElevationType
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+        }
+      )
+
+      LET filtered_sec = SELECT * FROM raw_sec
+        WHERE NewProcessName =~ TargetProcessRegex
+          AND (CommandLine =~ SuspiciousPathRegex
+               OR ParentProcessName =~ SuspiciousParentRegex
+               OR NewProcessName =~ SuspiciousPathRegex)
+
+      SELECT
+        EventTime,
+        Computer,
+        SubjectUser + "\\" + SubjectDomain AS User,
+        NewProcessName AS ProcessImage,
+        CommandLine,
+        ParentProcessName AS ParentProcess,
+        TokenElevationType,
+        NewProcessId AS ProcessId,
+        CallerProcessId AS ParentProcessId,
+        "Security-EID4688" AS Source
+      FROM filtered_sec
+      WHERE if(condition=date_filter,
+              then=EventTime > timestamp(string=date_filter + "T00:00:00Z"),
+              else=TRUE)
+      ORDER BY EventTime DESC
+
+  - name: LiveProcessCheck
+    description: Check currently running MSBuild or InstallUtil processes (live endpoint scan)
+    query: |
+      LET running = SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime
+      FROM pslist()
+      WHERE Exe =~ TargetProcessRegex
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe AS ProcessImage,
+        CommandLine,
+        Username,
+        CreateTime,
+        hash(path=Exe, hashselect="MD5,SHA256") AS FileHash,
+        "LiveProcess" AS Source
+      FROM running
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: ProcessImage
+    type: path
+  - name: ParentProcess
+    type: path

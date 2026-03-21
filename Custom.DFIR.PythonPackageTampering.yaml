@@ -1,0 +1,107 @@
+name: Custom.DFIR.PythonPackageTampering
+description: |
+  Hunt for recently installed or modified Python/pip packages in site-packages directories.
+  
+  Adversaries may tamper with or implant malicious packages in Python's site-packages
+  to achieve persistence or supply chain compromise (T1195.001). This artifact identifies
+  packages modified or created recently by examining .dist-info METADATA files and
+  top-level package directories across common Python installation paths on Linux, macOS,
+  and Windows.
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+  - https://pip.pypa.io/en/stable/reference/pip_show/
+
+type: CLIENT
+
+parameters:
+  - name: SitePackagesGlob
+    type: glob
+    default: "{/usr/lib/python*/dist-packages,/usr/local/lib/python*/dist-packages,/usr/lib/python*/site-packages,/usr/local/lib/python*/site-packages,/opt/*/lib/python*/site-packages,C:/Python*/Lib/site-packages,C:/Users/*/AppData/Local/Programs/Python/*/Lib/site-packages,C:/Users/*/AppData/Roaming/Python/*/site-packages,/Library/Python/*/site-packages,/Users/*/Library/Python/*/lib/python/site-packages}"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: RecentDays
+    type: int
+    default: 30
+  - name: UploadMetadata
+    type: bool
+    default: false
+
+sources:
+  - name: RecentlyModifiedPackages
+    description: |
+      Lists Python dist-info METADATA files modified within the last N days.
+      Each row represents a package installation or modification event.
+    query: |
+      LET cutoff <= timestamp(epoch=now() - RecentDays * 86400)
+
+      LET MetadataFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=SitePackagesGlob + "/*.dist-info/METADATA")
+        WHERE Mtime > cutoff AND OSPath =~ FilterRegex
+
+      LET ParsedPackages = SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        regex_replace(source=str(str=OSPath), re=".*/([^/]+)\\.dist-info/METADATA$", replace="$1") AS PackageDistInfo,
+        read_file(filename=OSPath, length=4096) AS MetadataContent
+      FROM MetadataFiles
+
+      SELECT
+        OSPath,
+        PackageDistInfo,
+        regex_replace(source=MetadataContent, re="(?s).*?Name: ([^\r\n]+).*", replace="$1") AS PackageName,
+        regex_replace(source=MetadataContent, re="(?s).*?Version: ([^\r\n]+).*", replace="$1") AS PackageVersion,
+        regex_replace(source=MetadataContent, re="(?s).*?Home-page: ([^\r\n]+).*", replace="$1") AS HomePage,
+        regex_replace(source=MetadataContent, re="(?s).*?Author: ([^\r\n]+).*", replace="$1") AS Author,
+        Size,
+        Mtime,
+        Ctime
+      FROM ParsedPackages
+
+  - name: PackageFilesHashed
+    description: |
+      Hashes all .py files within site-packages modified within the last N days.
+      Use to detect unexpected or injected Python modules.
+    query: |
+      LET cutoff <= timestamp(epoch=now() - RecentDays * 86400)
+
+      LET RecentPyFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=SitePackagesGlob + "/**/*.py")
+        WHERE Mtime > cutoff AND OSPath =~ FilterRegex
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM RecentPyFiles
+
+  - name: MetadataUpload
+    description: |
+      Optionally upload METADATA files for offline analysis.
+    query: |
+      LET cutoff <= timestamp(epoch=now() - RecentDays * 86400)
+
+      LET MetadataFiles <= SELECT OSPath, Mtime
+        FROM glob(globs=SitePackagesGlob + "/*.dist-info/METADATA")
+        WHERE Mtime > cutoff AND OSPath =~ FilterRegex
+
+      SELECT * FROM if(
+        condition=UploadMetadata,
+        then={
+          SELECT OSPath, Mtime, upload(file=OSPath) AS Upload FROM MetadataFiles
+        },
+        else={
+          SELECT OSPath, Mtime, "Upload disabled" AS Upload FROM MetadataFiles
+        })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: preview_upload
