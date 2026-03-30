@@ -1,0 +1,174 @@
+name: Custom.DFIR.TunnelingToolDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects evidence of protocol tunneling and port forwarding tools commonly used
+  by attackers for C2 communication and lateral movement.
+
+  Covers: chisel, socat, plink, ngrok, frp, ligolo, stunnel (MITRE ATT&CK T1572).
+
+  Detection vectors:
+    1. Running processes matching known tool names or command-line patterns
+    2. Active network connections associated with tunneling processes
+    3. Filesystem artifacts (binaries, config files) in common drop locations
+    4. Windows registry Run keys referencing tunneling tools (persistence)
+    5. Windows Prefetch evidence of past tool execution
+
+reference:
+  - https://attack.mitre.org/techniques/T1572/
+  - https://github.com/jpillora/chisel
+  - https://ngrok.com/docs
+  - https://www.chiark.greenend.org.uk/~sgtatham/putty/
+
+type: CLIENT
+
+parameters:
+  - name: ToolNameRegex
+    type: regex
+    default: "(?i)(chisel|socat|plink|ngrok|frpc|frps|ligolo|stunnel|redsocks|proxychains)"
+    description: Regex matching tunneling tool names in process names or command lines
+
+  - name: SuspiciousCmdlineRegex
+    type: regex
+    default: "(?i)(socks5?://|:4444|:1080|reverse.*proxy|tunnel.*client|R:\\d+:|L:\\d+:|D:\\d+:)"
+    description: Regex for suspicious command-line arguments indicating tunneling activity
+
+  - name: FilesystemGlob
+    type: string
+    default: "{/tmp/**,/dev/shm/**,/home/**/.local/bin/**,/var/tmp/**,C:/Users/*/AppData/Local/Temp/**,C:/Windows/Temp/**,C:/ProgramData/**}"
+    description: Glob pattern to scan for tunneling tool binaries
+
+  - name: FileNameRegex
+    type: regex
+    default: "(?i)(chisel|socat|plink|ngrok|frpc|frps|ligolo|stunnel)"
+    description: Regex to match filenames of known tunneling tools
+
+  - name: UploadSuspiciousFiles
+    type: bool
+    default: "N"
+    description: Upload matched binaries to the server for further analysis
+
+  - name: PrefetchGlob
+    type: string
+    default: "C:/Windows/Prefetch/*.pf"
+    description: Windows Prefetch directory glob for execution history
+
+  - name: RegistryRunKeys
+    type: string
+    default: "{HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*,HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*,HKEY_CURRENT_USER/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*}"
+    description: Registry Run key globs to check for tunneling tool persistence
+
+sources:
+  - name: RunningProcesses
+    description: Active processes matching known tunneling tool names or suspicious command-line arguments
+    query: |
+      LET procs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+                   FROM pslist()
+
+      SELECT Pid,
+             Ppid,
+             Name,
+             Exe,
+             CommandLine,
+             Username,
+             CreateTime,
+             if(condition=Name =~ ToolNameRegex,
+               then="Process Name Match",
+               else=if(condition=CommandLine =~ ToolNameRegex,
+                 then="Cmdline Tool Match",
+                 else="Cmdline Pattern Match")) AS MatchReason
+      FROM procs
+      WHERE Name =~ ToolNameRegex
+         OR CommandLine =~ ToolNameRegex
+         OR CommandLine =~ SuspiciousCmdlineRegex
+
+  - name: NetworkConnections
+    description: Network connections from processes associated with tunneling tools
+    query: |
+      SELECT * FROM foreach(
+        row={
+          SELECT Pid AS MatchPid,
+                 Name AS ProcessName,
+                 Exe AS ProcessExe,
+                 CommandLine,
+                 Username
+          FROM pslist()
+          WHERE Name =~ ToolNameRegex
+             OR CommandLine =~ ToolNameRegex
+        },
+        query={
+          SELECT MatchPid,
+                 ProcessName,
+                 ProcessExe,
+                 CommandLine,
+                 Username,
+                 FamilyString AS Family,
+                 TypeString AS ConnType,
+                 Status,
+                 Laddr.IP AS LocalIP,
+                 Laddr.Port AS LocalPort,
+                 Raddr.IP AS RemoteIP,
+                 Raddr.Port AS RemotePort
+          FROM netstat()
+          WHERE Pid = MatchPid
+        }
+      )
+
+  - name: FilesystemArtifacts
+    description: Filesystem scan for tunneling tool binaries and related files in common attacker drop locations
+    query: |
+      LET found_files <= SELECT OSPath, Size, Mtime, Atime, Ctime
+                         FROM glob(globs=FilesystemGlob)
+                         WHERE OSPath =~ FileNameRegex
+                           AND NOT IsDir
+
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Atime,
+             Ctime,
+             hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes,
+             if(condition=UploadSuspiciousFiles,
+               then=upload(file=OSPath),
+               else="Upload disabled") AS Upload
+      FROM found_files
+
+  - name: RegistryPersistence
+    description: Windows registry Run keys referencing tunneling tools (Windows only)
+    query: |
+      LET reg_entries <= SELECT OSPath, Data.value AS Value, Mtime
+                         FROM glob(globs=RegistryRunKeys, accessor="registry")
+
+      SELECT OSPath,
+             Value,
+             Mtime
+      FROM reg_entries
+      WHERE Value =~ ToolNameRegex
+         OR Value =~ FileNameRegex
+
+  - name: PrefetchEvidence
+    description: Windows Prefetch files indicating past execution of tunneling tools (Windows only)
+    query: |
+      LET pf_files <= SELECT OSPath,
+                             regex_replace(
+                               source=basename(path=OSPath),
+                               re="-[A-F0-9]{8}\\.PF$",
+                               replace="") AS ExeName
+                      FROM glob(globs=PrefetchGlob)
+
+      SELECT OSPath, ExeName
+      FROM pf_files
+      WHERE ExeName =~ FileNameRegex
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: url
+  - name: ProcessExe
+    type: url
