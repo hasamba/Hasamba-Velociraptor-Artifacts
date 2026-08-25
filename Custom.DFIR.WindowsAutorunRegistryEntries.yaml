@@ -1,0 +1,133 @@
+name: Custom.DFIR.WindowsAutorunRegistryEntries
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Enumerate Windows autorun persistence entries from HKLM and HKCU Run/RunOnce registry locations.
+
+  This artifact collects autorun values across machine-wide and user-hive Run keys,
+  highlights suspicious command lines with regex filters, and attempts to resolve
+  executable paths for hashing when the registry data points directly to a file on disk.
+reference:
+  - https://attack.mitre.org/techniques/T1547.001/
+  - https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
+
+type: CLIENT
+
+parameters:
+  - name: HKLMRunGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*"
+  - name: HKLMRunOnceGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*"
+  - name: HKLMWowRunGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Wow6432Node/Microsoft/Windows/CurrentVersion/Run/*"
+  - name: HKLMWowRunOnceGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Wow6432Node/Microsoft/Windows/CurrentVersion/RunOnce/*"
+  - name: HKCURunGlob
+    type: glob
+    default: "HKEY_USERS/*/Software/Microsoft/Windows/CurrentVersion/Run/*"
+  - name: HKCURunOnceGlob
+    type: glob
+    default: "HKEY_USERS/*/Software/Microsoft/Windows/CurrentVersion/RunOnce/*"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousRegex
+    type: regex
+    default: '(?i)(appdata|programdata|temp|downloads|public|powershell|cmd\.exe|wscript|cscript|rundll32|mshta)'
+  - name: PathRegex
+    type: regex
+    default: '(?i)^["''\s]*[A-Z]:[\\/].*'
+
+sources:
+  - name: AutorunEntries
+    description: Enumerate Run and RunOnce values across HKLM and HKCU-equivalent hives.
+    query: |
+      LET HKLMRun <= SELECT "HKLM" AS Hive, "Run" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMRunGlob, accessor="registry")
+      LET HKLMRunOnce <= SELECT "HKLM" AS Hive, "RunOnce" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMRunOnceGlob, accessor="registry")
+      LET HKLMWowRun <= SELECT "HKLM" AS Hive, "Run" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMWowRunGlob, accessor="registry")
+      LET HKLMWowRunOnce <= SELECT "HKLM" AS Hive, "RunOnce" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMWowRunOnceGlob, accessor="registry")
+      LET HKCURun <= SELECT "HKCU" AS Hive, "Run" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKCURunGlob, accessor="registry")
+      LET HKCURunOnce <= SELECT "HKCU" AS Hive, "RunOnce" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKCURunOnceGlob, accessor="registry")
+      LET AllEntries <= SELECT * FROM chain(a=HKLMRun, b=HKLMRunOnce, c=HKLMWowRun, d=HKLMWowRunOnce, e=HKCURun, f=HKCURunOnce)
+      SELECT
+        Hive,
+        KeyType,
+        OSPath AS RegistryPath,
+        Name AS ValueName,
+        CommandLine,
+        Mtime,
+        if(condition=CommandLine =~ SuspiciousRegex,
+          then="HIGH",
+          else="INFO") AS RiskLevel
+      FROM AllEntries
+      WHERE RegistryPath =~ FilterRegex OR CommandLine =~ FilterRegex
+
+  - name: ReferencedFileDetails
+    description: File metadata and hashes for autorun entries that contain a direct executable script path without arguments.
+    query: |
+      LET HKLMRun <= SELECT "HKLM" AS Hive, "Run" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMRunGlob, accessor="registry")
+      LET HKLMRunOnce <= SELECT "HKLM" AS Hive, "RunOnce" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMRunOnceGlob, accessor="registry")
+      LET HKLMWowRun <= SELECT "HKLM" AS Hive, "Run" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMWowRunGlob, accessor="registry")
+      LET HKLMWowRunOnce <= SELECT "HKLM" AS Hive, "RunOnce" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKLMWowRunOnceGlob, accessor="registry")
+      LET HKCURun <= SELECT "HKCU" AS Hive, "Run" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKCURunGlob, accessor="registry")
+      LET HKCURunOnce <= SELECT "HKCU" AS Hive, "RunOnce" AS KeyType, OSPath, Name, Data.value AS CommandLine, Mtime
+        FROM glob(globs=HKCURunOnceGlob, accessor="registry")
+      LET AllEntries <= SELECT * FROM chain(a=HKLMRun, b=HKLMRunOnce, c=HKLMWowRun, d=HKLMWowRunOnce, e=HKCURun, f=HKCURunOnce)
+      LET FileCandidates <= SELECT
+          Hive,
+          KeyType,
+          OSPath AS RegistryPath,
+          Name AS ValueName,
+          CommandLine,
+          CommandLine AS FilePath
+        FROM AllEntries
+        WHERE CommandLine =~ "(?i)^[A-Z]:[\\/][^\" ]+\.(exe|dll|bat|cmd|ps1|vbs|js)$"
+      SELECT * FROM foreach(
+        row=FileCandidates,
+        query={
+          SELECT
+            Hive,
+            KeyType,
+            RegistryPath,
+            ValueName,
+            CommandLine,
+            FilePath,
+            Size,
+            Mtime,
+            Btime,
+            Ctime,
+            Atime,
+            hash(path=FilePath, hashselect="MD5,SHA256") AS Hashes
+          FROM stat(filename=FilePath)
+        })
+      WHERE Size > 0
+
+column_types:
+  - name: RegistryPath
+    type: path
+  - name: FilePath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Hashes
+    type: hashes

@@ -1,0 +1,153 @@
+name: Custom.DFIR.TorAndC2ConnectionDetector
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect processes communicating with TOR exit nodes or known C2 IP ranges.
+  
+  Monitors active network connections via netstat() and correlates them against
+  known TOR exit node lists and common C2 IP ranges. Also checks for TOR-related
+  processes and DNS queries to suspicious domains.
+
+reference:
+  - https://attack.mitre.org/techniques/T1090.003/
+
+type: CLIENT
+
+parameters:
+  - name: TorExitIPs
+    type: csv
+    default: |
+      IP
+      185.220.101.0
+      185.220.101.1
+      185.220.101.2
+      185.220.101.3
+      185.220.101.4
+      185.220.101.5
+      185.220.101.6
+      185.220.101.7
+      185.220.101.8
+      185.220.101.9
+      185.220.101.10
+      185.220.101.11
+      185.220.101.12
+      185.220.101.13
+      185.220.101.14
+      185.220.101.15
+      185.220.101.16
+      185.220.101.17
+      185.220.101.18
+      185.220.101.19
+      185.220.101.20
+      199.249.230.0
+      199.249.230.1
+      199.249.230.2
+      199.249.230.3
+      199.249.230.4
+      199.249.230.5
+      199.249.230.6
+      199.249.230.7
+      199.249.230.8
+      199.249.230.9
+      209.141.58.0
+      209.141.58.1
+      209.141.58.2
+      209.141.58.3
+      209.141.58.4
+      209.141.58.5
+      209.141.58.6
+      209.141.58.7
+      209.141.58.8
+      209.141.58.9
+  - name: C2IPRanges
+    type: csv
+    default: |
+      IP
+      45.33.32.0
+      45.33.32.1
+      45.33.32.2
+      45.33.32.3
+      45.33.32.4
+      45.33.32.5
+      45.33.32.6
+      45.33.32.7
+      45.33.32.8
+      45.33.32.9
+      91.219.236.0
+      91.219.236.1
+      91.219.236.2
+      91.219.236.3
+      91.219.236.4
+      91.219.236.5
+      91.219.236.6
+      91.219.236.7
+      91.219.236.8
+      91.219.236.9
+  - name: TorProcessRegex
+    type: regex
+    default: "(?i)(tor|tor-browser|firefox.*tor|obfs4proxy|meek-client|snowflake-client|lyrebird)"
+  - name: SuspiciousDomainRegex
+    type: regex
+    default: "(?i)\\.(onion|tor2web|onion\\.to|onion\\.pet|onion\\.ly)$"
+
+sources:
+  - name: NetworkConnections
+    description: Detect active network connections to TOR exit nodes and known C2 IP ranges
+    query: |
+      LET TorIPs <= SELECT IP FROM foreach(row=TorExitIPs, query={SELECT IP FROM scope()})
+      LET C2IPs <= SELECT IP FROM foreach(row=C2IPRanges, query={SELECT IP FROM scope()})
+      LET Connections = SELECT Pid, Name, Exe, CommandLine, Username,
+          Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+          Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort,
+          Status, Timestamp
+      FROM netstat()
+      LET Enriched = SELECT
+          Pid,
+          Name AS ProcessName,
+          Exe AS ProcessPath,
+          CommandLine,
+          Username,
+          LocalIP,
+          LocalPort,
+          RemoteIP,
+          RemotePort,
+          Status,
+          Timestamp,
+          if(condition=RemoteIP IN TorIPs.IP, then="TOR_EXIT_NODE",
+             else=if(condition=RemoteIP IN C2IPs.IP, then="KNOWN_C2_RANGE",
+             else="UNKNOWN")) AS ThreatCategory
+      FROM Connections
+      SELECT * FROM Enriched
+      WHERE ThreatCategory != "UNKNOWN"
+
+  - name: TorProcessDetection
+    description: Detect TOR-related processes running on the system
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+         CreateTime, if(condition=Name =~ TorProcessRegex, then="TOR_PROCESS",
+             else=if(condition=CommandLine =~ TorProcessRegex, then="TOR_PROCESS",
+             else=if(condition=Exe =~ TorProcessRegex, then="TOR_PROCESS",
+             else="CLEAN"))) AS DetectionType
+      FROM pslist()
+      WHERE Name =~ TorProcessRegex OR CommandLine =~ TorProcessRegex OR Exe =~ TorProcessRegex
+
+  - name: SuspiciousDNS
+    description: Detect DNS queries to TOR-related or suspicious domains from DNS cache
+    query: |
+      LET DNSCache = SELECT * FROM foreach(row={
+         SELECT OSPath FROM glob(globs="C:/Windows/System32/drivers/etc/hosts")
+      }, query={
+         SELECT Line FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+      })
+      LET ParsedHosts = SELECT
+          regex_replace(re="^\\s*#.*", replace="", source=Line) AS Line
+      FROM DNSCache
+      WHERE Line =~ SuspiciousDomainRegex AND NOT Line =~ "^\\s*#"
+      SELECT * FROM ParsedHosts
+
+column_types:
+  - name: Timestamp
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: ProcessPath
+    type: filepath

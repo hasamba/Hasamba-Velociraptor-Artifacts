@@ -1,16 +1,14 @@
 name: Custom.DFIR.SuspiciousOutboundLongRunningProcesses
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Hunts for suspicious outbound network connections from long-running processes.
+  Hunt for suspicious outbound network connections from long-running processes.
 
   Long-running processes that maintain persistent outbound connections may indicate
-  command-and-control (C2) beaconing or data exfiltration (MITRE ATT&CK T1041 —
-  Exfiltration Over C2 Channel). Attackers often inject into or abuse legitimate
-  long-lived processes (e.g., browsers, system services) to blend in with normal traffic.
-
-  This artifact correlates netstat() active connections with pslist() process metadata
-  to surface processes with high uptime making outbound connections, especially those
-  running from suspicious filesystem locations or connecting to non-standard ports.
+  command-and-control activity, tunneling, remote access abuse, or exfiltration over
+  an existing channel (MITRE ATT&CK T1041). This artifact correlates netstat() active
+  connections with pslist() process metadata to surface long-lived processes making
+  outbound connections, with risk scoring based on remote ports and suspicious
+  executable locations.
 
   Platform: Windows / Linux (cross-platform).
 
@@ -22,29 +20,29 @@ type: CLIENT
 
 parameters:
   - name: MinUptimeSeconds
-    description: Minimum process uptime in seconds to flag as long-running (default 3600 = 1 hour)
+    description: Minimum process uptime in seconds to flag as long-running.
     type: int
     default: 3600
   - name: SuspiciousPortRegex
-    description: Regex of remote ports considered high-risk for outbound connections
+    description: Regex of remote ports considered high-risk for outbound connections.
     type: regex
     default: "^(4444|8080|8443|1337|31337|9999|6666|12345|54321|8888|9001|9030|1234|7777)$"
   - name: SuspiciousPathRegex
-    description: Regex matching executable paths that are inherently suspicious
+    description: Regex matching executable paths that are inherently suspicious.
     type: regex
     default: "(?i)(Temp|AppData.Local.Temp|ProgramData|Users.Public|/tmp|/dev/shm|/var/tmp|\\.ps1|\\.vbs|\\.bat|\\.sh)"
   - name: ExcludeProcessRegex
-    description: Regex of known-good process names to exclude from results
+    description: Regex of known-good process names to exclude from results.
     type: regex
     default: "(?i)(svchost\\.exe|lsass\\.exe|services\\.exe|smss\\.exe|csrss\\.exe|wininit\\.exe|MsMpEng\\.exe|spoolsv\\.exe)"
   - name: ExcludeRemoteIPRegex
-    description: Regex of remote IP ranges to exclude (loopback and RFC1918 private space)
+    description: Regex of remote IP ranges to exclude.
     type: regex
     default: "^(127\\.|0\\.0\\.0\\.0|::1$|fd[0-9a-f]{2}:|fe80:)"
 
 sources:
   - name: LongRunningOutbound
-    description: All established outbound connections from long-running processes with risk scoring
+    description: All established outbound connections from long-running processes with risk scoring.
     query: |
       LET ProcsLongRunning <= SELECT
         Pid,
@@ -96,7 +94,7 @@ sources:
       WHERE ProcessName != ""
 
   - name: HighRiskWithHashes
-    description: High-risk findings (suspicious port or path) enriched with executable hashes for threat intel
+    description: High-risk findings enriched with executable hashes for threat intel pivoting.
     query: |
       LET ProcsLR <= SELECT
         Pid,
@@ -158,5 +156,7 @@ column_types:
     type: timestamp
   - name: UptimeSeconds
     type: number
+  - name: ExecutablePath
+    type: path
   - name: ExecutableHashes
     type: string

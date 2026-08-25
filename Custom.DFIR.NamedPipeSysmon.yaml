@@ -1,0 +1,84 @@
+name: Custom.DFIR.NamedPipeSysmon
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for named pipe artifacts in Sysmon Event ID 17/18 (pipe creation/connection).
+  
+  Inter-process communication via named pipes is abused for lateral movement and privilege escalation (MITRE T1559.001).
+  This artifact parses Sysmon PipeEvent logs (EID 17 = Pipe Created, EID 18 = Pipe Connected) and filters
+  for suspicious pipe names, unusual processes, or known attack tool patterns.
+
+reference:
+  - https://attack.mitre.org/techniques/T1559.001/
+
+type: CLIENT
+
+parameters:
+  - name: SysmonGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+    description: Path to the Sysmon event log file.
+  - name: SuspiciousPipeRegex
+    type: regex
+    default: "(?i)(psexec|msf|meterpreter|cobalt|beacon|msse|lsass|winreg|svcctl|atsvc|samr|lsarpc|wkssvc|DAV|TSVCProc|ISystemActivator|epmapper|csexec|remcom|paexec|cbssvc|postex|msagent|protected_storage|NTControlPipe)"
+    description: Regex to flag suspicious or known-malicious pipe names.
+  - name: ProcessFilterRegex
+    type: regex
+    default: "."
+    description: Regex to filter by creating/connecting process image path.
+  - name: UploadFiles
+    type: bool
+    default: false
+    description: If true, upload the Sysmon EVTX file for offline analysis.
+
+sources:
+  - name: PipeEvents
+    description: Parse Sysmon Event ID 17 (Pipe Created) and 18 (Pipe Connected) for named pipe analysis.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.PipeName AS PipeName,
+            EventData.Image AS Image,
+            EventData.ProcessGuid AS ProcessGuid,
+            EventData.ProcessId AS ProcessId,
+            EventData.User AS User
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value IN (17, 18)
+            AND EventData.PipeName =~ SuspiciousPipeRegex
+            AND EventData.Image =~ ProcessFilterRegex
+        })
+
+      SELECT
+        EventTime,
+        if(condition=EventID=17, then="Pipe Created", else=if(condition=EventID=18, then="Pipe Connected", else="Unknown")) AS EventType,
+        EventID,
+        PipeName,
+        Image,
+        ProcessGuid,
+        ProcessId,
+        User
+      FROM RawEvents
+
+  - name: Upload
+    description: Upload the Sysmon EVTX file for offline analysis.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonGlob)
+      SELECT * FROM if(
+        condition=UploadFiles,
+        then={
+          SELECT OSPath, upload(file=OSPath) AS Upload FROM EvtxFiles
+        },
+        else={
+          SELECT * FROM scope() WHERE FALSE
+        })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: Image
+    type: path

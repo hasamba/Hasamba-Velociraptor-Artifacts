@@ -1,0 +1,70 @@
+name: Custom.DFIR.LinuxWebshellGlobHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for possible Linux webshells in common web server document roots using glob patterns.
+
+  This artifact searches configurable Linux web roots for suspicious script filenames and
+  webshell-like content patterns related to ATT&CK T1505.003. It is tuned for triage:
+  small candidate files are inspected, hashes are calculated, and optional uploads can
+  preserve evidence for deeper review.
+
+reference:
+  - https://attack.mitre.org/techniques/T1505.003/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: /var/www/**/*
+  - name: ExtensionRegex
+    type: regex
+    default: '(?i)\.(php[0-9]?|phtml|phar|asp|aspx|jsp|jspx|war|cgi|pl|py|sh)$'
+  - name: FilenameRegex
+    type: regex
+    default: '(?i)(shell|webshell|cmd|command|exec|upload|uploader|backdoor|bypass|wso|c99|r57|china|kacak|indoxploit|adminer|mini|mailer|priv8|alfa|sadrazam|symlink)'
+  - name: ContentRegex
+    type: regex
+    default: '(?i)(eval\s*\(|assert\s*\(|system\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|base64_decode\s*\(|gzinflate\s*\(|str_rot13\s*\(|preg_replace\s*\(.*/e|cmd=|execute\s*command|FilesMan|WSO|c99shell|r57shell|php_uname\s*\(|/bin/(ba)?sh|chmod\s+0777)'
+  - name: MaxSizeBytes
+    type: int
+    default: 1048576
+  - name: ReadBytes
+    type: int
+    default: 65536
+  - name: UploadMatches
+    type: bool
+    default: false
+
+sources:
+  - name: WebshellCandidates
+    description: Files under web document roots with suspicious extensions, names, or content.
+    query: |
+      LET CandidateFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=TargetGlob)
+        WHERE Size > 0 AND Size <= MaxSizeBytes
+          AND (OSPath =~ ExtensionRegex OR OSPath =~ FilenameRegex)
+
+      LET Matches <= SELECT OSPath, Size, Mtime, Ctime, Btime,
+          hash(path=OSPath) AS Hash,
+          read_file(filename=OSPath, length=ReadBytes) AS Snippet
+        FROM CandidateFiles
+        WHERE OSPath =~ FilenameRegex OR Snippet =~ ContentRegex
+
+      SELECT OSPath, Size, Mtime, Ctime, Btime, Hash, Snippet,
+        if(condition=UploadMatches,
+          then=upload(file=OSPath),
+          else='Upload disabled') AS Upload
+      FROM Matches
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Hash
+    type: hash

@@ -1,0 +1,110 @@
+name: Custom.DFIR.ComObjectHijackingRegistryPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for COM object hijacking persistence in Windows registry CLSID registrations.
+
+  Attackers can persist by creating or overriding COM registrations under user or
+  machine hives, especially InprocServer32, LocalServer32, InprocHandler32, and
+  TreatAs subkeys. User-hive CLSID entries are high-value because Windows checks
+  HKCU class registrations before HKLM, allowing non-admin persistence that
+  shadows legitimate COM classes.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.015/
+  - https://bohops.com/2018/08/18/abusing-the-com-registry-structure-part-2-loading-techniques-for-evasion-and-persistence/
+  - https://learn.microsoft.com/en-us/windows/win32/com/clsid-key-hklm
+
+type: CLIENT
+
+parameters:
+  - name: RegistryGlobs
+    type: csv
+    default: |
+      HKEY_USERS/*/Software/Classes/CLSID/*/InprocServer32/@
+      HKEY_USERS/*/Software/Classes/CLSID/*/LocalServer32/@
+      HKEY_USERS/*/Software/Classes/CLSID/*/InprocHandler32/@
+      HKEY_USERS/*/Software/Classes/CLSID/*/TreatAs/@
+      HKEY_USERS/*/Software/Classes/Wow6432Node/CLSID/*/InprocServer32/@
+      HKEY_USERS/*/Software/Classes/Wow6432Node/CLSID/*/LocalServer32/@
+      HKEY_LOCAL_MACHINE/Software/Classes/CLSID/*/InprocServer32/@
+      HKEY_LOCAL_MACHINE/Software/Classes/CLSID/*/LocalServer32/@
+      HKEY_LOCAL_MACHINE/Software/Classes/CLSID/*/InprocHandler32/@
+      HKEY_LOCAL_MACHINE/Software/Classes/CLSID/*/TreatAs/@
+      HKEY_LOCAL_MACHINE/Software/Classes/Wow6432Node/CLSID/*/InprocServer32/@
+      HKEY_LOCAL_MACHINE/Software/Classes/Wow6432Node/CLSID/*/LocalServer32/@
+    description: Registry value globs for COM server and TreatAs registrations.
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Return only entries whose registry path or value matches this regex.
+  - name: SuspiciousPathRegex
+    type: regex
+    default: "(?i)(appdata|\\btemp\\b|\\btmp\\b|programdata|public|downloads|desktop|roaming|localappdata|users\\\\public|\\.dat$|\\.tmp$)"
+    description: Regex used to flag suspicious COM server paths.
+  - name: UserHiveRegex
+    type: regex
+    default: "(?i)^HKEY_USERS/"
+    description: Registry path regex for user-hive COM registrations.
+  - name: HashPayloads
+    type: bool
+    default: true
+    description: Attempt to stat and hash suspicious COM server DLL/EXE payloads.
+
+sources:
+  - name: COMRegistryCandidates
+    description: COM CLSID server and TreatAs registrations that match the supplied filters.
+    query: |
+      LET Entries <= SELECT
+          OSPath AS RegistryPath,
+          Data.value AS ServerValue,
+          Mtime AS LastModified
+        FROM glob(globs=RegistryGlobs, accessor="registry")
+        WHERE OSPath =~ FilterRegex OR Data.value =~ FilterRegex
+
+      SELECT
+        RegistryPath,
+        ServerValue,
+        LastModified,
+        if(condition=RegistryPath =~ UserHiveRegex, then="UserHiveOverride", else="MachineHiveRegistration") AS Scope,
+        if(condition=RegistryPath =~ "(?i)/TreatAs/@", then="TreatAs", else="ServerPath") AS HijackVector,
+        if(condition=ServerValue =~ SuspiciousPathRegex OR RegistryPath =~ UserHiveRegex, then="HIGH", else="REVIEW") AS RiskLevel
+      FROM Entries
+
+  - name: SuspiciousPayloadHashes
+    description: File metadata and hashes for suspicious COM server payload paths when they exist on disk.
+    query: |
+      LET SuspiciousValues <= SELECT
+          OSPath AS RegistryPath,
+          Data.value AS ServerValue
+        FROM glob(globs=RegistryGlobs, accessor="registry")
+        WHERE Data.value =~ SuspiciousPathRegex
+
+      LET PayloadStats <= SELECT
+          RegistryPath,
+          ServerValue AS FilePath,
+          Size,
+          Mtime AS LastModified,
+          if(condition=HashPayloads, then=hash(path=ServerValue, hashselect="MD5,SHA256").MD5, else="") AS MD5,
+          if(condition=HashPayloads, then=hash(path=ServerValue, hashselect="MD5,SHA256").SHA256, else="") AS SHA256
+        FROM foreach(
+          row=SuspiciousValues,
+          query={
+            SELECT RegistryPath, ServerValue, Size, Mtime
+            FROM stat(filename=ServerValue)
+          })
+
+      SELECT RegistryPath, FilePath, Size, LastModified, MD5, SHA256
+      FROM PayloadStats
+      WHERE Size >= 0
+
+column_types:
+  - name: LastModified
+    type: timestamp
+  - name: RegistryPath
+    type: preview_upload
+  - name: FilePath
+    type: preview_upload
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash

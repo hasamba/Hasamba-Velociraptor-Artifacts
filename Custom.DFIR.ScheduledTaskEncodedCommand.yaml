@@ -1,0 +1,164 @@
+name: Custom.DFIR.ScheduledTaskEncodedCommand
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for scheduled tasks created via schtasks.exe with encoded commands.
+  Adversaries often abuse schtasks.exe to establish persistence using encoded
+  command arguments (base64 via /create /ru /rp /tr with encoded payloads).
+  This artifact inspects Windows Scheduled Task XML files and the Task Scheduler
+  registry for tasks whose execution command contains base64-encoded strings,
+  ps/cmd encodings, or other obfuscation indicators.
+
+reference:
+  - https://attack.mitre.org/techniques/T1053.005/
+
+type: CLIENT
+
+parameters:
+  - name: TaskXmlGlob
+    type: glob
+    default: "C:/Windows/System32/Tasks/**/*.xml"
+  - name: TaskGlobAlt
+    type: glob
+    default: "C:/Windows/SysWOW64/Tasks/**/*.xml"
+  - name: EncodedCommandRegex
+    type: regex
+    default: "(?i)(-encod|-enco|^e\\s|JABjAGwA|AAEAOAA|YgBVA|IABJAE|FromBase64String|\\\\x[0-9a-f]{2}|[A-Za-z0-9+/]{40,}={0,2})"
+  - name: SchTasksRegex
+    type: regex
+    default: "(?i)schtasks"
+  - name: UploadFiles
+    type: bool
+    default: Y
+
+sources:
+  - name: TaskXmlFiles
+    description: |
+      Parse Scheduled Task XML files looking for encoded or obfuscated commands.
+      Checks the <Command>, <Arguments>, and <Execute> XML elements for base64
+      and encoding indicators matching EncodedCommandRegex.
+    query: |
+      LET TaskFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=[TaskXmlGlob, TaskGlobAlt])
+
+      LET Parsed <= SELECT
+        OSPath,
+        Size,
+        Mtime,
+        parse_xml(file=OSPath) AS TaskXml
+      FROM TaskFiles
+      WHERE Size > 0 AND log(message="Processing task file: " + OSPath)
+
+      LET Extracted <= SELECT
+        OSPath,
+        Mtime,
+        basename(path=OSPath) AS TaskName,
+        TaskXml AS _RawXml,
+        if(condition=TaskXml.Task.RegistrationInfo AND TaskXml.Task.RegistrationInfo.Description,
+           then=TaskXml.Task.RegistrationInfo.Description.Value,
+           else="") AS TaskDescription,
+        if(condition=TaskXml.Task.Actions AND TaskXml.Task.Actions.Exec,
+           then=if(condition=typeof(item=TaskXml.Task.Actions.Exec)="_dict",
+                   then=TaskXml.Task.Actions.Exec.Command.Value,
+                   else=""),
+           else="") AS CommandPath,
+        if(condition=TaskXml.Task.Actions AND TaskXml.Task.Actions.Exec,
+           then=if(condition=typeof(item=TaskXml.Task.Actions.Exec)="_dict",
+                   then=if(condition=TaskXml.Task.Actions.Exec.Arguments,
+                           then=TaskXml.Task.Actions.Exec.Arguments.Value,
+                           else=""),
+                   else=""),
+           else="") AS Arguments
+      FROM Parsed
+
+      LET FullCommand <= SELECT *,
+        if(condition=Arguments AND CommandPath,
+           then=CommandPath + " " + Arguments,
+           else=if(condition=CommandPath,
+                    then=CommandPath,
+                    else="")) AS FullCommandLine
+      FROM Extracted
+
+      SELECT
+        OSPath AS TaskXmlPath,
+        TaskName,
+        Mtime,
+        TaskDescription,
+        CommandPath,
+        Arguments,
+        FullCommandLine,
+        if(condition=FullCommandLine =~ EncodedCommandRegex,
+           then="YES",
+           else="NO") AS EncodedCommandDetected
+      FROM FullCommand
+      WHERE FullCommandLine =~ SchTasksRegex OR FullCommandLine =~ EncodedCommandRegex OR CommandPath =~ SchTasksRegex
+
+  - name: RegistryTaskInfo
+    description: |
+      Enumerate scheduled task entries from the Windows registry, looking for
+      tasks with encoded commands or schtasks.exe invocation patterns.
+    query: |
+      LET RegKeys <= SELECT OSPath, Data, Mtime FROM glob(
+        globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows NT/CurrentVersion/Schedule/TaskCache/Tasks/*",
+        accessor="registry")
+
+      LET ParsedReg <= SELECT
+        OSPath AS RegistryKey,
+        Mtime,
+        Data AS RawData,
+        if(condition=Data =~ EncodedCommandRegex,
+           then="YES",
+           else="NO") AS EncodedDetected,
+        if(condition=Data =~ SchTasksRegex,
+           then="YES",
+           else="NO") AS SchTasksDetected
+      FROM RegKeys
+
+      SELECT *
+      FROM ParsedReg
+      WHERE EncodedDetected = "YES" OR SchTasksDetected = "YES"
+
+  - name: EventLogEvidence
+    description: |
+      Search Windows event logs for schtasks.exe process creation events
+      (Security 4688, Sysmon 1) that contain encoded command indicators.
+    query: |
+      LET SecurityEvtx <= SELECT OSPath FROM glob(
+        globs="C:/Windows/System32/winevt/Logs/Security.evtx")
+
+      LET SysmonEvtx <= SELECT OSPath FROM glob(
+        globs="C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx")
+
+      LET AllEvtx <= SELECT OSPath FROM chain(
+        a=SecurityEvtx,
+        b=SysmonEvtx)
+
+      LET Parsed <= SELECT * FROM foreach(
+        row=AllEvtx,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.NewProcessName AS ProcessName,
+            EventData.CommandLine AS CommandLine,
+            EventData.SubjectUserName AS SubjectUser,
+            OSPath AS EvtxFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE (EventID = 4688 OR EventID = 1)
+            AND (CommandLine =~ SchTasksRegex OR CommandLine =~ EncodedCommandRegex)
+        })
+
+      SELECT
+        EventTime,
+        EventID,
+        ProcessName,
+        CommandLine,
+        SubjectUser,
+        EvtxFile
+      FROM Parsed
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: TaskXmlPath
+    type: filepath

@@ -1,0 +1,105 @@
+name: Custom.DFIR.CryptoMinerHighCpuProcessHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect cryptocurrency miner activity by combining miner-like process names,
+  suspicious command lines, execution from temp and user-writable locations, and
+  sustained high CPU time.
+
+  This is a cross-platform artifact for endpoints that expose process telemetry.
+reference:
+  - https://attack.mitre.org/techniques/T1496/
+type: CLIENT
+parameters:
+  - name: NameRegex
+    type: regex
+    default: '(?i)(xmrig|minerd|cpuminer|sgminer|bfgminer|t-rex|gminer|lolminer|kdevtmpfsi|kinsing|cryptonight|xmr-stak|nanominer|teamredminer|nbminer|phoenixminer|claymore|wildrig|monero-miner)'
+    description: Regex used to match miner-like process names.
+  - name: ExePathRegex
+    type: regex
+    default: '(?i)(/tmp/|/var/tmp/|/dev/shm/|/home/.*/Downloads/|AppData\\Local\\Temp|\\Windows\\Temp)'
+    description: Regex used to match suspicious execution paths.
+  - name: CmdlineRegex
+    type: regex
+    default: '(?i)(stratum\+tcp|stratum\+ssl|--pool|--url|--user|--pass|--wallet|rig-id|coinhive|randomx|cryptonight|monero|xmr)'
+    description: Regex used to match miner-style command line arguments.
+  - name: MinCpuTimeSeconds
+    type: int
+    default: 300
+    description: Minimum cumulative CPU time needed to flag a process as high-CPU.
+  - name: IncludeHashes
+    type: bool
+    default: true
+    description: Hash suspicious binaries when the executable path is available.
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: path
+  - name: OSPath
+    type: path
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
+  - name: CpuTimeSeconds
+    type: number
+  - name: Size
+    type: number
+sources:
+  - name: SuspiciousProcesses
+    description: Processes matching miner names, suspicious paths, miner command lines, or high cumulative CPU time.
+    query: |
+      LET Procs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime, UserTime, KernelTime FROM pslist()
+      SELECT
+        timestamp(epoch=CreateTime) AS CreateTime,
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        UserTime,
+        KernelTime,
+        UserTime + KernelTime AS CpuTimeSeconds,
+        if(condition=IncludeHashes AND Exe, then=hash(path=Exe, hashselect="MD5,SHA256").MD5, else="") AS MD5,
+        if(condition=IncludeHashes AND Exe, then=hash(path=Exe, hashselect="MD5,SHA256").SHA256, else="") AS SHA256
+      FROM Procs
+      WHERE Name =~ NameRegex
+        OR Exe =~ ExePathRegex
+        OR CommandLine =~ CmdlineRegex
+        OR (UserTime + KernelTime) >= MinCpuTimeSeconds
+  - name: HighCpuMinerProcesses
+    description: Running processes that match miner indicators and are also consuming sustained CPU time.
+    query: |
+      LET Procs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime, UserTime, KernelTime FROM pslist()
+      SELECT
+        timestamp(epoch=CreateTime) AS CreateTime,
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        UserTime,
+        KernelTime,
+        UserTime + KernelTime AS CpuTimeSeconds,
+        if(condition=IncludeHashes AND Exe, then=hash(path=Exe, hashselect="MD5,SHA256").MD5, else="") AS MD5,
+        if(condition=IncludeHashes AND Exe, then=hash(path=Exe, hashselect="MD5,SHA256").SHA256, else="") AS SHA256
+      FROM Procs
+      WHERE (Name =~ NameRegex
+        OR Exe =~ ExePathRegex
+        OR CommandLine =~ CmdlineRegex)
+        AND (UserTime + KernelTime) >= MinCpuTimeSeconds
+  - name: SuspiciousBinaryHashes
+    description: Hashes of miner-like binaries found in common user-writable and temp execution locations.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime FROM glob(globs=["/tmp/**", "/var/tmp/**", "/dev/shm/**", "/home/*/Downloads/**", "/home/*/.cache/**", "C:/Windows/Temp/**", "C:/Users/**/AppData/Local/Temp/**", "C:/Users/**/Downloads/**"])
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256
+      FROM Files
+      WHERE OSPath =~ NameRegex
+        OR OSPath =~ ExePathRegex

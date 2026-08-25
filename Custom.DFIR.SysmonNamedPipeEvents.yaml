@@ -1,0 +1,100 @@
+name: Custom.DFIR.SysmonNamedPipeEvents
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for named pipe creation and connection events from Sysmon Event ID 17 (PipeEvent) and 18 (PipeEvent).
+  Identifies suspicious named pipe activity associated with lateral movement via T1559.001 (Inter-Process Communication: Component Object Model).
+  Focuses on known malicious pipe names, cross-process pipe connections, and anomaly patterns.
+
+reference:
+  - https://attack.mitre.org/techniques/T1559.001/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Sysmon*.evtx"
+  - name: SuspiciousPipeRegex
+    type: regex
+    default: "(?i)(\\\\pipe\\\\(|msse-[0-9]|psexec|remcom|cobalt|postex|status_|\\\\pipe\\\\[0-9a-f]{8}|\\\\pipe\\\\msagent|\\\\pipe\\\\win_svc|\\\\pipe\\\\\\\\terminal|\\\\pipe\\\\lsass|\\\\pipe\\\\samr|\\\\pipe\\\\winreg|\\\\pipe\\\\srvsvc|\\\\pipe\\\\wkssvc|\\\\pipe\\\\eventlog|\\\\pipe\\\\svcctl|\\\\pipe\\\\atsvc|\\\\pipe\\\\lsarpc)"
+  - name: EventIDs
+    type: csv
+    default: |
+      EventID
+      17
+      18
+  - name: MaxRows
+    type: int
+    default: 5000
+
+sources:
+  - name: PipeEvents
+    description: |
+      Parse Sysmon Event ID 17 (Pipe Created) and 18 (Pipe Connected) from Evtx logs.
+      Extracts pipe name, creating/connecting process, PID, and image path.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.ImageName AS Image,
+            EventData.ProcessGuid AS ProcessGuid,
+            EventData.ProcessId.Value AS ProcessId,
+            EventData.PipeName AS PipeName
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value IN ("17", "18")
+        })
+
+      SELECT
+        EventTime,
+        EventID,
+        PipeName,
+        Image,
+        ProcessGuid,
+        ProcessId
+      FROM RawEvents
+      ORDER BY EventTime DESC
+      LIMIT 5000
+
+  - name: SuspiciousPipeActivity
+    description: |
+      Filter pipe events matching known suspicious or malicious pipe name patterns.
+      Flags events that may indicate COM hijacking, lateral movement, or C2 pipe usage.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.ImageName AS Image,
+            EventData.ProcessGuid AS ProcessGuid,
+            EventData.ProcessId.Value AS ProcessId,
+            EventData.PipeName AS PipeName
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value IN ("17", "18")
+        })
+
+      SELECT
+        EventTime,
+        EventID,
+        PipeName,
+        Image,
+        ProcessGuid,
+        ProcessId
+      FROM RawEvents
+      WHERE PipeName =~ SuspiciousPipeRegex
+      ORDER BY EventTime DESC
+      LIMIT 5000
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: EventID
+    type: int

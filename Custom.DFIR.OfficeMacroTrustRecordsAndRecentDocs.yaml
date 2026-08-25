@@ -1,0 +1,217 @@
+name: Custom.DFIR.OfficeMacroTrustRecordsAndRecentDocs
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Identifies Office macro enablement evidence from TrustRecords and correlates it with recent document registry traces.
+
+  Microsoft Office writes Trusted Documents TrustRecords when a user enables active content or macros for a document.
+  These registry values can remain after the file is closed or deleted, making them useful evidence for phishing and
+  macro execution investigations. This artifact collects TrustRecords across user hives, Office File MRU values, and
+  Windows RecentDocs entries, then optionally attempts to stat and hash directly referenced Office documents that still
+  exist on disk.
+
+  Aligned with MITRE ATT&CK T1137.001 - Office Application Startup: Office Template Macros.
+
+reference:
+  - https://attack.mitre.org/techniques/T1137.001/
+  - https://support.microsoft.com/en-us/office/enable-or-disable-macros-in-microsoft-365-files-12b036fd-d140-4e74-b45e-16fed1a7e5c6
+
+type: CLIENT
+
+parameters:
+  - name: TrustRecordsGlob
+    type: glob
+    default: "HKEY_USERS/*/SOFTWARE/Microsoft/Office/*/*/Security/Trusted Documents/TrustRecords/*"
+    description: Registry glob for Office Trusted Documents TrustRecords across all loaded user hives.
+  - name: OfficeMRUGlob
+    type: glob
+    default: "HKEY_USERS/*/SOFTWARE/Microsoft/Office/*/*/File MRU/*"
+    description: Registry glob for Office per-application File MRU values.
+  - name: WindowsRecentDocsGlob
+    type: glob
+    default: "HKEY_USERS/*/SOFTWARE/Microsoft/Windows/CurrentVersion/Explorer/RecentDocs/**/*"
+    description: Registry glob for Windows Explorer RecentDocs values.
+  - name: UserSIDRegex
+    type: regex
+    default: "."
+    description: Return only entries whose user SID matches this regex.
+  - name: DocumentPathRegex
+    type: regex
+    default: '(?i)\.(doc|docm|dot|dotm|xls|xlsm|xlt|xltm|ppt|pptm|pot|potm)$'
+    description: Return entries whose document path or value matches this regex.
+  - name: SuspiciousPathRegex
+    type: regex
+    default: '(?i)(downloads|appdata|temp|tmp|content\.outlook|inetcache|desktop|public|onedrive|sharepoint|\\\\)'
+    description: Regex used to flag higher-risk document locations.
+  - name: HashExistingDocuments
+    type: bool
+    default: true
+    description: Attempt to stat and hash direct local document paths that still exist on disk.
+
+sources:
+  - name: OfficeTrustRecords
+    description: Trusted Documents TrustRecords showing Office documents where active content was trusted by a user.
+    query: |
+      LET TrustRecords <= SELECT
+          OSPath AS RegistryPath,
+          Name AS DocumentPath,
+          Data.value AS RawTrustRecord,
+          Data.type AS RegistryType,
+          Mtime AS LastModified,
+          split(string=OSPath, sep="/")[1] AS UserSID,
+          split(string=OSPath, sep="/")[5] AS OfficeVersion,
+          split(string=OSPath, sep="/")[6] AS OfficeApplication
+        FROM glob(globs=TrustRecordsGlob, accessor="registry")
+
+      SELECT
+        UserSID,
+        OfficeVersion,
+        OfficeApplication,
+        DocumentPath,
+        RawTrustRecord,
+        RegistryType,
+        LastModified,
+        RegistryPath,
+        if(condition=DocumentPath =~ SuspiciousPathRegex, then="HIGH", else="REVIEW") AS RiskLevel,
+        "OfficeTrustRecord" AS EvidenceType
+      FROM TrustRecords
+      WHERE UserSID =~ UserSIDRegex
+        AND DocumentPath =~ DocumentPathRegex
+
+  - name: OfficeRecentDocuments
+    description: Office File MRU values that help correlate trusted macro documents with recently opened Office files.
+    query: |
+      LET OfficeMRU <= SELECT
+          OSPath AS RegistryPath,
+          Name AS ValueName,
+          Data.value AS DocumentPath,
+          Data.type AS RegistryType,
+          Mtime AS LastModified,
+          split(string=OSPath, sep="/")[1] AS UserSID,
+          split(string=OSPath, sep="/")[5] AS OfficeVersion,
+          split(string=OSPath, sep="/")[6] AS OfficeApplication
+        FROM glob(globs=OfficeMRUGlob, accessor="registry")
+        WHERE Name =~ "(?i)^(Item|File)[ 0-9]*"
+
+      SELECT
+        UserSID,
+        OfficeVersion,
+        OfficeApplication,
+        ValueName,
+        DocumentPath,
+        RegistryType,
+        LastModified,
+        RegistryPath,
+        if(condition=DocumentPath =~ SuspiciousPathRegex, then="HIGH", else="INFO") AS RiskLevel,
+        "OfficeFileMRU" AS EvidenceType
+      FROM OfficeMRU
+      WHERE UserSID =~ UserSIDRegex
+        AND DocumentPath =~ DocumentPathRegex
+
+  - name: WindowsRecentDocs
+    description: Windows Explorer RecentDocs values for Office document extensions and recently accessed document names.
+    query: |
+      LET RecentDocs <= SELECT
+          OSPath AS RegistryPath,
+          Name AS ValueName,
+          Data.value AS RecentDocValue,
+          Data.type AS RegistryType,
+          Mtime AS LastModified,
+          split(string=OSPath, sep="/")[1] AS UserSID
+        FROM glob(globs=WindowsRecentDocsGlob, accessor="registry")
+        WHERE Name =~ "^[0-9]+$"
+
+      SELECT
+        UserSID,
+        ValueName,
+        RecentDocValue,
+        RegistryType,
+        LastModified,
+        RegistryPath,
+        if(condition=RegistryPath =~ SuspiciousPathRegex OR RecentDocValue =~ SuspiciousPathRegex, then="HIGH", else="INFO") AS RiskLevel,
+        "WindowsRecentDocs" AS EvidenceType
+      FROM RecentDocs
+      WHERE UserSID =~ UserSIDRegex
+        AND (RegistryPath =~ DocumentPathRegex OR RecentDocValue =~ DocumentPathRegex)
+
+  - name: ExistingDocumentHashes
+    description: File metadata and hashes for direct local document paths that are referenced by TrustRecords or Office MRU and still exist.
+    query: |
+      LET TrustDocuments <= SELECT
+          "OfficeTrustRecord" AS EvidenceType,
+          OSPath AS RegistryPath,
+          Name AS DocumentPath,
+          Mtime AS RegistryLastModified,
+          split(string=OSPath, sep="/")[1] AS UserSID
+        FROM glob(globs=TrustRecordsGlob, accessor="registry")
+        WHERE Name =~ "(?i)^[A-Z]:[\\/].*"
+          AND Name =~ DocumentPathRegex
+          AND split(string=OSPath, sep="/")[1] =~ UserSIDRegex
+
+      LET MRUDocuments <= SELECT
+          "OfficeFileMRU" AS EvidenceType,
+          OSPath AS RegistryPath,
+          Data.value AS DocumentPath,
+          Mtime AS RegistryLastModified,
+          split(string=OSPath, sep="/")[1] AS UserSID
+        FROM glob(globs=OfficeMRUGlob, accessor="registry")
+        WHERE Data.value =~ "(?i)^[A-Z]:[\\/].*"
+          AND Data.value =~ DocumentPathRegex
+          AND split(string=OSPath, sep="/")[1] =~ UserSIDRegex
+
+      LET CandidateDocuments <= SELECT * FROM chain(a=TrustDocuments, b=MRUDocuments)
+
+      SELECT * FROM if(condition=HashExistingDocuments,
+        then={
+          SELECT * FROM foreach(
+            row=CandidateDocuments,
+            query={
+              SELECT
+                UserSID,
+                EvidenceType,
+                RegistryPath,
+                DocumentPath,
+                RegistryLastModified,
+                Size,
+                Mtime,
+                Btime,
+                Ctime,
+                Atime,
+                hash(path=DocumentPath, hashselect="MD5,SHA256") AS Hashes
+              FROM stat(filename=DocumentPath)
+            })
+        },
+        else={
+          SELECT
+            UserSID,
+            EvidenceType,
+            RegistryPath,
+            DocumentPath,
+            RegistryLastModified,
+            0 AS Size,
+            "" AS Mtime,
+            "" AS Btime,
+            "" AS Ctime,
+            "" AS Atime,
+            "" AS Hashes
+          FROM CandidateDocuments
+        })
+
+column_types:
+  - name: LastModified
+    type: timestamp
+  - name: RegistryLastModified
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: RegistryPath
+    type: path
+  - name: DocumentPath
+    type: path
+  - name: Hashes
+    type: hashes

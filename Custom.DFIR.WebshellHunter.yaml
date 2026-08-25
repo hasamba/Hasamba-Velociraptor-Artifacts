@@ -1,0 +1,79 @@
+name: Custom.DFIR.WebshellHunter
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for webshells by scanning common web server document roots for suspicious files.
+  
+  Identifies potential webshells by globbing known web root directories and filtering
+  for PHP, JSP, ASP, and other web-script extensions that often appear in webshell
+  payloads. Checks file content for common webshell indicators (eval, base64_decode,
+  system, exec, shell_exec, passthru) and computes hashes for IOC matching.
+
+reference:
+  - https://attack.mitre.org/techniques/T1505.003/
+
+type: CLIENT
+
+parameters:
+  - name: WebRootGlobs
+    type: glob
+    default: |
+      /var/www/html/**/*
+      /var/www/*/public_html/**/*
+      /var/www/*/htdocs/**/*
+      /srv/www/**/*
+      /usr/share/nginx/html/**/*
+      /opt/lampp/htdocs/**/*
+      /home/*/public_html/**/*
+  - name: SuspiciousExtensionsRegex
+    type: regex
+    default: '\.(php|phtml|php[0-9]|jsp|jspx|asp|aspx|ashx|cgi|pl|py|sh|rb)$'
+  - name: WebshellContentRegex
+    type: regex
+    default: '(eval\s*\(|base64_decode\s*\(|system\s*\(|exec\s*\(|shell_exec\s*\(|passthru\s*\(|assert\s*\(|preg_replace\s*\(.*/[a-z]*e[a-z]*[''"][^''"]*|create_function\s*\(|call_user_func\s*\(|call_user_func_array\s*\(|$_(GET|POST|REQUEST|COOKIE)\s*\[|<\?php\s+@?assert|<\?=.*\$_|gzinflate\s*\(|gzuncompress\s*\(|str_rot13|chr\s*\(\s*\d+\s*\)|\\x[0-9a-f]{2})'
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: WebshellCandidates
+    description: |
+      Finds files in web document roots with suspicious extensions and webshell content patterns.
+    query: |
+      LET WebRootFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=split(string=WebRootGlobs, sep="\n"))
+        WHERE NOT IsDir
+          AND OSPath =~ SuspiciousExtensionsRegex
+
+      LET ContentChecked <= SELECT OSPath, Size, Mtime, Atime, Ctime,
+        read_file(filename=OSPath, length=65536) AS FileContent,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM WebRootFiles
+
+      LET Results <= SELECT OSPath, Size, Mtime, Atime, Ctime,
+        FileHash.MD5 AS MD5,
+        FileHash.SHA256 AS SHA256,
+        FileContent,
+        len(list=FileContent) AS ContentLength
+        FROM ContentChecked
+        WHERE FileContent =~ WebshellContentRegex
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Atime, Ctime, MD5, SHA256,
+            upload(file=OSPath) AS Upload
+          FROM Results
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Atime, Ctime, MD5, SHA256, ContentLength
+          FROM Results
+        })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: path

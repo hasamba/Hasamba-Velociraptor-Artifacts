@@ -1,0 +1,127 @@
+name: Custom.DFIR.Kerberoasting4769Detector
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect potential Kerberoasting activity by hunting Windows Security Event ID 4769.
+  Focuses on ticket requests for service accounts, with tunable regex filters for
+  service names, client addresses, and account patterns.
+
+reference:
+  - https://attack.mitre.org/techniques/T1558.003/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+  - name: ServiceNameRegex
+    type: regex
+    default: "(?i)^(MSSQLSvc|HTTP|CIFS|HOST|LDAP|WSMAN|TERMSRV|SAP|Exchange|krbtgt|.*$)"
+  - name: ClientAddressRegex
+    type: regex
+    default: "."
+  - name: AccountNameRegex
+    type: regex
+    default: "."
+  - name: RequestCountThreshold
+    type: int
+    default: 10
+
+sources:
+  - name: Kerberoast4769Events
+    description: Windows Security 4769 events that match the supplied service/account filters.
+    query: |
+      LET SecurityLogs <= SELECT OSPath
+        FROM glob(globs=SecurityLogGlob)
+        WHERE OSPath =~ ".*Security\\.evtx$"
+
+      LET ParsedEvents <= SELECT
+          OSPath,
+          System.TimeCreated.SystemTime AS EventTime,
+          System.EventID.Value AS EventID,
+          EventData.TargetUserName AS ServiceName,
+          EventData.IpAddress AS ClientAddress,
+          EventData.IpPort AS ClientPort,
+          EventData.ServiceName AS RequestedSPN,
+          EventData.TicketEncryptionType AS TicketEncryptionType,
+          EventData.AccountName AS AccountName,
+          EventData.Status AS Status,
+          EventData.TicketOptions AS TicketOptions,
+          EventData.TicketHash AS TicketHash,
+          EventData
+        FROM foreach(
+          row=SecurityLogs,
+          query={
+            SELECT *
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4769
+          }
+        )
+
+      SELECT
+        EventTime,
+        EventID,
+        OSPath,
+        ServiceName,
+        RequestedSPN,
+        AccountName,
+        ClientAddress,
+        ClientPort,
+        TicketEncryptionType,
+        Status,
+        TicketOptions,
+        TicketHash,
+        EventData
+      FROM ParsedEvents
+      WHERE ServiceName =~ ServiceNameRegex
+        AND ClientAddress =~ ClientAddressRegex
+        AND AccountName =~ AccountNameRegex
+        AND (RequestedSPN =~ ServiceNameRegex OR ServiceName =~ ServiceNameRegex)
+      ORDER BY EventTime DESC
+
+  - name: ServiceRequestSummary
+    description: Counts of matching 4769 requests grouped by service name and client address.
+    query: |
+      LET SecurityLogs <= SELECT OSPath
+        FROM glob(globs=SecurityLogGlob)
+        WHERE OSPath =~ ".*Security\\.evtx$"
+
+      LET ParsedEvents <= SELECT
+          System.TimeCreated.SystemTime AS EventTime,
+          EventData.TargetUserName AS ServiceName,
+          EventData.IpAddress AS ClientAddress,
+          EventData.ServiceName AS RequestedSPN,
+          EventData.AccountName AS AccountName
+        FROM foreach(
+          row=SecurityLogs,
+          query={
+            SELECT *
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4769
+          }
+        )
+
+      SELECT
+        ServiceName,
+        RequestedSPN,
+        ClientAddress,
+        AccountName,
+        count() AS RequestCount
+      FROM ParsedEvents
+      WHERE ServiceName =~ ServiceNameRegex
+        AND ClientAddress =~ ClientAddressRegex
+        AND AccountName =~ AccountNameRegex
+      GROUP BY ServiceName, RequestedSPN, ClientAddress, AccountName
+      ORDER BY RequestCount DESC
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: TicketHash
+    type: hash

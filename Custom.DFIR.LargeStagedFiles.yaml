@@ -1,0 +1,108 @@
+name: Custom.DFIR.LargeStagedFiles
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects large files staged in temporary and user-accessible directories prior to exfiltration.
+
+  Threat actors commonly aggregate sensitive data into archives or bulk files within
+  world-writable directories (%TEMP%, /tmp, Downloads, Desktop, Documents) before
+  transferring data off-network. This artifact scans configurable path globs for files
+  exceeding a configurable size threshold, filters by suspicious extension regex,
+  computes MD5 and SHA256 hashes, and optionally uploads artifacts for triage.
+
+  Covers Windows, Linux, and macOS. Maps to MITRE ATT&CK T1074.001 (Data Staged: Local Data Staging).
+
+reference:
+  - https://attack.mitre.org/techniques/T1074.001/
+
+type: CLIENT
+
+parameters:
+  - name: WindowsGlob
+    description: Glob for Windows user staging directories
+    type: glob
+    default: "C:/Users/**"
+  - name: WindowsTempGlob
+    description: Glob for Windows system temp directory
+    type: glob
+    default: "C:/Windows/Temp/**"
+  - name: LinuxGlob
+    description: Glob for Linux/macOS home directories
+    type: glob
+    default: "/home/**"
+  - name: LinuxTempGlob
+    description: Glob for Linux/macOS temp directories
+    type: glob
+    default: "/tmp/**"
+  - name: MinFileSizeMB
+    description: Minimum file size in megabytes to flag as potentially staged
+    type: int
+    default: 50
+  - name: FileExtensionRegex
+    description: Regex matching suspicious staging file extensions (archives, databases, dumps)
+    type: regex
+    default: "(?i)\\.(zip|tar|gz|7z|rar|bz2|xz|cab|iso|db|sqlite|sql|csv|xlsx|pst|ost|dmp|bin|dat|img|vmdk|vhd|mbox)$"
+  - name: ExcludePathRegex
+    description: Regex to exclude known-benign paths from results
+    type: regex
+    default: "(?i)(windows.assembly|AppData.Roaming.Microsoft|node_modules|\\.cache|OneDriveTemp)"
+  - name: UploadFiles
+    description: Upload matched files to the Velociraptor server for analysis
+    type: bool
+    default: false
+
+sources:
+  - name: WindowsStagedFiles
+    description: Large staged files found in Windows user and temp directories
+    query: |
+      LET MinBytes <= MinFileSizeMB * 1024 * 1024
+      LET RawFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=[WindowsGlob, WindowsTempGlob])
+        WHERE NOT IsDir
+          AND Size > MinBytes
+          AND OSPath =~ FileExtensionRegex
+          AND NOT OSPath =~ ExcludePathRegex
+      LET WithHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM RawFiles
+      SELECT OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        FileHash.MD5 AS MD5,
+        FileHash.SHA256 AS SHA256,
+        if(condition=UploadFiles, then=upload(file=OSPath), else=NULL) AS Upload
+      FROM WithHashes
+
+  - name: LinuxStagedFiles
+    description: Large staged files found in Linux/macOS home and temp directories
+    query: |
+      LET MinBytes <= MinFileSizeMB * 1024 * 1024
+      LET RawFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=[LinuxGlob, LinuxTempGlob, "/var/tmp/**", "/root/**", "/Users/**"])
+        WHERE NOT IsDir
+          AND Size > MinBytes
+          AND OSPath =~ FileExtensionRegex
+          AND NOT OSPath =~ ExcludePathRegex
+      LET WithHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM RawFiles
+      SELECT OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        FileHash.MD5 AS MD5,
+        FileHash.SHA256 AS SHA256,
+        if(condition=UploadFiles, then=upload(file=OSPath), else=NULL) AS Upload
+      FROM WithHashes
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: path

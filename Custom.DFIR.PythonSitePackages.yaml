@@ -1,0 +1,161 @@
+name: Custom.DFIR.PythonSitePackages
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for recently installed or modified Python/pip packages in site-packages directories.
+  
+  Identifies Python packages that were recently installed or modified, which may indicate
+  supply chain compromise (T1195.001) — malicious packages slipped into site-packages via
+  pip install, dependency confusion, or typosquatting attacks.
+  
+  Scans common site-packages locations across platforms, reports package metadata, 
+  modification times, and hashes for forensic triage.
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+
+type: CLIENT
+
+parameters:
+  - name: RecentDays
+    type: int
+    default: 7
+    description: Number of days to consider as "recent" for modified packages
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Regex to filter package names (default matches all)
+  - name: UploadFiles
+    type: bool
+    default: false
+    description: Upload suspicious files for further analysis
+
+sources:
+  - name: SitePackagesLinux
+    description: Scan Linux/macOS site-packages directories
+    query: |
+      LET RecentCutoff <= now() - RecentDays * 86400
+
+      LET SitePkgPaths <= SELECT OSPath, Size, Mtime FROM glob(
+        globs=[
+          "/usr/lib/python3*/site-packages/*/*.dist-info/METADATA",
+          "/usr/lib/python3*/site-packages/*/*.dist-info/RECORD",
+          "/usr/local/lib/python3*/site-packages/*/*.dist-info/METADATA",
+          "/usr/local/lib/python3*/site-packages/*/*.dist-info/RECORD",
+          "/usr/lib/python3*/dist-packages/*/*.dist-info/METADATA",
+          "/usr/lib/python3*/dist-packages/*/*.dist-info/RECORD",
+          "/usr/local/lib/python3*/dist-packages/*/*.dist-info/METADATA",
+          "/usr/local/lib/python3*/dist-packages/*/*.dist-info/RECORD",
+          "/home/*/.local/lib/python3*/site-packages/*/*.dist-info/METADATA",
+          "/home/*/.local/lib/python3*/site-packages/*/*.dist-info/RECORD"
+        ])
+
+      LET ParsedMeta <= SELECT
+        OSPath,
+        OSPath.Dir.Dir.Basename AS PackageName,
+        OSPath.Dir.Basename AS DistInfoDir,
+        Size,
+        Mtime,
+        if(condition=Mtime > RecentCutoff, then=true, else=false) AS IsRecent,
+        read_file(filename=OSPath, length=512) AS MetadataSnippet
+      FROM SitePkgPaths
+
+      SELECT
+        PackageName,
+        DistInfoDir,
+        OSPath AS MetadataPath,
+        Size,
+        Mtime,
+        IsRecent,
+        MetadataSnippet,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM ParsedMeta
+      WHERE PackageName =~ FilterRegex
+
+  - name: SitePackagesWindows
+    description: Scan Windows site-packages directories
+    query: |
+      LET RecentCutoff <= now() - RecentDays * 86400
+
+      LET SitePkgPaths <= SELECT OSPath, Size, Mtime FROM glob(
+        globs=[
+          "C:/Python3*/Lib/site-packages/*/*.dist-info/METADATA",
+          "C:/Python3*/Lib/site-packages/*/*.dist-info/RECORD",
+          "C:/Users/*/AppData/Local/Programs/Python/Python3*/Lib/site-packages/*/*.dist-info/METADATA",
+          "C:/Users/*/AppData/Local/Programs/Python/Python3*/Lib/site-packages/*/*.dist-info/RECORD",
+          "C:/Program Files/Python3*/Lib/site-packages/*/*.dist-info/METADATA",
+          "C:/Program Files/Python3*/Lib/site-packages/*/*.dist-info/RECORD"
+        ])
+
+      LET ParsedMeta <= SELECT
+        OSPath,
+        OSPath.Dir.Dir.Basename AS PackageName,
+        OSPath.Dir.Basename AS DistInfoDir,
+        Size,
+        Mtime,
+        if(condition=Mtime > RecentCutoff, then=true, else=false) AS IsRecent,
+        read_file(filename=OSPath, length=512) AS MetadataSnippet
+      FROM SitePkgPaths
+
+      SELECT
+        PackageName,
+        DistInfoDir,
+        OSPath AS MetadataPath,
+        Size,
+        Mtime,
+        IsRecent,
+        MetadataSnippet,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM ParsedMeta
+      WHERE PackageName =~ FilterRegex
+
+  - name: SuspiciousPackages
+    description: Cross-platform check for recently modified package content files (potential tampering)
+    query: |
+      LET RecentCutoff <= now() - RecentDays * 86400
+
+      LET LinuxPkgContent <= SELECT OSPath, Size, Mtime FROM glob(
+        globs=[
+          "/usr/lib/python3*/site-packages/*/*.py",
+          "/usr/local/lib/python3*/site-packages/*/*.py",
+          "/usr/lib/python3*/dist-packages/*/*.py",
+          "/usr/local/lib/python3*/dist-packages/*/*.py",
+          "/home/*/.local/lib/python3*/site-packages/*/*.py"
+        ])
+
+      LET WinPkgContent <= SELECT OSPath, Size, Mtime FROM glob(
+        globs=[
+          "C:/Python3*/Lib/site-packages/*/*.py",
+          "C:/Users/*/AppData/Local/Programs/Python/Python3*/Lib/site-packages/*/*.py",
+          "C:/Program Files/Python3*/Lib/site-packages/*/*.py"
+        ])
+
+      LET AllContent <= SELECT * FROM chain(
+        a={ SELECT * FROM LinuxPkgContent },
+        b={ SELECT * FROM WinPkgContent }
+      )
+
+      LET RecentContent <= SELECT
+        OSPath,
+        OSPath.Dir.Basename AS PackageDir,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM AllContent
+      WHERE Mtime > RecentCutoff
+        AND OSPath =~ FilterRegex
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={ SELECT OSPath, PackageDir, Size, Mtime, Hashes, upload(file=OSPath) AS Upload FROM RecentContent },
+        else={ SELECT OSPath, PackageDir, Size, Mtime, Hashes FROM RecentContent })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: MetadataPath
+    type: path
+  - name: OSPath
+    type: path
+  - name: Hashes.MD5
+    type: hash
+  - name: Hashes.SHA256
+    type: hash

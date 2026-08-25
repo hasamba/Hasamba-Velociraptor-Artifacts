@@ -1,0 +1,169 @@
+name: Custom.DFIR.TimestompMACComparison
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects potential timestomping by comparing filesystem MAC times (Modified, Accessed, Changed)
+  against intrinsic metadata embedded within files. When a file's modification time has been
+  artificially altered, the filesystem Mtime may diverge significantly from metadata timestamps
+  stored inside the file itself (e.g., PE header TimeDateStamp).
+
+  This artifact scans executable files, extracts the PE compile timestamp from the binary header,
+  compares it to filesystem MAC times, and flags suspicious discrepancies exceeding a configurable
+  threshold. Large deltas between PE compile time and filesystem Mtime are strong indicators of
+  timestomping (MITRE T1070.006). It also flags logical MAC anomalies where Mtime predates Ctime
+  (creation time), which is impossible without manipulation.
+
+reference:
+  - https://attack.mitre.org/techniques/T1070/006/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    description: Glob pattern for files to inspect (executables and DLLs by default).
+    type: glob
+    default: "C:/Users/**/*.exe"
+  - name: SystemGlob
+    description: Glob pattern for system directory files (executables, DLLs).
+    type: glob
+    default: "C:/Windows/System32/*.{exe,dll}"
+  - name: SuspiciousDeltaHours
+    description: Minimum delta in hours between PE compile timestamp and filesystem Mtime to flag as suspicious.
+    type: int
+    default: 168
+  - name: FilterRegex
+    description: Regex filter to narrow results to specific filenames or paths.
+    type: regex
+    default: "."
+  - name: UploadSuspicious
+    description: If true, upload suspicious files for further analysis.
+    type: bool
+    default: false
+
+sources:
+  - name: PECompileTimeComparison
+    description: Compares PE TimeDateStamp header against filesystem Mtime for executables and DLLs to detect timestomping.
+    query: |
+      LET PeFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=[TargetGlob, SystemGlob])
+        WHERE Name =~ "\\.(exe|dll)$" AND OSPath =~ FilterRegex
+
+      LET Parsed <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          parse_pe(file=OSPath) AS PEInfo
+        FROM PeFiles
+        WHERE PEInfo
+
+      LET WithTimestamps <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          PEInfo,
+          timestamp(epoch=PEInfo.TimeDateStamp) AS PECompileTime,
+          Mtime - timestamp(epoch=PEInfo.TimeDateStamp) AS DeltaMtimeToPE
+        FROM Parsed
+        WHERE PEInfo.TimeDateStamp > 0
+
+      LET WithVerdict <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          PECompileTime,
+          DeltaMtimeToPE,
+          if(condition=DeltaMtimeToPE > 60 * 60 * SuspiciousDeltaHours,
+             then="SUSPICIOUS - Mtime much newer than PE compile time",
+             else=if(condition=DeltaMtimeToPE < -(60 * 60 * SuspiciousDeltaHours),
+                      then="SUSPICIOUS - Mtime much older than PE compile time",
+                      else="OK")) AS Verdict
+        FROM WithTimestamps
+
+      SELECT * FROM if(condition=UploadSuspicious,
+        then={
+          SELECT
+              OSPath,
+              Size,
+              Mtime,
+              Atime,
+              Ctime,
+              Btime,
+              PECompileTime,
+              DeltaMtimeToPE,
+              Verdict,
+              upload(file=OSPath) AS Upload
+            FROM WithVerdict
+            WHERE Verdict =~ "SUSPICIOUS"
+        },
+        else={
+          SELECT
+              OSPath,
+              Size,
+              Mtime,
+              Atime,
+              Ctime,
+              Btime,
+              PECompileTime,
+              DeltaMtimeToPE,
+              Verdict
+            FROM WithVerdict
+        })
+
+  - name: FilesystemMACAnomalies
+    description: Flags files where Mtime is older than Ctime (creation time), which is logically impossible without timestomping.
+    query: |
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=[TargetGlob, SystemGlob])
+        WHERE OSPath =~ FilterRegex AND Mtime AND Ctime
+
+      LET MACAnomalies <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          Ctime - Mtime AS DeltaCtimeToMtime,
+          Btime - Mtime AS DeltaBtimeToMtime
+        FROM AllFiles
+
+      SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          DeltaCtimeToMtime,
+          DeltaBtimeToMtime,
+          if(condition=DeltaCtimeToMtime > 0,
+             then="ANOMALY - Mtime older than Ctime (modification before creation)",
+             else="OK") AS MACVerdict
+        FROM MACAnomalies
+        WHERE DeltaCtimeToMtime > 0
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: PECompileTime
+    type: timestamp
+  - name: DeltaMtimeToPE
+    type: duration
+  - name: DeltaCtimeToMtime
+    type: duration
+  - name: DeltaBtimeToMtime
+    type: duration

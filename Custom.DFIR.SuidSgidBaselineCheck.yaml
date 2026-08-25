@@ -1,0 +1,136 @@
+name: Custom.DFIR.SuidSgidBaselineCheck
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Find SUID/SGID binaries that do not match a known-good baseline.
+  
+  Adversaries may abuse SUID/SGID binaries for privilege escalation (T1548.001).
+  This artifact scans the filesystem for binaries with SUID or SGID bits set,
+  computes their SHA256 hashes, and flags any that do not appear in a
+  user-provided baseline of known-good hashes. Unknown or modified SUID/SGID
+  binaries are strong indicators of potential privilege escalation tampering.
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.001/
+
+type: CLIENT
+
+parameters:
+  - name: KnownGoodHashes
+    type: csv
+    description: |
+      CSV of known-good SUID/SGID binary hashes. Must have a 'SHA256' column.
+      Any SUID/SGID binary whose SHA256 is NOT in this list will be flagged.
+    default: |
+      SHA256,Path
+      e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,/usr/bin/placeholder
+  - name: SearchGlob
+    type: glob
+    description: Glob pattern to search for SUID/SGID binaries.
+    default: "/**"
+  - name: FilterRegex
+    type: regex
+    description: Regex to filter result paths (e.g. only specific directories).
+    default: "."
+  - name: UploadFiles
+    type: bool
+    description: If true, upload flagged binaries for offline analysis.
+    default: false
+
+sources:
+  - name: SuidBinaries
+    description: Find SUID binaries not in the known-good baseline.
+    query: |
+      LET Baseline <= SELECT SHA256 FROM KnownGoodHashes
+      
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Data.Mode AS Mode
+        FROM glob(globs=SearchGlob)
+        WHERE Mode AND format(format="%o", args=Mode) =~ "[2367]...$"
+      
+      LET SuidFiles <= SELECT OSPath, Size, Mtime, Mode
+        FROM AllFiles
+        WHERE format(format="%o", args=Mode) =~ "[2367]...$"
+        AND OSPath =~ FilterRegex
+      
+      LET SuidWithHash <= SELECT OSPath, Size, Mtime, Mode,
+        hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256
+        FROM SuidFiles
+      
+      LET UnknownSuid <= SELECT OSPath, Size, Mtime, SHA256, "SUID" AS StickyType
+        FROM SuidWithHash
+        WHERE NOT SHA256 IN Baseline.SHA256
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, SHA256, StickyType,
+            upload(file=OSPath) AS Upload
+          FROM UnknownSuid
+        },
+        else={
+          SELECT OSPath, Size, Mtime, SHA256, StickyType
+          FROM UnknownSuid
+        })
+
+  - name: SgidBinaries
+    description: Find SGID binaries not in the known-good baseline.
+    query: |
+      LET Baseline <= SELECT SHA256 FROM KnownGoodHashes
+      
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Data.Mode AS Mode
+        FROM glob(globs=SearchGlob)
+        WHERE Mode
+      
+      LET SgidFiles <= SELECT OSPath, Size, Mtime, Mode
+        FROM AllFiles
+        WHERE format(format="%o", args=Mode) =~ ".[2367]..$"
+        AND OSPath =~ FilterRegex
+      
+      LET SgidWithHash <= SELECT OSPath, Size, Mtime, Mode,
+        hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256
+        FROM SgidFiles
+      
+      LET UnknownSgid <= SELECT OSPath, Size, Mtime, SHA256, "SGID" AS StickyType
+        FROM SgidWithHash
+        WHERE NOT SHA256 IN Baseline.SHA256
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, SHA256, StickyType,
+            upload(file=OSPath) AS Upload
+          FROM UnknownSgid
+        },
+        else={
+          SELECT OSPath, Size, Mtime, SHA256, StickyType
+          FROM UnknownSgid
+        })
+
+  - name: AllSuidSgid
+    description: Combined view of all SUID and SGID binaries with baseline status.
+    query: |
+      LET Baseline <= SELECT SHA256 FROM KnownGoodHashes
+      
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Data.Mode AS Mode
+        FROM glob(globs=SearchGlob)
+        WHERE Mode AND format(format="%o", args=Mode) =~ "[2367]..$|[2367]...$"
+      
+      LET Enriched <= SELECT OSPath, Size, Mtime, Mode,
+        hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256,
+        if(condition=format(format="%o", args=Mode) =~ "[2367]...$",
+            then="SUID",
+            else=if(condition=format(format="%o", args=Mode) =~ ".[2367]..$",
+                then="SGID",
+                else="UNKNOWN")) AS StickyType
+        FROM AllFiles
+        WHERE OSPath =~ FilterRegex
+      
+      SELECT OSPath, Size, Mtime, SHA256, StickyType,
+        if(condition=SHA256 IN Baseline.SHA256,
+           then="KNOWN", else="UNKNOWN") AS BaselineStatus
+      FROM Enriched
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: SHA256
+    type: hash

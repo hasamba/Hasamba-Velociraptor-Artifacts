@@ -1,0 +1,83 @@
+name: Custom.DFIR.TempArchiveExfilEvidence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for compressed archives created in temporary directories that may indicate data staging for exfiltration.
+  
+  This artifact scans common temporary locations for ZIP, TAR, GZ, TGZ, 7Z, and RAR files,
+  enriches the results with file size, timestamps, and hashes, and filters on suspicious naming
+  patterns so responders can quickly review likely archive staging activity.
+
+reference:
+  - https://attack.mitre.org/techniques/T1560.001/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "/tmp/**/*,/var/tmp/**/*,/dev/shm/**/*,/private/tmp/**/*,/tmp/**/Temp/**/*,/Users/*/Library/Caches/**/*,/Users/*/Library/Application Support/**/*,/home/*/.cache/**/*,C:/Windows/Temp/**/*,C:/Temp/**/*,C:/Users/*/AppData/Local/Temp/**/*,C:/Users/*/Downloads/**/*"
+  - name: ArchiveRegex
+    type: regex
+    default: "(?i).*(\\.(zip|7z|rar|tar|gz|tgz|bz2|xz|cab|iso))$"
+  - name: SuspiciousNameRegex
+    type: regex
+    default: "(?i).*(backup|collect|temp|loot|exfil|upload|archive|dump|staging|docs|data|report).*"
+  - name: MinSize
+    type: int
+    default: 10240
+  - name: MaxSize
+    type: int
+    default: 2147483648
+  - name: HashFiles
+    type: bool
+    default: true
+
+sources:
+  - name: ArchiveCandidates
+    description: Scan temporary directories for suspicious archive files that may have been staged for exfiltration.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Ctime, Btime, Atime
+      FROM glob(globs=split(string=TargetGlob, sep=","))
+      WHERE NOT IsDir
+        AND OSPath =~ ArchiveRegex
+        AND Size >= MinSize
+        AND Size <= MaxSize
+
+      LET Enriched <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Ctime,
+          Btime,
+          Atime,
+          if(condition=OSPath =~ SuspiciousNameRegex, then="suspicious_name", else="archive_extension") AS MatchReason,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM Files
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        Atime,
+        MatchReason,
+        Hashes.MD5 AS MD5,
+        Hashes.SHA256 AS SHA256
+      FROM Enriched
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: MD5
+    type: string
+  - name: SHA256
+    type: string

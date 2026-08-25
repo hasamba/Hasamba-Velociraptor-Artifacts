@@ -1,0 +1,166 @@
+name: Custom.DFIR.LOLBinAbuseDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects LOLBin (Living Off The Land Binary) abuse via suspicious command lines
+  involving mshta.exe, regsvr32.exe, and certutil.exe — common T1218 adversaries.
+
+  Adversaries abuse these signed Microsoft binaries to proxy-execute malicious code,
+  download payloads, or bypass application whitelisting. This artifact hunts for
+  known abuse patterns in process command lines across the endpoint.
+
+reference:
+  - https://attack.mitre.org/techniques/T1218/
+
+type: CLIENT
+
+parameters:
+  - name: LOLBinProcs
+    type: csv
+    default: |
+      Process,Pattern
+      mshta.exe,(\.hta|http|https|script|javascript|vbscript|mshta\.exe\s+.*http|regsvr32)
+      regsvr32.exe,(/i|/s|/n|http|https|\.dll|\.ocx|scrobj\.dll|mshtml|javascript)
+      certutil.exe,(-urlcache|-f|-pin|-url|download|verify|encode|decode|ping|\.cer|\.crt|\.p7b|\.pfx)
+  - name: SuspiciousMshtaRegex
+    type: regex
+    default: "(\\.hta|http|https|script|javascript|vbscript)"
+  - name: SuspiciousRegsvr32Regex
+    type: regex
+    default: "(/i|/s|/n|http|https|scrobj\\.dll|mshtml)"
+  - name: SuspiciousCertutilRegex
+    type: regex
+    default: "(-urlcache|-f|-url|download|encode|decode|ping)"
+
+sources:
+  - name: RunningProcesses
+    description: |
+      Scans currently running processes for LOLBin command-line abuse patterns.
+      Flags mshta.exe, regsvr32.exe, and certutil.exe with suspicious arguments.
+    query: |
+      LET SuspiciousProcs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        if(condition=Name =~ "(?i)mshta\\.exe",
+           then="mshta.exe",
+           else=if(condition=Name =~ "(?i)regsvr32\\.exe",
+                   then="regsvr32.exe",
+                   else=if(condition=Name =~ "(?i)certutil\\.exe",
+                           then="certutil.exe",
+                           else="unknown"))) AS LOLBin,
+        if(condition=Name =~ "(?i)mshta\\.exe" AND CommandLine =~ SuspiciousMshtaRegex,
+           then=TRUE,
+           else=if(condition=Name =~ "(?i)regsvr32\\.exe" AND CommandLine =~ SuspiciousRegsvr32Regex,
+                   then=TRUE,
+                   else=if(condition=Name =~ "(?i)certutil\\.exe" AND CommandLine =~ SuspiciousCertutilRegex,
+                           then=TRUE,
+                           else=FALSE))) AS IsSuspicious
+      FROM pslist()
+      WHERE Name =~ "(?i)^(mshta|regsvr32|certutil)\\.exe$"
+
+      SELECT Pid, Ppid, Name AS ProcessName, Exe, CommandLine, Username, LOLBin,
+        IsSuspicious,
+        timestamp(epoch=now()) AS DetectionTime
+      FROM SuspiciousProcs
+      WHERE IsSuspicious
+
+  - name: WMIProcessCreationLogs
+    description: |
+      Queries WMI process creation event logs (Security EVTX 4688) for historical
+      LOLBin executions with suspicious command lines.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(
+        globs="C:/Windows/System32/winevt/Logs/Security.evtx")
+
+      LET ParsedEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT System.TimeCreated.SystemTime AS EventTime,
+                 System.EventID.Value AS EventID,
+                 EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE EventID = 4688
+            AND EventData.NewProcessName =~ "(?i)\\\\(mshta|regsvr32|certutil)\\.exe$"
+        })
+
+      SELECT EventTime,
+             EventData.NewProcessName AS ProcessPath,
+             EventData.CommandLine AS CommandLine,
+             EventData.SubjectUserName AS SubjectUser,
+             if(condition=EventData.NewProcessName =~ "(?i)mshta\\.exe",
+                then="mshta.exe",
+                else=if(condition=EventData.NewProcessName =~ "(?i)regsvr32\\.exe",
+                        then="regsvr32.exe",
+                        else="certutil.exe")) AS LOLBin,
+             if(condition=EventData.NewProcessName =~ "(?i)mshta\\.exe"
+                  AND EventData.CommandLine =~ SuspiciousMshtaRegex,
+                then=TRUE,
+                else=if(condition=EventData.NewProcessName =~ "(?i)regsvr32\\.exe"
+                         AND EventData.CommandLine =~ SuspiciousRegsvr32Regex,
+                       then=TRUE,
+                       else=if(condition=EventData.NewProcessName =~ "(?i)certutil\\.exe"
+                                AND EventData.CommandLine =~ SuspiciousCertutilRegex,
+                              then=TRUE,
+                              else=FALSE))) AS IsSuspicious
+      FROM ParsedEvents
+      WHERE IsSuspicious
+
+  - name: PowerShellScriptBlockLogs
+    description: |
+      Checks PowerShell Script Block Logging (EID 4104) for LOLBin-related
+      suspicious script content — e.g., mshta/regsvr32/certutil invocation strings.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(
+        globs="C:/Windows/System32/winevt/Logs/Microsoft-Windows-PowerShell%4Operational.evtx")
+
+      LET ParsedBlocks <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT System.TimeCreated.SystemTime AS EventTime,
+                 System.EventID.Value AS EventID,
+                 EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE EventID = 4104
+            AND EventData.ScriptBlockText =~ "(?i)(mshta|regsvr32|certutil)"
+        })
+
+      SELECT EventTime,
+             EventData.ScriptBlockText AS ScriptBlock,
+             EventData.Path AS ScriptPath,
+             if(condition=EventData.ScriptBlockText =~ "(?i)mshta",
+                then="mshta.exe",
+                else=if(condition=EventData.ScriptBlockText =~ "(?i)regsvr32",
+                        then="regsvr32.exe",
+                        else="certutil.exe")) AS LOLBin,
+             if(condition=EventData.ScriptBlockText =~ "(?i)mshta" AND EventData.ScriptBlockText =~ SuspiciousMshtaRegex,
+                then=TRUE,
+                else=if(condition=EventData.ScriptBlockText =~ "(?i)regsvr32" AND EventData.ScriptBlockText =~ SuspiciousRegsvr32Regex,
+                        then=TRUE,
+                        else=if(condition=EventData.ScriptBlockText =~ "(?i)certutil" AND EventData.ScriptBlockText =~ SuspiciousCertutilRegex,
+                                then=TRUE,
+                                else=FALSE))) AS IsSuspicious
+      FROM ParsedBlocks
+      WHERE IsSuspicious
+
+  - name: PrefetchTraces
+    description: |
+      Scans Windows Prefetch files for evidence of past LOLBin executions,
+      including suspicious command-line fragments stored in prefetch metadata.
+    query: |
+      LET PrefetchFiles <= SELECT OSPath, Size, Mtime FROM glob(
+        globs="C:/Windows/Prefetch/(MSHTA|REGSVR32|CERTUTIL)*.pf")
+
+      SELECT OSPath, Size, Mtime,
+        if(condition=OSPath =~ "(?i)MSHTA",
+           then="mshta.exe",
+           else=if(condition=OSPath =~ "(?i)REGSVR32",
+                   then="regsvr32.exe",
+                   else="certutil.exe")) AS LOLBin
+      FROM PrefetchFiles
+
+column_types:
+  - name: DetectionTime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: CommandLine
+    type: nobreak

@@ -1,0 +1,154 @@
+name: Custom.DFIR.PasswdShadowModification
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for suspicious modifications to /etc/passwd or /etc/shadow.
+  
+  Adversaries may create or modify accounts (T1136.001) by directly editing
+  /etc/passwd or /etc/shadow to add backdoor users, elevate privileges, or
+  change authentication attributes. This artifact detects recent modifications,
+  suspicious entries (UID 0 non-root accounts, unusual shells, empty password fields),
+  and cross-references account creation timestamps with process execution logs.
+
+reference:
+  - https://attack.mitre.org/techniques/T1136.001/
+
+type: CLIENT
+
+parameters:
+  - name: PasswdGlob
+    type: glob
+    default: "/etc/passwd"
+  - name: ShadowGlob
+    type: glob
+    default: "/etc/shadow"
+  - name: SuspiciousUIDRegex
+    type: regex
+    default: "^(0|[1-9]\\d{3,})"
+  - name: SuspiciousShellRegex
+    type: regex
+    default: "(nologin|false|sync|shutdown|halt)$"
+  - name: TimeframeDays
+    type: int
+    default: 7
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: PasswdAnalysis
+    description: Parse /etc/passwd entries and flag suspicious accounts
+    query: |
+      LET PasswdFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=PasswdGlob)
+
+      LET PasswdLines <= SELECT * FROM foreach(
+        row={ SELECT OSPath, read_file(filename=OSPath) AS Content FROM PasswdFiles },
+        query={
+          SELECT OSPath, Line FROM split_records(
+            filenames=OSPath,
+            regex="\n",
+            columns=["Line"])
+          WHERE Line AND Line =~ "."
+        })
+
+      LET Parsed <= SELECT OSPath, Line,
+        split(sep=":", string=Line)[0] AS Username,
+        split(sep=":", string=Line)[2] AS UID,
+        split(sep=":", string=Line)[3] AS GID,
+        split(sep=":", string=Line)[4] AS GECOS,
+        split(sep=":", string=Line)[5] AS HomeDir,
+        split(sep=":", string=Line)[6] AS Shell
+      FROM PasswdLines
+      WHERE Username
+
+      LET Suspicious <= SELECT OSPath, Username, UID, GID, GECOS, HomeDir, Shell
+      FROM Parsed
+      WHERE UID =~ SuspiciousUIDRegex OR NOT Shell =~ SuspiciousShellRegex
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Username, UID, GID, GECOS, HomeDir, Shell,
+            upload(file=OSPath) AS Upload
+          FROM Suspicious
+        },
+        else={
+          SELECT OSPath, Username, UID, GID, GECOS, HomeDir, Shell
+          FROM Suspicious
+        })
+
+  - name: ShadowAnalysis
+    description: Parse /etc/shadow entries and flag suspicious password configurations
+    query: |
+      LET ShadowFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=ShadowGlob)
+
+      LET ShadowLines <= SELECT * FROM foreach(
+        row={ SELECT OSPath, Mtime, read_file(filename=OSPath) AS Content FROM ShadowFiles },
+        query={
+          SELECT OSPath, Mtime, Line FROM split_records(
+            filenames=OSPath,
+            regex="\n",
+            columns=["Line"])
+          WHERE Line AND Line =~ "."
+        })
+
+      LET Parsed <= SELECT OSPath, Mtime, Line,
+        split(sep=":", string=Line)[0] AS Username,
+        split(sep=":", string=Line)[1] AS PasswordHash,
+        split(sep=":", string=Line)[2] AS LastChanged,
+        split(sep=":", string=Line)[3] AS MinDays,
+        split(sep=":", string=Line)[4] AS MaxDays,
+        split(sep=":", string=Line)[5] AS WarnDays
+      FROM ShadowLines
+      WHERE Username
+
+      LET PasswordStatus <= if(condition=PasswordHash="", then="EMPTY_PASSWORD",
+        else=if(condition=PasswordHash="!", then="LOCKED",
+        else=if(condition=PasswordHash="*", then="NO_LOGIN",
+        else=if(condition=PasswordHash =~ "^\\$", then="HAS_HASH",
+        else="UNKNOWN"))))
+
+      LET Flagged <= SELECT OSPath, Mtime, Username, PasswordHash, LastChanged,
+        PasswordStatus AS PasswordStatus,
+        if(condition=LastChanged AND LastChanged =~ "^\\d+$",
+            then=timestamp(epoch=LastChanged),
+            else=NULL) AS LastChangedTime
+      FROM Parsed
+
+      LET SuspiciousShadow <= SELECT * FROM Flagged
+      WHERE PasswordStatus IN ("EMPTY_PASSWORD", "HAS_HASH", "UNKNOWN")
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT *, upload(file=OSPath) AS Upload FROM SuspiciousShadow
+        },
+        else={
+          SELECT * FROM SuspiciousShadow
+        })
+
+  - name: ModificationCheck
+    description: Check /etc/passwd and /etc/shadow for recent modifications within the specified timeframe
+    query: |
+      LET Threshold <= timestamp(epoch=now() - TimeframeDays * 86400)
+
+      LET AllFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=[PasswdGlob, ShadowGlob])
+
+      LET RecentMods <= SELECT OSPath, Size, Mtime,
+        if(condition=Mtime > Threshold, then="YES", else="NO") AS ModifiedRecently
+      FROM AllFiles
+      WHERE Mtime
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, ModifiedRecently,
+            upload(file=OSPath) AS Upload
+          FROM RecentMods
+        },
+        else={
+          SELECT OSPath, Size, Mtime, ModifiedRecently
+          FROM RecentMods
+        })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: LastChangedTime
+    type: timestamp

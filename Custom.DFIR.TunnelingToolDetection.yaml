@@ -33,7 +33,7 @@ parameters:
     description: Regex for suspicious command-line arguments indicating tunneling activity
 
   - name: FilesystemGlob
-    type: string
+    type: glob
     default: "{/tmp/**,/dev/shm/**,/home/**/.local/bin/**,/var/tmp/**,C:/Users/*/AppData/Local/Temp/**,C:/Windows/Temp/**,C:/ProgramData/**}"
     description: Glob pattern to scan for tunneling tool binaries
 
@@ -48,12 +48,12 @@ parameters:
     description: Upload matched binaries to the server for further analysis
 
   - name: PrefetchGlob
-    type: string
+    type: glob
     default: "C:/Windows/Prefetch/*.pf"
     description: Windows Prefetch directory glob for execution history
 
   - name: RegistryRunKeys
-    type: string
+    type: glob
     default: "{HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*,HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*,HKEY_CURRENT_USER/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*}"
     description: Registry Run key globs to check for tunneling tool persistence
 

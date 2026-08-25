@@ -1,0 +1,171 @@
+name: Custom.DFIR.TimestompDetector
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+
+description: |
+  Detects potential timestomping by comparing file MAC times against internal metadata timestamps.
+  
+  Timestomping (T1070.006) is an anti-forensics technique where attackers modify file
+  timestamps to blend in with legitimate files or hide activity timelines. This artifact
+  compares Mtime (Modification), Atime (Access), Ctime (Change/Metadata) against embedded
+  metadata such as PE compile timestamps, document creation times, and digital signature
+  timestamps to identify inconsistencies that indicate timestamp manipulation.
+
+reference:
+  - https://attack.mitre.org/techniques/T1070.006/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/**/*.{exe,dll,sys,doc,docx,pdf,xls,xlsx,ppt,pptx}"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: TimeToleranceSeconds
+    type: int
+    default: 86400
+    description: Seconds of tolerance between filesystem and metadata timestamps before flagging.
+
+sources:
+  - name: PETimestampMismatch
+    description: |
+      Compares PE file Mtime against the PE compile timestamp in the COFF header.
+      A significant discrepancy (Mtime older than compile time, or compile time far from Mtime)
+      suggests the Mtime was artificially modified.
+    query: |
+      LET PEFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=TargetGlob)
+        WHERE OSPath =~ FilterRegex
+          AND OSPath =~ "\\.(exe|dll|sys)$"
+
+      LET PEParsed <= SELECT
+        OSPath, Size, Mtime, Atime, Ctime, Btime,
+        parse_pe(file=OSPath) AS PEInfo
+      FROM PEFiles
+      WHERE PEInfo
+
+      LET PETimes <= SELECT
+        OSPath, Size, Mtime, Atime, Ctime, Btime,
+        PEInfo,
+        PEInfo.CompileTime AS PECompileTime
+      FROM PEParsed
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Btime,
+        PECompileTime,
+        if(condition=PECompileTime,
+           then=_Mtime - PECompileTime,
+           else=-1) AS TimeDeltaSeconds,
+        "PE compile time vs Mtime mismatch" AS AnomalyType
+      FROM PETimes
+      WHERE PECompileTime
+        AND (_Mtime - PECompileTime > TimeToleranceSeconds
+          OR PECompileTime - _Mtime > TimeToleranceSeconds)
+
+  - name: DigitalSigTimestampMismatch
+    description: |
+      Compares file Mtime against authenticode digital signature timestamps.
+      Authenticode signatures embed a trusted timestamp from the CA. If Mtime differs
+      significantly from the signature timestamp, the file may have been timestomped.
+    query: |
+      LET SignedFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+        authenticode(filename=OSPath) AS SigInfo
+      FROM glob(globs=TargetGlob)
+      WHERE OSPath =~ FilterRegex
+        AND OSPath =~ "\\.(exe|dll|sys)$"
+
+      LET SigParsed <= SELECT
+        OSPath, Size, Mtime, Atime, Ctime, Btime,
+        SigInfo,
+        SigInfo.SigningTime AS SigTimestamp
+      FROM SignedFiles
+      WHERE SigTimestamp
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Btime,
+        SigTimestamp,
+        _Mtime - SigTimestamp AS TimeDeltaSeconds,
+        "Digital signature timestamp vs Mtime mismatch" AS AnomalyType
+      FROM SigParsed
+      WHERE _Mtime - SigTimestamp > TimeToleranceSeconds
+         OR SigTimestamp - _Mtime > TimeToleranceSeconds
+
+  - name: MACAnomalyBtime
+    description: |
+      On NTFS volumes, the Birth/Creation time (Btime) should logically precede or match
+      the Modification time (Mtime). If Mtime is earlier than Btime, the Mtime was likely
+      backdated (timestomped). Also flags when Ctime is older than Btime.
+    query: |
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=TargetGlob)
+        WHERE OSPath =~ FilterRegex
+          AND Btime
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Btime,
+        if(condition=_Mtime < _Btime,
+           then="Mtime older than Btime (backdated)",
+           else="Ctime older than Btime") AS AnomalyType,
+        if(condition=_Mtime < _Btime,
+           then=_Btime - _Mtime,
+           else=_Btime - _Ctime) AS TimeDeltaSeconds
+      FROM AllFiles
+      WHERE _Mtime < _Btime OR _Ctime < _Btime
+
+  - name: DocumentMetadataMismatch
+    description: |
+      Compares filesystem Mtime against document internal metadata timestamps
+      (creation/modify times in Office docs and PDFs). A mismatch suggests
+      the file was downloaded or copied with a modified filesystem timestamp.
+    query: |
+      LET DocFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=TargetGlob)
+        WHERE OSPath =~ FilterRegex
+          AND OSPath =~ "\\.(docx?|xlsx?|pptx?|pdf)$"
+
+      LET DocMeta <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+        parse_yaml(filename=OSPath) AS MetaInfo
+      FROM DocFiles
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Btime,
+        "Document metadata vs filesystem Mtime mismatch" AS AnomalyType
+      FROM DocMeta
+      WHERE MetaInfo
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: PECompileTime
+    type: timestamp
+  - name: SigTimestamp
+    type: timestamp
+  - name: TimeDeltaSeconds
+    type: int

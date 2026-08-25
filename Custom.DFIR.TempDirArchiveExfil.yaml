@@ -1,0 +1,80 @@
+name: Custom.DFIR.TempDirArchiveExfil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect evidence of data compressed for exfiltration by searching temporary directories
+  for archive files (zip, tar, 7z, rar, gz, bz2, xz) that may indicate staging for data
+  exfiltration per MITRE ATT&CK T1560.001.
+
+  Checks common temp paths, user profile temp dirs, and recently created/modified archives.
+  Enriches findings with file size, timestamps, hash values, and whether a process is
+  currently holding the file open.
+
+reference:
+  - https://attack.mitre.org/techniques/T1560.001/
+
+type: CLIENT
+
+parameters:
+  - name: TempGlobs
+    type: glob
+    default: "{C:/Users/*/AppData/Local/Temp/**,C:/Windows/Temp/**,C:/ProgramData/**,%TEMP%/**,/tmp/**,/var/tmp/**}"
+  - name: ArchiveGlobSuffixes
+    type: string
+    default: "\\.(zip|tar|7z|rar|gz|bz2|xz|tgz|tar\\.gz|tar\\.bz2|tar\\.xz)$"
+  - name: RecentDays
+    type: int
+    default: 7
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: ArchiveFiles
+    description: Finds archive files in temp directories indicating data staging for exfiltration
+    query: |
+      LET RecentCutoff <= now() - RecentDays * 86400
+
+      LET ArchiveFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Baktime
+        FROM glob(globs=TempGlobs)
+        WHERE OSPath =~ ArchiveGlobSuffixes
+          AND OSPath =~ FilterRegex
+          AND Mtime > RecentCutoff
+
+      SELECT
+        OSPath AS ArchivePath,
+        Size,
+        Mtime AS ModifiedTime,
+        Atime AS AccessTime,
+        Ctime AS ChangeTime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes,
+        if(condition=upload(file=OSPath),
+          then={ SELECT upload(file=OSPath) AS Upload FROM scope() },
+          else={ SELECT NULL AS Upload FROM scope() }) AS Uploaded
+      FROM ArchiveFiles
+
+  - name: SuspiciousProcesses
+    description: Identifies processes currently running archiving tools that may be compressing data for exfiltration
+    query: |
+      LET SuspiciousNames <= "7z|7za|7zr|zip|tar|rar|gzip|bzip2|xz|winrar|peazip|bandizip"
+      LET SuspiciousPaths <= "(?i)(7z|zip|tar|rar|gzip|bzip2|xz|winrar|peazip|bandizip)"
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        timestamp(epoch=CreateTime) AS ProcessStartTime
+      FROM pslist()
+      WHERE Name =~ SuspiciousNames
+         OR Exe =~ SuspiciousPaths
+         OR CommandLine =~ SuspiciousPaths
+
+column_types:
+  - name: ModifiedTime
+    type: timestamp
+  - name: AccessTime
+    type: timestamp
+  - name: ChangeTime
+    type: timestamp

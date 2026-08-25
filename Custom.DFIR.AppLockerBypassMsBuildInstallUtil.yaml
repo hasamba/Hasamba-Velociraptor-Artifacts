@@ -1,0 +1,177 @@
+name: Custom.DFIR.AppLockerBypassMsBuildInstallUtil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects potential AppLocker bypass attempts via MSBuild and InstallUtil.
+  
+  Adversaries abuse trusted .NET utilities (MSBuild.exe, InstallUtil.exe) to bypass
+  application whitelisting and execute arbitrary code. This artifact hunts for suspicious
+  process executions, command-line patterns, parent-child relationships, and file artifacts
+  associated with T1218.004 (Signed Binary Proxy Execution: InstallUtil/MSBuild).
+
+reference:
+  - https://attack.mitre.org/techniques/T1218.004/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousProcessRegex
+    type: regex
+    default: "(msbuild\\.exe|installutil\\.exe)"
+  - name: SuspiciousCmdlineRegex
+    type: regex
+    default: "(\\\\msbuild\\.exe|\\\\installutil\\.exe|/logfile|/logtoconsole|/installtype|/u\\s|\\.csproj|\\.sln|/uninstall)"
+  - name: SuspiciousParentRegex
+    type: regex
+    default: "(cmd\\.exe|powershell\\.exe|wscript\\.exe|cscript\\.exe|wmic\\.exe|bash\\.exe|certutil\\.exe)"
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: SuspiciousProcesses
+    description: |
+      Detects MSBuild.exe or InstallUtil.exe processes with suspicious parent processes
+      or command-line arguments indicating potential AppLocker bypass.
+    query: |
+      LET Processes <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM pslist()
+      WHERE Name =~ SuspiciousProcessRegex
+
+      LET Suspicious <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime,
+        if(condition=CommandLine =~ SuspiciousCmdlineRegex,
+          then="Suspicious command line",
+          else="Process name match") AS DetectionReason
+      FROM Processes
+      WHERE CommandLine =~ SuspiciousCmdlineRegex
+        OR Name =~ SuspiciousProcessRegex
+
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime, DetectionReason
+      FROM Suspicious
+
+  - name: SuspiciousParentChild
+    description: |
+      Identifies MSBuild/InstallUtil spawned by suspicious parent processes
+      that may indicate lateral movement or scripted execution.
+    query: |
+      LET SuspiciousParents <= SELECT Pid AS ParentPid, Name AS ParentName,
+        Exe AS ParentExe, CommandLine AS ParentCmdline
+      FROM pslist()
+      WHERE Name =~ SuspiciousParentRegex
+
+      LET TargetProcesses <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM pslist()
+      WHERE Name =~ SuspiciousProcessRegex
+        AND Ppid IN SuspiciousParents.ParentPid
+
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+      FROM TargetProcesses
+
+  - name: NetworkConnections
+    description: |
+      Checks for network connections established by MSBuild or InstallUtil processes,
+      which may indicate C2 communication or payload download.
+    query: |
+      LET SuspiciousPids <= SELECT Pid, Name, Exe, CommandLine
+      FROM pslist()
+      WHERE Name =~ SuspiciousProcessRegex
+
+      SELECT Pid, Name, Exe, CommandLine,
+        Status, Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+        Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort, Username
+      FROM netstat()
+      WHERE Pid IN SuspiciousPids.Pid
+
+  - name: FilesystemArtifacts
+    description: |
+      Hunts for MSBuild/InstallUtil binaries in non-standard paths and suspicious
+      project/installer files that could be used for bypass execution.
+    query: |
+      LET MsBuildPaths <= SELECT OSPath, Size, Mtime, timestamp(epoch=Mtime) AS ModifiedTime
+      FROM glob(globs=["C:/Users/*/msbuild.exe", "C:/Users/*/*/msbuild.exe",
+        "C:/Windows/Microsoft.NET/Framework*/*/MSBuild.exe",
+        "C:/Program Files*/MSBuild/*/Bin/MSBuild.exe",
+        "C:/Users/*/msbuild.exe",
+        "C:/Temp/*/msbuild.exe", "C:/tmp/*/msbuild.exe"])
+      WHERE OSPath =~ "(?i)msbuild\\.exe$"
+
+      LET InstallUtilPaths <= SELECT OSPath, Size, Mtime, timestamp(epoch=Mtime) AS ModifiedTime
+      FROM glob(globs=["C:/Users/*/installutil.exe", "C:/Users/*/*/installutil.exe",
+        "C:/Windows/Microsoft.NET/Framework*/*/InstallUtil.exe",
+        "C:/Temp/*/installutil.exe", "C:/tmp/*/installutil.exe"])
+      WHERE OSPath =~ "(?i)installutil\\.exe$"
+
+      LET SuspiciousProjectFiles <= SELECT OSPath, Size, Mtime,
+        timestamp(epoch=Mtime) AS ModifiedTime
+      FROM glob(globs=["C:/Users/*/*.csproj", "C:/Users/*/*.sln",
+        "C:/Temp/*/*.csproj", "C:/tmp/*/*.csproj",
+        "C:/Users/*/AppData/Local/Temp/*/*.csproj"])
+
+      LET AllFiles <= SELECT * FROM chain(
+        a={ SELECT OSPath, Size, ModifiedTime, "MSBuild" AS ArtifactType FROM MsBuildPaths },
+        b={ SELECT OSPath, Size, ModifiedTime, "InstallUtil" AS ArtifactType FROM InstallUtilPaths },
+        c={ SELECT OSPath, Size, ModifiedTime, "ProjectFile" AS ArtifactType FROM SuspiciousProjectFiles }
+      )
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={ SELECT OSPath, Size, ModifiedTime, ArtifactType, upload(file=OSPath) AS Upload FROM AllFiles },
+        else={ SELECT OSPath, Size, ModifiedTime, ArtifactType FROM AllFiles })
+
+  - name: EventLogEvidence
+    description: |
+      Searches Security and Sysmon event logs for MSBuild/InstallUtil process creation
+      events (Event IDs 4688 and 1) that may indicate AppLocker bypass execution.
+    query: |
+      LET SecurityEvents <= SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.EventID.Value AS EventID,
+        EventData.SubjectUserName AS SubjectUser,
+        EventData.NewProcessName AS NewProcess,
+        EventData.CommandLine AS CmdLine,
+        EventData.ParentProcessName AS ParentProcess,
+        "Security" AS LogSource
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs="C:/Windows/System32/winevt/Logs/Security.evtx") },
+        query={ SELECT System.TimeCreated.SystemTime AS EventTime,
+                       System.EventID.Value AS EventID,
+                       EventData
+                FROM parse_evtx(filename=OSPath)
+                WHERE System.EventID.Value = 4688
+                  AND (EventData.NewProcessName =~ SuspiciousProcessRegex
+                    OR EventData.CommandLine =~ SuspiciousCmdlineRegex) }
+      )
+
+      LET SysmonEvents <= SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.EventID.Value AS EventID,
+        EventData.Image AS NewProcess,
+        EventData.CommandLine AS CmdLine,
+        EventData.ParentImage AS ParentProcess,
+        EventData.User AS SubjectUser,
+        "Sysmon" AS LogSource
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs="C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx") },
+        query={ SELECT System.TimeCreated.SystemTime AS EventTime,
+                       System.EventID.Value AS EventID,
+                       EventData
+                FROM parse_evtx(filename=OSPath)
+                WHERE System.EventID.Value = 1
+                  AND (EventData.Image =~ SuspiciousProcessRegex
+                    OR EventData.CommandLine =~ SuspiciousCmdlineRegex) }
+      )
+
+      SELECT * FROM chain(
+        a={ SELECT * FROM SecurityEvents },
+        b={ SELECT * FROM SysmonEvents }
+      )
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: ModifiedTime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: OSPath
+    type: path

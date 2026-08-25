@@ -1,0 +1,150 @@
+name: Custom.DFIR.CryptoMinerDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect cryptocurrency miner activity by identifying processes with known miner names
+  and high-CPU utilization patterns.
+
+  Cryptocurrency miners (MITRE T1496 - Resource Hijacking) often manifest as processes
+  consuming excessive CPU while connecting to mining pools or command-and-control servers.
+  This artifact checks for known miner process names, unusual high-CPU processes, and
+  suspicious network connections to common mining pool ports and domains.
+
+reference:
+  - https://attack.mitre.org/techniques/T1496/
+
+type: CLIENT
+
+parameters:
+  - name: MinerNameRegex
+    type: regex
+    default: "(?i)(xmrig|cryptonight|minerd|cpuminer|ccminer|claymore|ethminer|phoenixminer|nbminer|t-rex|nanominer|lolminer|gminer|bminer|cast-xmr|sgminer|cgminer|nicehash|progpow|randomx|stratum|coinhive|crypto-loot|jsecoin|minero|minerdash|minergate)"
+  - name: HighCpuThreshold
+    type: int
+    default: 80
+  - name: MiningPoolRegex
+    type: regex
+    default: "(?i)(mining.?pool|stratum|xmr|crypto|monero|ethpool|dwarfpool|nanopool|f2pool|antpool|slush|pool\\.org|supportxmr|minexmr|coinhive|hashflare|nicehash)"
+  - name: SuspiciousPorts
+    type: string
+    default: "3333,4444,5555,5556,7777,8888,14433,14444,45560,45700"
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: SuspiciousProcesses
+    description: |
+      Identify processes whose names or command lines match known cryptocurrency miner patterns,
+      including common miner binaries and mining-related arguments.
+    query: |
+      LET SuspiciousProcesses = SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        CREATE_TIME AS StartTime
+      FROM pslist()
+      WHERE Name =~ MinerNameRegex
+         OR CommandLine =~ MinerNameRegex
+
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        timestamp(epoch=StartTime) AS StartTime
+      FROM SuspiciousProcesses
+
+  - name: HighCPUProcesses
+    description: |
+      Identify processes consuming high CPU that may indicate hidden miner activity,
+      even if the process name has been disguised.
+    query: |
+      LET ProcList = SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        CREATE_TIME AS StartTime
+      FROM pslist()
+
+      SELECT Pid, Name, Exe, CommandLine, Username,
+        timestamp(epoch=StartTime) AS StartTime
+      FROM ProcList
+      WHERE NOT Name =~ "^(System|csrss|smss|svchost|lsass|services|wininit|dwm|explorer|SearchIndexer)$"
+
+  - name: MiningNetworkConnections
+    description: |
+      Detect network connections to known mining pool domains and suspicious ports
+      commonly used by cryptocurrency miners for stratum protocol communication.
+    query: |
+      LET SuspiciousPortList = split(string=SuspiciousPorts, sep=",")
+
+      LET NetConnections = SELECT Pid, Status, Laddr.IP AS LocalIP,
+        Laddr.Port AS LocalPort, Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+      FROM netstat()
+      WHERE Status =~ "ESTAB"
+        AND (
+          Raddr.IP =~ MiningPoolRegex
+          OR RemotePort IN SuspiciousPortList
+        )
+
+      SELECT Pid, Status, LocalIP, LocalPort, RemoteIP, RemotePort
+      FROM NetConnections
+
+  - name: MinerFileArtifacts
+    description: |
+      Scan common filesystem locations for cryptocurrency miner binaries and
+      configuration files containing mining pool connection strings.
+    query: |
+      LET MinerFiles <= SELECT OSPath, Size, Mtime, "MinerBinary" AS MatchType
+      FROM glob(globs=[
+        "C:/Users/*/AppData/*/xmrig*",
+        "C:/Users/*/AppData/*/minerd*",
+        "C:/Users/*/AppData/*/cpuminer*",
+        "C:/Users/*/AppData/*/ccminer*",
+        "C:/Users/*/AppData/*/claymore*",
+        "C:/Users/*/AppData/*/ethminer*",
+        "C:/Users/*/AppData/*/phoenixminer*",
+        "C:/Users/*/AppData/*/nbminer*",
+        "C:/Users/*/AppData/*/t-rex*",
+        "C:/Users/*/AppData/*/nanominer*",
+        "C:/Users/*/AppData/*/lolminer*",
+        "C:/Users/*/AppData/*/gminer*",
+        "C:/ProgramData/xmrig*",
+        "C:/ProgramData/minerd*",
+        "C:/ProgramData/cpuminer*",
+        "C:/ProgramData/ccminer*",
+        "C:/ProgramData/claymore*",
+        "C:/ProgramData/ethminer*",
+        "C:/Windows/Temp/xmrig*",
+        "C:/Windows/Temp/minerd*",
+        "C:/Windows/Temp/cpuminer*",
+        "C:/Windows/Temp/ccminer*",
+        "/tmp/xmrig*",
+        "/tmp/minerd*",
+        "/tmp/cpuminer*",
+        "/tmp/ccminer*",
+        "/opt/xmrig*",
+        "/opt/minerd*",
+        "/opt/cpuminer*",
+        "/home/*/xmrig*",
+        "/home/*/minerd*",
+        "/home/*/cpuminer*"
+      ])
+
+      LET ConfigFiles <= SELECT OSPath, Size, Mtime, "MinerConfig" AS MatchType
+      FROM glob(globs=[
+        "C:/Users/*/AppData/*/config.json",
+        "C:/Users/*/AppData/*/pool.conf",
+        "C:/ProgramData/config.json",
+        "C:/ProgramData/pool.conf"
+      ])
+      WHERE read_file(filename=OSPath, length=4096) =~ MiningPoolRegex
+
+      LET AllFiles <= SELECT * FROM chain(queries=[MinerFiles, ConfigFiles])
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, timestamp(epoch=Mtime) AS Mtime, MatchType,
+            upload(file=OSPath) AS Upload
+          FROM AllFiles
+        },
+        else={
+          SELECT OSPath, Size, timestamp(epoch=Mtime) AS Mtime, MatchType
+          FROM AllFiles
+        })
+
+column_types:
+  - name: StartTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp

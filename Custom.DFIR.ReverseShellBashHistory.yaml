@@ -1,0 +1,61 @@
+name: Custom.DFIR.ReverseShellBashHistory
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for reverse shell patterns in bash history files across all users on Linux endpoints.
+  
+  Examines .bash_history files for common reverse shell indicators including:
+  - /dev/tcp/ and /dev/udp/ socket attempts
+  - Interactive shell spawns (bash -i, sh -i)
+  - Netcat reverse shell patterns (nc -e, nc -c)
+  - FIFO/pipe reverse shells (mkfifo, /tmp/f)
+  - Common obfuscation techniques
+
+reference:
+  - https://attack.mitre.org/techniques/T1059.004/
+
+type: CLIENT
+
+parameters:
+  - name: FilterRegex
+    type: regex
+    description: Regex pattern to filter history entries for reverse shell indicators
+    default: "/dev/(tcp|udp)|bash -i|sh -i|nc -[ec]|mkfifo|/tmp/f|2>&1|0>&1|1>&1|pwn|pentestmonkey|puts|socket"
+
+sources:
+  - name: BashHistoryFindings
+    description: Search all user bash history files for reverse shell patterns
+    query: |
+      LET RootHistory = SELECT "/root/.bash_history" AS HistoryPath, "/root" AS HomeDir
+      FROM scope()
+      
+      LET HomeBashHistories = SELECT HomeDir + "/.bash_history" AS HistoryPath, HomeDir
+      FROM glob(globs="/home/*/.bash_history")
+      
+      LET AllHistories = SELECT HistoryPath, HomeDir FROM chain(
+        a={ SELECT * FROM RootHistory },
+        b={ SELECT * FROM HomeBashHistories }
+      )
+      
+      LET ExistingHistories = SELECT HomeDir, HistoryPath
+      FROM foreach(row={ SELECT * FROM AllHistories }, query={
+        SELECT HomeDir, HistoryPath
+        FROM stat(filename=HistoryPath)
+        WHERE Size > 0
+      })
+      
+      LET AllLines = SELECT HomeDir, Line AS HistoryEntry
+      FROM foreach(row={ SELECT * FROM ExistingHistories }, query={
+        SELECT HomeDir, Line
+        FROM split_records(filenames=HistoryPath, regex="\n", columns=["Line"])
+      })
+      
+      SELECT HomeDir AS UserHome,
+             HistoryEntry
+      FROM AllLines
+      WHERE HistoryEntry =~ FilterRegex
+
+column_types:
+  - name: UserHome
+    type: string
+  - name: HistoryEntry
+    type: string

@@ -1,0 +1,70 @@
+name: Custom.DFIR.RecentPythonSitePackages
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for recently installed or modified Python package content under common site-packages and dist-packages locations.
+  
+  This artifact searches cross-platform Python package paths, filters results with regex controls, and highlights recent file activity that can indicate a compromised package, malicious dependency update, or local package tampering.
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+  - https://pypi.org/security/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlobs
+    type: csv
+    default: "/usr/lib/python*/site-packages/**,/usr/local/lib/python*/site-packages/**,/usr/local/lib/python*/dist-packages/**,/home/*/.local/lib/python*/site-packages/**,/Library/Python/*/site-packages/**,/opt/homebrew/lib/python*/site-packages/**,C:/Python*/Lib/site-packages/**,C:/Users/*/AppData/Local/Programs/Python/Python*/Lib/site-packages/**"
+  - name: PackageRegex
+    type: regex
+    default: "."
+  - name: FileRegex
+    type: regex
+    default: ".(dist-info/|egg-info/|py$|pyc$|pyd$|so$|dll$|dylib$|pth$|pkg$|whl$|zip$|RECORD$|METADATA$|WHEEL$|direct_url.json$|entry_points.txt$)"
+  - name: DaysLookback
+    type: int
+    default: 7
+  - name: CalculateHashes
+    type: bool
+    default: false
+  - name: HashAlgorithms
+    type: string
+    default: MD5,SHA256
+sources:
+  - name: RecentPackageFiles
+    description: Recently modified files in Python site-packages and dist-packages.
+    query: |
+      LET CutoffEpoch <= now() - (DaysLookback * 24 * 60 * 60)
+      LET PackageFiles <= SELECT OSPath, Size, Mode, Mtime, Ctime, Btime, Atime
+      FROM glob(globs=split(string=TargetGlobs, sep=","))
+      WHERE OSPath =~ PackageRegex
+        AND OSPath =~ FileRegex
+        AND Mtime >= timestamp(epoch=CutoffEpoch)
+
+      SELECT OSPath,
+             Size,
+             Mode,
+             Mtime,
+             Ctime,
+             Btime,
+             Atime,
+             if(condition=CalculateHashes,
+                then=hash(path=OSPath, hashselect=HashAlgorithms),
+                else='') AS Hashes
+      FROM PackageFiles
+      ORDER BY Mtime DESC
+      LIMIT 500
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Hashes
+    type: digest

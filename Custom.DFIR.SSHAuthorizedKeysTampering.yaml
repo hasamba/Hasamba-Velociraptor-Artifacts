@@ -1,0 +1,179 @@
+name: Custom.DFIR.SSHAuthorizedKeysTampering
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect SSH authorized_keys tampering across all user home directories.
+  
+  Identifies suspicious or unauthorized SSH public keys by collecting authorized_keys
+  files from all real user accounts, parsing each key entry, and flagging keys that
+  appear tampered, recently modified, or associated with unusual key types, comments,
+  or sizes. Includes filesystem metadata (size, mtime, ctime) and optional hash
+  collection for integrity tracking.
+
+reference:
+  - https://attack.mitre.org/techniques/T1098.004/
+
+type: CLIENT
+
+parameters:
+  - name: HomeGlob
+    type: glob
+    default: /home/*/.ssh/authorized_keys
+  - name: RootKeysPath
+    type: string
+    default: /root/.ssh/authorized_keys
+  - name: SuspiciousCommentRegex
+    type: regex
+    default: "(?i)(tmp|test|backup|admin|root|hack|payload|exploit|temp|unknown)"
+  - name: SuspiciousKeyTypeRegex
+    type: regex
+    default: "(?i)(ssh-dss|ssh-rsa(?!\\s+))"
+  - name: RecentDays
+    type: int
+    default: 7
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: AuthorizedKeysEntries
+    description: |
+      Collect all authorized_keys files from user home directories and root,
+      parse each key line, and extract metadata including key type, comment,
+      fingerprint, and file timestamps.
+    query: |
+      LET HomeKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=HomeGlob)
+      
+      LET RootKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=RootKeysPath)
+      
+      LET AllKeyFiles <= SELECT * FROM chain(
+        a={ SELECT * FROM HomeKeyFiles },
+        b={ SELECT * FROM RootKeyFiles }
+      )
+      
+      LET ParsedKeys <= SELECT OSPath AS KeyFilePath, Size, Mtime, Ctime, Btime, Line
+        FROM foreach(
+          row={ SELECT * FROM AllKeyFiles },
+          query={
+            SELECT OSPath, Size, Mtime, Ctime, Btime, Line
+            FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+            WHERE Line =~ "\\S" AND NOT Line =~ "^\\s*#"
+          }
+        )
+      
+      LET Extracted <= SELECT
+        KeyFilePath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        Line,
+        if(condition=Line =~ "^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss)\\s+",
+           then=regex_replace(source=Line, re="(^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss))\\s+(\\S+).*", replace="$2"),
+           else="unknown") AS KeyType,
+        if(condition=Line =~ "\\s+\\S+@\\S+\\s*$",
+           then=regex_replace(source=Line, re="^.*\\s+(\\S+@\\S+)\\s*$", replace="$1"),
+           else="") AS KeyComment
+      FROM ParsedKeys
+      WHERE KeyFilePath =~ FilterRegex
+      
+      SELECT
+        KeyFilePath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        KeyType,
+        KeyComment,
+        Line AS RawKeyLine
+      FROM Extracted
+
+  - name: SuspiciousKeys
+    description: |
+      Flag authorized_keys entries that match suspicious patterns: unusual key
+      types (ssh-dss), suspicious comments, recently modified files, or oversized
+      key files. Also includes hash information for integrity verification.
+    query: |
+      LET HomeKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=HomeGlob)
+      
+      LET RootKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=RootKeysPath)
+      
+      LET AllKeyFiles <= SELECT * FROM chain(
+        a={ SELECT * FROM HomeKeyFiles },
+        b={ SELECT * FROM RootKeyFiles }
+      )
+      
+      LET ParsedKeys <= SELECT OSPath AS KeyFilePath, Size, Mtime, Ctime, Btime, Line
+        FROM foreach(
+          row={ SELECT * FROM AllKeyFiles },
+          query={
+            SELECT OSPath, Size, Mtime, Ctime, Btime, Line
+            FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+            WHERE Line =~ "\S" AND NOT Line =~ "^\s*#"
+          }
+        )
+      
+      LET KeyHashes <= SELECT KeyFilePath, Size, Mtime, Ctime, Btime, Line,
+        hash(path=KeyFilePath, hashselect="MD5,SHA256") AS FileHash
+      FROM ParsedKeys
+      
+      LET RecentCutoff <= timestamp(epoch=now() - RecentDays * 86400)
+      
+      LET Flagged <= SELECT
+        KeyFilePath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        Line AS RawKeyLine,
+        FileHash,
+        if(condition=Line =~ "^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss)\s+",
+           then=regex_replace(source=Line, re="(^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss))\s+(\S+).*", replace="$2"),
+           else="unknown") AS KeyType,
+        if(condition=Line =~ "\s+\S+@\S+\s*$",
+           then=regex_replace(source=Line, re="^.*\s+(\S+@\S+)\s*$", replace="$1"),
+           else="") AS KeyComment,
+        if(condition=Mtime > RecentCutoff,
+           then="RecentlyModified",
+           else="Stable") AS ModificationStatus,
+        if(condition=Line =~ SuspiciousCommentRegex,
+           then="SuspiciousComment",
+           else="NormalComment") AS CommentFlag,
+        if(condition=Line =~ "^(ssh-dss|ssh-rsa)\s",
+           then="WeakOrLegacyKeyType",
+           else="ModernKeyType") AS KeyTypeFlag
+      FROM KeyHashes
+      WHERE KeyFilePath =~ FilterRegex
+        AND (
+          CommentFlag = "SuspiciousComment"
+          OR KeyTypeFlag = "WeakOrLegacyKeyType"
+          OR ModificationStatus = "RecentlyModified"
+          OR Size > 10240
+        )
+      
+      SELECT
+        KeyFilePath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        KeyType,
+        KeyComment,
+        ModificationStatus,
+        CommentFlag,
+        KeyTypeFlag,
+        FileHash.MD5 AS FileMD5,
+        FileHash.SHA256 AS FileSHA256,
+        RawKeyLine
+      FROM Flagged
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp

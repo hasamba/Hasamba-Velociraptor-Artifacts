@@ -1,0 +1,169 @@
+name: Custom.DFIR.AlternateDataStreams
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for Alternate Data Streams (ADS) on NTFS filesystems.
+  
+  ADS is a technique used by attackers to hide payloads, store tooling,
+  and persist on Windows systems without creating visible files. This artifact
+  enumerates all named data streams on common hiding spots and flags suspicious
+  streams such as Zone.Identifier, executable content in ADS, and unusually large
+  hidden streams.
+
+reference:
+  - https://attack.mitre.org/techniques/T1564.004/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/Users/**/*"
+  - name: TargetGlob2
+    type: glob
+    default: "C:/Windows/Temp/**/*"
+  - name: TargetGlob3
+    type: glob
+    default: "C:/ProgramData/**/*"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousStreamRegex
+    type: regex
+    default: "(?!^Zone\\.Identifier$)^.*$"
+  - name: UploadFiles
+    type: bool
+    default: "Y"
+
+sources:
+  - name: ADSFromUsers
+    description: Enumerate alternate data streams under user profiles
+    query: |
+      LET UserFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=TargetGlob)
+        WHERE NOT OSPath =~ ":\\$DATA"
+      
+      LET UserStreams <= SELECT
+          OSPath,
+          Size,
+          Mtime
+        FROM foreach(
+          row=UserFiles,
+          query={
+            SELECT OSPath, Size, Mtime
+            FROM glob(globs=OSPath + ":*", accessor="ntfs")
+            WHERE NOT OSPath =~ ":\\$DATA$"
+              AND OSPath =~ FilterRegex
+          })
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime,
+            upload(file=OSPath, accessor="ntfs") AS Upload
+          FROM UserStreams
+        },
+        else={
+          SELECT OSPath, Size, Mtime FROM UserStreams
+        })
+
+  - name: ADSFromTemp
+    description: Enumerate alternate data streams under Windows Temp
+    query: |
+      LET TempFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=TargetGlob2)
+        WHERE NOT OSPath =~ ":\\$DATA"
+      
+      LET TempStreams <= SELECT
+          OSPath,
+          Size,
+          Mtime
+        FROM foreach(
+          row=TempFiles,
+          query={
+            SELECT OSPath, Size, Mtime
+            FROM glob(globs=OSPath + ":*", accessor="ntfs")
+            WHERE NOT OSPath =~ ":\\$DATA$"
+              AND OSPath =~ FilterRegex
+          })
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime,
+            upload(file=OSPath, accessor="ntfs") AS Upload
+          FROM TempStreams
+        },
+        else={
+          SELECT OSPath, Size, Mtime FROM TempStreams
+        })
+
+  - name: ADSFromProgramData
+    description: Enumerate alternate data streams under ProgramData
+    query: |
+      LET PDFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=TargetGlob3)
+        WHERE NOT OSPath =~ ":\\$DATA"
+      
+      LET PDStreams <= SELECT
+          OSPath,
+          Size,
+          Mtime
+        FROM foreach(
+          row=PDFiles,
+          query={
+            SELECT OSPath, Size, Mtime
+            FROM glob(globs=OSPath + ":*", accessor="ntfs")
+            WHERE NOT OSPath =~ ":\\$DATA$"
+              AND OSPath =~ FilterRegex
+          })
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime,
+            upload(file=OSPath, accessor="ntfs") AS Upload
+          FROM PDStreams
+        },
+        else={
+          SELECT OSPath, Size, Mtime FROM PDStreams
+        })
+
+  - name: SuspiciousADS
+    description: Flag suspicious ADS entries — Zone.Identifier mismatch, executable content, large hidden streams
+    query: |
+      LET AllFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=[TargetGlob, TargetGlob2, TargetGlob3])
+        WHERE NOT OSPath =~ ":\\$DATA"
+      
+      LET AllStreams <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          regex_replace(re="^(.*):(.+)$", replace="\\2", source=OSPath) AS StreamName,
+          regex_replace(re="^(.*):(.+)$", replace="\\1", source=OSPath) AS BasePath
+        FROM foreach(
+          row=AllFiles,
+          query={
+            SELECT OSPath, Size, Mtime
+            FROM glob(globs=OSPath + ":*", accessor="ntfs")
+            WHERE NOT OSPath =~ ":\\$DATA$"
+          })
+      
+      SELECT
+          OSPath,
+          BasePath,
+          StreamName,
+          Size,
+          Mtime,
+          if(condition=StreamName =~ "\\.(exe|dll|ps1|bat|cmd|vbs|js|wsf|hta|mof|inf)$",
+             then="Executable content in ADS",
+             else=if(condition=Size > 65536 AND StreamName != "Zone.Identifier",
+                      then="Unusually large ADS",
+                      else=if(condition=StreamName =~ SuspiciousStreamRegex,
+                               then="Non-standard ADS",
+                               else="Zone.Identifier"))) AS Suspicion
+        FROM AllStreams
+        WHERE OSPath =~ FilterRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Size
+    type: number

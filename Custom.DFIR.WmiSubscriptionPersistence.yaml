@@ -1,0 +1,81 @@
+name: Custom.DFIR.WmiSubscriptionPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects potential WMI permanent event subscription persistence on Windows systems.
+  
+  The artifact inspects MOF files under WBEM paths for suspicious __EventFilter,
+  consumer, and binding definitions, and reviews the registry list of autorecover
+  MOF entries that can be used to restore malicious subscriptions.
+reference:
+  - https://attack.mitre.org/techniques/T1546.003/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/Windows/System32/wbem/**/*.mof"
+  - name: FileNameRegex
+    type: regex
+    default: '(?i).*(subscription|event|filter|consumer|binding|\.mof)$'
+  - name: MofContentRegex
+    type: regex
+    default: '(?is)(__EventFilter|EventConsumer|ToConsumerBinding|CommandLineEventConsumer|ActiveScriptEventConsumer|__IntervalTimerInstruction|ScriptText|ExecutablePath|CommandLineTemplate|Consumer=|Filter=)'
+  - name: RegistryGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/Autorecover MOFs/*"
+  - name: RegistryPathRegex
+    type: regex
+    default: '(?i).*Autorecover MOFs.*'
+  - name: RegistryDataRegex
+    type: regex
+    default: '(?i).*(wbem|mof|subscription|consumer|filter|binding).*'
+  - name: MaxBytes
+    type: int
+    default: 1048576
+
+sources:
+  - name: MOFMatches
+    description: Scan MOF files for permanent WMI subscription definitions and suspicious consumer content.
+    query: |
+      LET CandidateFiles <=
+        SELECT OSPath, Size, Mtime
+        FROM glob(globs=TargetGlob)
+        WHERE NOT IsDir
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256,
+        read_file(filename=OSPath, length=MaxBytes) AS Content
+      FROM CandidateFiles
+      WHERE OSPath =~ FileNameRegex
+        OR read_file(filename=OSPath, length=MaxBytes) =~ MofContentRegex
+
+  - name: RegistryAutorecoverMOFs
+    description: Review registry-managed autorecover MOF entries that may rehydrate malicious WMI subscriptions.
+    query: |
+      LET RegEntries <=
+        SELECT OSPath, Mtime, Data, Type
+        FROM glob(globs=RegistryGlob, accessor="registry")
+
+      SELECT
+        OSPath,
+        Mtime,
+        Type,
+        Data
+      FROM RegEntries
+      WHERE OSPath =~ RegistryPathRegex
+        AND format(format="%v", args=Data) =~ RegistryDataRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash

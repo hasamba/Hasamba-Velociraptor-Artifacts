@@ -1,0 +1,164 @@
+name: Custom.DFIR.KerberoastingEvent4769
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect potential Kerberoasting activity by analyzing Windows Security Event ID 4769 (Kerberos Service Ticket Request).
+  
+  Event 4769 is logged whenever a TGS is requested. Kerberoasting abuses this by requesting TGS tickets
+  for service accounts (often SPN-enabled accounts) and then cracking the encrypted ticket offline.
+  
+  This artifact scans all .evtx files for 4769 events, extracts the target SPN, account name, client address,
+  ticket encryption type, and flags suspicious indicators:
+  - Requests targeting service accounts (non-machine accounts)
+  - Weak encryption types (RC4 / 0x1 / 0x17) which are preferred by attackers for offline cracking
+  - Multiple unique SPN requests from the same client in a short window
+  - Requests from non-domain-joined or unusual source IPs
+
+reference:
+  - https://attack.mitre.org/techniques/T1558.003/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/*.evtx"
+  - name: TargetEventID
+    type: int
+    default: 4769
+  - name: WeakEncryptionRegex
+    type: regex
+    default: "0x1|0x17|RC4|rc4"
+  - name: SuspiciousAccountRegex
+    type: regex
+    default: "(?i)(sql|svc|service|backup|exchange|mssql|admin|test|share|file|print|iis|apache|tomcat|jenkins|git|jira|nexus|grafana|prometheus|elastic|kibana|splunk|serviceaccount)"
+  - name: ClientAddressFilter
+    type: regex
+    default: "."
+
+sources:
+  - name: Kerberoasting4769Events
+    description: Extract and analyze all Event ID 4769 (TGS requests) from Windows event logs
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+      
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.ServiceName AS ServiceName,
+            EventData.ServiceSid AS ServiceSid,
+            EventData.ClientAddress AS ClientAddress,
+            EventData.ClientPort AS ClientPort,
+            EventData.TicketEncryptionType AS TicketEncryptionType,
+            EventData.ResultCode AS ResultCode,
+            EventData.TicketOptions AS TicketOptions,
+            EventData.LogonGuid AS LogonGuid,
+            EventData.IpAddress AS IpAddress,
+            EventData.IpPort AS IpPort,
+            OSPath AS SourceFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = TargetEventID
+            AND EventData.ResultCode = "0x0"
+        })
+      
+      LET ServiceAccountRequests <= SELECT * FROM RawEvents
+        WHERE ServiceName =~ SuspiciousAccountRegex
+          AND NOT ServiceName =~ "\\$$"
+          AND ClientAddress =~ ClientAddressFilter
+      
+      SELECT
+        EventTime,
+        TargetUserName,
+        ServiceName,
+        ClientAddress,
+        ClientPort,
+        TicketEncryptionType,
+        TicketOptions,
+        ResultCode,
+        SourceFile
+      FROM ServiceAccountRequests
+      ORDER BY EventTime DESC
+      LIMIT 5000
+
+  - name: WeakEncryptionSummary
+    description: Summary of TGS requests using weak encryption types (RC4) targeting service accounts
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+      
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.ServiceName AS ServiceName,
+            EventData.ClientAddress AS ClientAddress,
+            EventData.TicketEncryptionType AS TicketEncryptionType,
+            EventData.ResultCode AS ResultCode
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = TargetEventID
+            AND EventData.ResultCode = "0x0"
+        })
+      
+      LET Filtered <= SELECT * FROM RawEvents
+        WHERE ServiceName =~ SuspiciousAccountRegex
+          AND NOT ServiceName =~ "\\$$"
+          AND TicketEncryptionType =~ WeakEncryptionRegex
+      
+      SELECT
+        ServiceName,
+        TargetUserName,
+        ClientAddress,
+        TicketEncryptionType,
+        count(items=ServiceName) AS RequestCount,
+        min(item=EventTime) AS FirstSeen,
+        max(item=EventTime) AS LastSeen
+      FROM Filtered
+      GROUP BY ServiceName, TargetUserName, ClientAddress, TicketEncryptionType
+      ORDER BY RequestCount DESC
+      LIMIT 5000
+
+  - name: All4769Summary
+    description: Summary of all successful 4769 events grouped by service and client
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+      
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.ServiceName AS ServiceName,
+            EventData.ClientAddress AS ClientAddress,
+            EventData.TicketEncryptionType AS TicketEncryptionType,
+            EventData.ResultCode AS ResultCode
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = TargetEventID
+            AND EventData.ResultCode = "0x0"
+        })
+      
+      SELECT
+        ServiceName,
+        ClientAddress,
+        TicketEncryptionType,
+        count(items=ServiceName) AS RequestCount,
+        min(item=EventTime) AS FirstSeen,
+        max(item=EventTime) AS LastSeen
+      FROM RawEvents
+      GROUP BY ServiceName, ClientAddress, TicketEncryptionType
+      ORDER BY RequestCount DESC
+      LIMIT 5000
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp

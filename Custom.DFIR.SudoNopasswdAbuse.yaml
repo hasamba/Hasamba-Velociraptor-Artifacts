@@ -1,0 +1,140 @@
+name: Custom.DFIR.SudoNopasswdAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects evidence of sudo rule abuse and new NOPASSWD entries in sudoers configuration.
+  
+  Adversaries may add or modify sudoers rules to escalate privileges without authentication
+  (MITRE T1548.003 - Abuse Elevation Control Mechanism: Sudo). This artifact collects
+  sudoers files, NOPASSWD entries, sudo group membership, timestamp files, and recent
+  sudo command execution evidence from logs.
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.003/
+
+type: CLIENT
+
+parameters:
+  - name: SudoersGlob
+    type: glob
+    default: "/etc/sudoers,/etc/sudoers.d/*"
+  - name: NopasswdRegex
+    type: regex
+    default: "(?i)NOPASSWD"
+  - name: SuspiciousEntryRegex
+    type: regex
+    default: "(?i)(\\(root\\)|\\(ALL\\s*:.*\\))\\s+NOPASSWD|\\(ALL\\s*:.*\\)\\s+NOPASSWD|\\(root\\)\\s+NOPASSWD"
+  - name: AuthLogGlob
+    type: glob
+    default: "/var/log/auth.log*,/var/log/secure*"
+  - name: SudoTimestampDir
+    type: string
+    default: "/run/sudo/ts"
+
+sources:
+  - name: SudoersFiles
+    description: Collect all sudoers files and flag NOPASSWD entries
+    query: |
+      LET SudoersFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=SudoersGlob)
+      LET SudoersContent <= SELECT OSPath, Size, Mtime,
+        read_file(filename=OSPath, length=1048576) AS Content
+      FROM SudoersFiles
+      LET ParsedLines <= SELECT * FROM foreach(
+        row=SudoersContent,
+        query={
+          SELECT Line, OSPath FROM split_records(
+            filenames=OSPath,
+            regex="\n",
+            columns=["Line"])
+          WHERE Line =~ "^[^#]"
+            AND Line =~ "."
+        })
+      LET NopasswdEntries <= SELECT Line AS SudoersLine, OSPath AS SourceFile
+      FROM ParsedLines
+      WHERE Line =~ NopasswdRegex
+      SELECT
+        SourceFile,
+        SudoersLine,
+        if(condition=SudoersLine =~ SuspiciousEntryRegex,
+           then="HIGH_RISK",
+           else="NOPASSWD_PRESENT") AS RiskLevel
+      FROM NopasswdEntries
+
+  - name: FullSudoersContent
+    description: Raw content of all sudoers files for review
+    query: |
+      LET SudoersFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=SudoersGlob)
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        read_file(filename=OSPath, length=1048576) AS Content,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM SudoersFiles
+
+  - name: SudoGroupMembers
+    description: List users in sudo and wheel groups
+    query: |
+      LET SudoGroups <= SELECT * FROM foreach(
+        row={
+          SELECT * FROM glob(globs="/etc/group")
+        },
+        query={
+          SELECT
+            OSPath,
+            split(sep=":", string=read_file(filename=OSPath, length=65536)) AS Fields
+          FROM scope()
+        })
+      LET GroupData <= SELECT
+        Fields[0] AS GroupName,
+        Fields[2] AS GID,
+        Fields[3] AS Members
+      FROM SudoGroups
+      WHERE GroupName =~ "^(sudo|wheel|admin)$"
+      SELECT
+        GroupName,
+        GID,
+        Members,
+        len(list=split(sep=",", string=Members)) AS MemberCount
+      FROM GroupData
+
+  - name: SudoTimestampFiles
+    description: Check sudo timestamp files for recent authenticated sessions
+    query: |
+      LET TsDirs <= SELECT OSPath, Size, Mtime FROM glob(globs=SudoTimestampDir + "/*")
+      LET TsFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=SudoTimestampDir + "/*/*")
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        timestamp(epoch=Mtime) AS LastAuthTime
+      FROM TsDirs
+      WHERE Size > 0 OR Mtime > 0
+
+  - name: SudoLogEvidence
+    description: Recent sudo command executions from auth logs
+    query: |
+      LET AuthLogs <= SELECT OSPath, Size, Mtime FROM glob(globs=AuthLogGlob)
+      LET LogLines <= SELECT * FROM foreach(
+        row=AuthLogs,
+        query={
+          SELECT Line, OSPath FROM split_records(
+            filenames=OSPath,
+            regex="\n",
+            columns=["Line"])
+          WHERE Line =~ "(?i)sudo"
+            AND NOT Line =~ "^#"
+        })
+      SELECT
+        Line AS LogLine,
+        OSPath AS LogFile,
+        if(condition=Line =~ "COMMAND=", then="COMMAND_EXECUTED",
+            else=if(condition=Line =~ "incorrect password attempt", then="FAILED_AUTH",
+            else=if(condition=Line =~ "session opened", then="SESSION_OPENED",
+            else="OTHER"))) AS EventType
+      FROM LogLines
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: LastAuthTime
+    type: timestamp

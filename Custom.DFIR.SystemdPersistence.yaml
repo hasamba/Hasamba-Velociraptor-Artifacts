@@ -1,0 +1,146 @@
+name: Custom.DFIR.SystemdPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect systemd service persistence units that may have been installed by an attacker.
+  
+  Attackers commonly create or modify systemd unit files to establish persistence on Linux
+  endpoints. This artifact scans system and user systemd unit directories for .service files,
+  collecting their content, timestamps, and metadata. It also checks for currently running
+  services that correspond to suspicious unit files, and examines override directories that
+  attackers may use to modify existing services without replacing them.
+
+reference:
+  - https://attack.mitre.org/techniques/T1543/002/
+
+type: CLIENT
+
+parameters:
+  - name: SystemUnitGlob
+    type: glob
+    default: /etc/systemd/system/*.service
+  - name: SystemUnitGlob2
+    type: glob
+    default: /usr/lib/systemd/system/*.service
+  - name: UserUnitGlob
+    type: glob
+    default: /home/*/.config/systemd/user/*.service
+  - name: OverrideGlob
+    type: glob
+    default: /etc/systemd/system/*.service.d/*.conf
+  - name: SuspiciousExecRegex
+    type: regex
+    default: "(curl|wget|nc|ncat|socat|/dev/tcp|/tmp/|/var/tmp/|/dev/shm/|base64|python|perl|ruby|bash\\s+-i|reverse|shell|backdoor|keylog|rootkit)"
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: SystemdUnits
+    description: |
+      Collect systemd .service unit files from system directories and user home directories.
+      Reads each unit file content and hashes it for tracking.
+    query: |
+      LET SystemUnits <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=SystemUnitGlob)
+      
+      LET SystemUnits2 <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=SystemUnitGlob2)
+      
+      LET UserUnits <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=UserUnitGlob)
+      
+      LET AllUnits <= SELECT * FROM chain(
+        a={ SELECT * FROM SystemUnits },
+        b={ SELECT * FROM SystemUnits2 },
+        c={ SELECT * FROM UserUnits }
+      )
+      
+      LET UnitContent <= SELECT OSPath, Size, Mtime, Ctime, Atime,
+        read_file(filename=OSPath, length=65536) AS Content,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM AllUnits
+        WHERE OSPath =~ FilterRegex
+      
+      SELECT OSPath, Size, Mtime, Ctime, Atime, Content,
+        Hash.MD5 AS MD5, Hash.SHA256 AS SHA256
+        FROM UnitContent
+
+  - name: SuspiciousUnits
+    description: |
+      Filter unit files containing suspicious ExecStart or ExecPre/Post entries that may
+      indicate attacker persistence, such as reverse shells, downloaders, or backdoors.
+    query: |
+      LET SystemUnits <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=SystemUnitGlob)
+      
+      LET SystemUnits2 <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=SystemUnitGlob2)
+      
+      LET UserUnits <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=UserUnitGlob)
+      
+      LET AllUnits <= SELECT * FROM chain(
+        a={ SELECT * FROM SystemUnits },
+        b={ SELECT * FROM SystemUnits2 },
+        c={ SELECT * FROM UserUnits }
+      )
+      
+      LET UnitContent <= SELECT OSPath, Size, Mtime, Ctime, Atime,
+        read_file(filename=OSPath, length=65536) AS Content,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM AllUnits
+      
+      SELECT OSPath, Size, Mtime, Ctime, Atime, Content,
+        Hash.MD5 AS MD5, Hash.SHA256 AS SHA256
+        FROM UnitContent
+        WHERE Content =~ SuspiciousExecRegex AND OSPath =~ FilterRegex
+
+  - name: Overrides
+    description: |
+      Collect systemd unit override .conf files. Attackers can use override directories
+      (e.g., servicename.service.d/override.conf) to modify legitimate services without
+      replacing the original unit file.
+    query: |
+      LET Overrides <= SELECT OSPath, Size, Mtime, Ctime, Atime
+        FROM glob(globs=OverrideGlob)
+      
+      LET OverrideContent <= SELECT OSPath, Size, Mtime, Ctime, Atime,
+        read_file(filename=OSPath, length=65536) AS Content,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM Overrides
+        WHERE OSPath =~ FilterRegex
+      
+      SELECT OSPath, Size, Mtime, Ctime, Atime, Content,
+        Hash.MD5 AS MD5, Hash.SHA256 AS SHA256
+        FROM OverrideContent
+
+  - name: EnabledServices
+    description: |
+      Check for symlinks in systemd .wants directories that indicate enabled services.
+      These show which services are set to start automatically at boot.
+    query: |
+      LET WantsDirs <= SELECT OSPath
+        FROM glob(globs="/etc/systemd/system/*.wants/*")
+      
+      LET WantsDirs2 <= SELECT OSPath
+        FROM glob(globs="/usr/lib/systemd/system/*.wants/*")
+      
+      LET AllWants <= SELECT * FROM chain(
+        a={ SELECT * FROM WantsDirs },
+        b={ SELECT * FROM WantsDirs2 }
+      )
+      
+      SELECT OSPath,
+        read_file(filename=OSPath, length=65536) AS Target
+        FROM AllWants
+        WHERE OSPath =~ FilterRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: OSPath
+    type: path

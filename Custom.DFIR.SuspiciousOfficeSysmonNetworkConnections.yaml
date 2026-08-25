@@ -1,0 +1,216 @@
+name: Custom.DFIR.SuspiciousOfficeSysmonNetworkConnections
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect suspicious network connections initiated by Microsoft Office applications using
+  Sysmon Event ID 3 (NetworkConnect) on Windows endpoints.
+
+  Office processes that establish direct outbound connections to unexpected destinations
+  can indicate phishing payload execution, macro abuse, malware staging, or command and
+  control traffic mapped to MITRE ATT&CK T1071.
+
+  This artifact parses the Sysmon Operational log, filters for common Office process
+  names, supports regex-based destination suppression, and returns both detailed events
+  and a grouped summary for fast triage.
+
+reference:
+  - https://attack.mitre.org/techniques/T1071/
+  - https://learn.microsoft.com/sysinternals/downloads/sysmon
+
+type: CLIENT
+
+parameters:
+  - name: SysmonEvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+    description: Path to the Sysmon Operational EVTX log
+
+  - name: OfficeProcessRegex
+    type: regex
+    default: "(?i)(winword|excel|powerpnt|outlook|mspub|msaccess|onenote|visio|teams)\\.exe$"
+    description: Regex used to match Office application process image names
+
+  - name: ExcludeDestinationRegex
+    type: regex
+    default: "(?i)(^$|microsoft\\.com|office\\.com|office365\\.com|live\\.com|windows\\.net|sharepoint\\.com|outlook\\.com|teams\\.microsoft\\.com)"
+    description: Regex of expected destinations to exclude from results; set to ^$ to include everything
+
+  - name: IncludePrivateIPs
+    type: bool
+    default: true
+    description: Include RFC1918 destination addresses in the results
+
+  - name: DestinationHostnameRegex
+    type: regex
+    default: "."
+    description: Regex used to include destination hostnames after exclusion filtering
+
+  - name: DestinationIPRegex
+    type: regex
+    default: "."
+    description: Regex used to include destination IP addresses after exclusion filtering
+
+  - name: MinDestinationPort
+    type: int
+    default: 1
+    description: Minimum destination port to include
+
+  - name: MaxDestinationPort
+    type: int
+    default: 65535
+    description: Maximum destination port to include
+
+  - name: UploadEvtx
+    type: bool
+    default: false
+    description: Upload the matching Sysmon EVTX file for offline review
+
+sources:
+  - name: DetailedConnections
+    description: Detailed Sysmon Event ID 3 results for Office applications
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row={ SELECT OSPath FROM EvtxFiles },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.Computer AS Computer,
+            EventData.Image AS ProcessImage,
+            EventData.ProcessId AS ProcessId,
+            EventData.User AS Username,
+            EventData.Protocol AS Protocol,
+            EventData.SourceIp AS SourceIP,
+            EventData.SourceHostname AS SourceHostname,
+            EventData.SourcePort AS SourcePort,
+            EventData.DestinationIp AS DestinationIP,
+            EventData.DestinationHostname AS DestinationHostname,
+            EventData.DestinationPort AS DestinationPort,
+            EventData.Initiated AS Initiated
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 3
+        })
+
+      LET FilteredEvents <= SELECT
+        EventTime,
+        Computer,
+        ProcessImage,
+        ProcessId,
+        Username,
+        Protocol,
+        SourceIP,
+        SourceHostname,
+        SourcePort,
+        DestinationIP,
+        DestinationHostname,
+        DestinationPort,
+        Initiated
+      FROM RawEvents
+      WHERE ProcessImage =~ OfficeProcessRegex
+        AND int(int=DestinationPort) >= MinDestinationPort
+        AND int(int=DestinationPort) <= MaxDestinationPort
+        AND DestinationHostname =~ DestinationHostnameRegex
+        AND DestinationIP =~ DestinationIPRegex
+        AND NOT DestinationHostname =~ ExcludeDestinationRegex
+        AND (
+          IncludePrivateIPs
+          OR NOT DestinationIP =~ "^(127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.)"
+        )
+
+      SELECT
+        EventTime,
+        Computer,
+        ProcessImage,
+        ProcessId,
+        Username,
+        Protocol,
+        SourceIP,
+        SourceHostname,
+        SourcePort,
+        DestinationIP,
+        DestinationHostname,
+        DestinationPort,
+        Initiated
+      FROM FilteredEvents
+
+  - name: ConnectionSummary
+    description: Grouped summary of suspicious Office network connections
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row={ SELECT OSPath FROM EvtxFiles },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.Computer AS Computer,
+            EventData.Image AS ProcessImage,
+            EventData.ProcessId AS ProcessId,
+            EventData.User AS Username,
+            EventData.Protocol AS Protocol,
+            EventData.DestinationIp AS DestinationIP,
+            EventData.DestinationHostname AS DestinationHostname,
+            EventData.DestinationPort AS DestinationPort
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 3
+        })
+
+      LET FilteredEvents <= SELECT
+        EventTime,
+        Computer,
+        ProcessImage,
+        ProcessId,
+        Username,
+        Protocol,
+        DestinationIP,
+        DestinationHostname,
+        DestinationPort
+      FROM RawEvents
+      WHERE ProcessImage =~ OfficeProcessRegex
+        AND int(int=DestinationPort) >= MinDestinationPort
+        AND int(int=DestinationPort) <= MaxDestinationPort
+        AND DestinationHostname =~ DestinationHostnameRegex
+        AND DestinationIP =~ DestinationIPRegex
+        AND NOT DestinationHostname =~ ExcludeDestinationRegex
+        AND (
+          IncludePrivateIPs
+          OR NOT DestinationIP =~ "^(127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.)"
+        )
+
+      SELECT
+        Computer,
+        ProcessImage,
+        Username,
+        Protocol,
+        DestinationIP,
+        DestinationHostname,
+        DestinationPort,
+        count() AS ConnectionCount,
+        min(item=EventTime) AS FirstSeen,
+        max(item=EventTime) AS LastSeen
+      FROM FilteredEvents
+      GROUP BY Computer, ProcessImage, Username, Protocol, DestinationIP, DestinationHostname, DestinationPort
+
+  - name: EvtxUpload
+    description: Optional upload of Sysmon EVTX data used during analysis
+    query: |
+      SELECT * FROM if(
+        condition=UploadEvtx,
+        then={
+          SELECT OSPath, upload(file=OSPath) AS Upload
+          FROM glob(globs=SysmonEvtxGlob)
+        },
+        else={
+          SELECT OSPath, "Upload disabled" AS Upload
+          FROM glob(globs=SysmonEvtxGlob)
+        })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp
+  - name: ProcessImage
+    type: preview_upload

@@ -1,0 +1,93 @@
+name: Custom.DFIR.SuspiciousServices
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Enumerates Windows services and flags those with suspicious binary paths
+  indicative of persistence or privilege escalation via service creation (T1543.003).
+
+  Checks all registered services for binary paths exhibiting common attacker patterns:
+  - Paths under user-writable directories (AppData, Temp, Downloads, Public, ProgramData)
+  - Paths referencing remote shares (\\\\)
+  - Suspicious extensions (.bat, .cmd, .ps1, .vbs, .js, .hta, .wsc, .wsf) as service binaries
+  - Missing or empty binary paths
+  - Binaries not on disk (file does not exist)
+  - Retrieves the ObjectName (RunAs account) and Start type from the service registry key
+
+reference:
+  - https://attack.mitre.org/techniques/T1543.003/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousPathRegex
+    type: regex
+    default: "(?i)(AppData|\\\\Temp|Downloads|\\\\Public|\\\\ProgramData|\\\\Users\\\\|\\\\\\\\|\\.bat|\\.cmd|\\.ps1|\\.vbs|\\.js|\\.hta|\\.wsc|\\.wsf)"
+  - name: ServiceNameRegex
+    type: regex
+    default: "."
+  - name: UploadSuspiciousBinaries
+    type: bool
+    default: false
+
+sources:
+  - name: Services
+    description: Enumerate all services and identify suspicious binary paths
+    query: |
+      LET SuspiciousRegex <= SuspiciousPathRegex
+
+      LET ServiceImagePaths <= SELECT
+        basename(path=OSPath.Dirname) AS ServiceName,
+        Data.value AS BinaryPath
+      FROM glob(
+        globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/*/ImagePath",
+        accessor="registry"
+      )
+      WHERE ServiceName =~ ServiceNameRegex
+
+      LET ServiceDetails <= SELECT
+        ServiceName,
+        BinaryPath,
+        {
+          SELECT Data.value FROM glob(
+            globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/" + ServiceName + "/ObjectName",
+            accessor="registry"
+          )
+          LIMIT 1
+        } AS RunAsRow,
+        {
+          SELECT Data.value FROM glob(
+            globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/" + ServiceName + "/Start",
+            accessor="registry"
+          )
+          LIMIT 1
+        } AS StartRow,
+        if(condition=NOT BinaryPath OR len(list=BinaryPath) = 0,
+          then=True,
+          else=BinaryPath =~ SuspiciousRegex) AS MatchesSuspiciousPattern
+      FROM ServiceImagePaths
+
+      LET Results <= SELECT
+        ServiceName,
+        BinaryPath,
+        RunAsRow.Data.value AS RunAs,
+        if(condition=StartRow.Data.value = 2, then="Automatic",
+          else=if(condition=StartRow.Data.value = 3, then="Manual",
+          else=if(condition=StartRow.Data.value = 4, then="Disabled",
+          else="Other"))) AS StartType,
+        MatchesSuspiciousPattern,
+        if(condition=NOT BinaryPath OR len(list=BinaryPath) = 0,
+          then=True,
+          else=NOT stat(filename=expand(path=BinaryPath), accessor="auto")) AS BinaryMissingFromDisk
+      FROM ServiceDetails
+
+      SELECT ServiceName, BinaryPath, RunAs, StartType,
+        MatchesSuspiciousPattern, BinaryMissingFromDisk,
+        if(condition=MatchesSuspiciousPattern OR BinaryMissingFromDisk,
+          then="SUSPICIOUS", else="OK") AS Verdict,
+        if(condition=UploadSuspiciousBinaries AND MatchesSuspiciousPattern AND BinaryPath,
+          then=upload(file=expand(path=BinaryPath)),
+          else=null) AS UploadedBinary
+      FROM Results
+
+column_types:
+  - name: BinaryPath
+    type: path

@@ -1,0 +1,104 @@
+name: Custom.DFIR.PortForwardingTunnelingTools
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+
+description: |
+  Detect evidence of port forwarding and tunneling tools such as chisel, socat, plink, and ngrok.
+  
+  Adversaries may use tunneling tools to route traffic through compromised hosts, bypassing
+  network segmentation and obscuring their C2 communications. This artifact hunts for known
+  tunneling binaries on disk, running processes, network connections on common tunneling ports,
+  and relevant command-line artifacts.
+
+reference:
+  - https://attack.mitre.org/techniques/T1572/
+
+type: CLIENT
+
+parameters:
+  - name: ToolGlobs
+    type: glob
+    default: |
+      /usr/bin/chisel
+      /usr/local/bin/chisel
+      /usr/bin/socat
+      /usr/local/bin/socat
+      /snap/bin/socat
+      /usr/bin/ngrok
+      /usr/local/bin/ngrok
+      /snap/bin/ngrok
+      /opt/*/chisel*
+      /opt/*/ngrok*
+      C:/Program Files/chisel*/**/*.exe
+      C:/Program Files (x86)/chisel*/**/*.exe
+      C:/Program Files/ngrok*/**/*.exe
+      C:/Program Files (x86)/ngrok*/**/*.exe
+      C:/Program Files/PuTTY/**/plink*.exe
+      C:/Program Files (x86)/PuTTY/**/plink*.exe
+      C:/Users/*/Downloads/**/chisel*.exe
+      C:/Users/*/Downloads/**/ngrok*.exe
+      C:/Users/*/Downloads/**/plink*.exe
+      C:/Users/*/Desktop/**/chisel*.exe
+      C:/Users/*/Desktop/**/ngrok*.exe
+      C:/Users/*/Desktop/**/plink*.exe
+      C:/Windows/System32/OpenSSH/**/ssh.exe
+
+  - name: ProcessRegex
+    type: regex
+    default: "(?i)(chisel|socat|plink|ngrok|ssh.*-[LRRD])"
+
+  - name: ConnectionRegex
+    type: regex
+    default: "."
+
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: DiskFindings
+    description: Find tunneling tool binaries on disk
+    query: |
+      LET ToolFiles <= SELECT OSPath, Size, Mtime, Btime AS CreationTime
+        FROM glob(globs=ToolGlobs)
+      SELECT OSPath, Size, Mtime, CreationTime,
+             hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes,
+             if(condition=UploadFiles,
+                then={ SELECT upload(file=OSPath) AS Upload FROM scope() },
+                else={ SELECT NULL AS Upload FROM scope() }) AS Upload
+        FROM ToolFiles
+        WHERE Size > 0
+
+  - name: ProcessFindings
+    description: Detect running tunneling and port-forwarding processes
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+             timestamp(epoch=CreateTime) AS ProcessStartTime
+        FROM pslist()
+        WHERE Name =~ ProcessRegex
+           OR CommandLine =~ ProcessRegex
+           OR Exe =~ ProcessRegex
+
+  - name: NetworkFindings
+    description: Detect active network connections associated with tunneling tools
+    query: |
+      LET ToolPids <= SELECT Pid FROM pslist()
+        WHERE Name =~ ProcessRegex
+           OR CommandLine =~ ProcessRegex
+      SELECT Pid, Status, Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+             Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort,
+             timestamp(epoch=CreateTime) AS ConnectionTime
+        FROM netstat()
+        WHERE Pid IN ToolPids.Pid
+           AND Raddr.IP =~ ConnectionRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: CreationTime
+    type: timestamp
+  - name: ProcessStartTime
+    type: timestamp
+  - name: ConnectionTime
+    type: timestamp
+  - name: OSPath
+    type: path

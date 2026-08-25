@@ -1,0 +1,147 @@
+name: Custom.DFIR.CronPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for cron-based persistence mechanisms on Linux endpoints.
+
+  Scans user crontabs (/var/spool/cron/*), system cron.d directories,
+  and daily/hourly/weekly/monthly cron drop-in dirs for suspicious or
+  anomalous scheduled jobs — a common Linux persistence technique (T1053.003).
+
+reference:
+  - https://attack.mitre.org/techniques/T1053.003/
+
+type: CLIENT
+
+parameters:
+  - name: UserCrontabGlob
+    type: glob
+    default: /var/spool/cron/*/*
+  - name: CronDGlob
+    type: glob
+    default: /etc/cron.d/*
+  - name: CronPeriodicGlobs
+    type: glob
+    default: /etc/cron.daily/*,/etc/cron.hourly/*,/etc/cron.weekly/*,/etc/cron.monthly/*
+  - name: SuspiciousRegex
+    type: regex
+    default: "(curl|wget|python|nc|ncat|bash|sh|perl|ruby|php)\\s|/dev/tcp|base64\\s|-e\\s|reverse|shell|backdoor|beacon|c2|download|payload|chmod|chown.*root"
+  - name: UploadFiles
+    type: bool
+    default: Y
+
+sources:
+  - name: UserCrontabs
+    description: |
+      Collect and parse user crontab files from /var/spool/cron/.
+      Highlights entries matching suspicious command patterns.
+    query: |
+      LET UserCrondir <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=UserCrontabGlob)
+
+      LET UserCronContent <= SELECT OSPath, Size, Mtime,
+        read_file(filename=OSPath, length=1048576) AS RawContent
+        FROM UserCrondir
+
+      LET UserCronLines <= SELECT * FROM foreach(
+        row=UserCronContent,
+        query={
+          SELECT OSPath, Size, Mtime, Line,
+            if(condition=Line =~ SuspiciousRegex,
+              then=True,
+              else=False) AS IsSuspicious
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ "\S" AND NOT Line =~ "^\s*#"
+        })
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Line, IsSuspicious,
+            upload(file=OSPath) AS Upload
+          FROM UserCronLines
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Line, IsSuspicious
+          FROM UserCronLines
+        })
+
+  - name: CronD
+    description: |
+      Collect and parse system cron.d drop-in files.
+      Highlights entries matching suspicious command patterns.
+    query: |
+      LET CronDFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=CronDGlob)
+
+      LET CronDContent <= SELECT OSPath, Size, Mtime,
+        read_file(filename=OSPath, length=1048576) AS RawContent
+        FROM CronDFiles
+
+      LET CronDLines <= SELECT * FROM foreach(
+        row=CronDContent,
+        query={
+          SELECT OSPath, Size, Mtime, Line,
+            if(condition=Line =~ SuspiciousRegex,
+              then=True,
+              else=False) AS IsSuspicious
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ "\S" AND NOT Line =~ "^\s*#"
+        })
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Line, IsSuspicious,
+            upload(file=OSPath) AS Upload
+          FROM CronDLines
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Line, IsSuspicious
+          FROM CronDLines
+        })
+
+  - name: PeriodicCronScripts
+    description: |
+      Collect cron scripts from daily/hourly/weekly/monthly directories.
+      Highlights scripts matching suspicious patterns and hashes each file.
+    query: |
+      LET PeriodicFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=CronPeriodicGlobs)
+
+      LET PeriodicContent <= SELECT OSPath, Size, Mtime,
+        read_file(filename=OSPath, length=1048576) AS RawContent,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM PeriodicFiles
+        WHERE Size > 0
+
+      LET PeriodicLines <= SELECT * FROM foreach(
+        row=PeriodicContent,
+        query={
+          SELECT OSPath, Size, Mtime, FileHash, Line,
+            if(condition=Line =~ SuspiciousRegex,
+              then=True,
+              else=False) AS IsSuspicious
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ "\S" AND NOT Line =~ "^\s*#"
+        })
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Line, IsSuspicious,
+            FileHash.MD5 AS MD5, FileHash.SHA256 AS SHA256,
+            upload(file=OSPath) AS Upload
+          FROM PeriodicLines
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Line, IsSuspicious,
+            FileHash.MD5 AS MD5, FileHash.SHA256 AS SHA256
+          FROM PeriodicLines
+        })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: MD5
+    type: hash_md5
+  - name: SHA256
+    type: hash_sha256

@@ -1,0 +1,83 @@
+name: Custom.DFIR.SudoersNoPasswdAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Find evidence of sudo rule abuse or new NOPASSWD entries in sudoers.
+
+  This artifact inspects Linux sudo policy files and nearby audit/authentication logs for suspicious sudoers changes, NOPASSWD rules, broad privilege grants, include directives, and sudo activity that may indicate abuse of elevated privileges.
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.003/
+
+type: CLIENT
+
+parameters:
+  - name: SudoersGlobs
+    type: glob
+    default: "/etc/sudoers,/etc/sudoers.d/**"
+  - name: RuleRegex
+    type: regex
+    default: '(?i)(NOPASSWD|ALL\s*=\s*\(ALL(:ALL)?\)\s*ALL|!authenticate|SETENV|sudoedit|#includedir|#include)'
+  - name: ExcludeLineRegex
+    type: regex
+    default: '^\s*(#\s*$|$)'
+  - name: LogGlobs
+    type: glob
+    default: "/var/log/auth.log*,/var/log/secure*,/var/log/audit/audit.log*,/var/log/syslog*"
+  - name: LogRegex
+    type: regex
+    default: '(?i)(sudo|sudoers|visudo|NOPASSWD|/etc/sudoers|COMMAND=|USER_AUTH|USER_CMD|USER_ACCT|USER_ROLE_CHANGE|USER_AVC)'
+  - name: MaxLogBytes
+    type: int
+    default: 10485760
+
+sources:
+  - name: SudoersFileInventory
+    description: Inventory sudo policy files with timestamps and hashes.
+    query: |
+      LET SudoersFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime, Mode.String AS Mode,
+             Uid, Gid, hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM glob(globs=split(string=SudoersGlobs, sep=","))
+      SELECT OSPath, Size, Mode, Uid, Gid, Mtime, Ctime, Btime, Hash
+      FROM SudoersFiles
+
+  - name: SuspiciousSudoersRules
+    description: Matching sudoers lines that grant broad privileges, disable authentication, or include delegated policy files.
+    query: |
+      LET SudoersFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime,
+             hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM glob(globs=split(string=SudoersGlobs, sep=","))
+      SELECT OSPath, Mtime, Ctime, Btime, Hash, Line
+      FROM foreach(
+        row=SudoersFiles,
+        query={
+          SELECT OSPath, Mtime, Ctime, Btime, Hash, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ RuleRegex AND NOT Line =~ ExcludeLineRegex
+        })
+
+  - name: SudoersChangeAndUseLogs
+    description: Authentication, sudo, and audit log lines related to sudoers changes or sudo command use.
+    query: |
+      LET LogFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=split(string=LogGlobs, sep=","))
+        WHERE Size > 0 AND Size <= MaxLogBytes
+      SELECT OSPath, Mtime, Ctime, Btime, Line
+      FROM foreach(
+        row=LogFiles,
+        query={
+          SELECT OSPath, Mtime, Ctime, Btime, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ LogRegex
+        })
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Hash
+    type: hash

@@ -1,0 +1,89 @@
+name: Custom.DFIR.NtfsAlternateDataStreams
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect Alternate Data Streams (ADS) on NTFS filesystems.
+  
+  ADS allow data to be hidden in named streams alongside a file's default data stream.
+  Adversaries abuse ADS to hide tools, payloads, and exfiltrated data (MITRE T1564.004).
+  This artifact scans common high-risk locations for ADS entries, hashes their content,
+  and flags suspicious stream names often used in offensive operations.
+
+reference:
+  - https://attack.mitre.org/techniques/T1564.004/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/**"
+  - name: HighRiskGlob
+    type: glob
+    default: "C:/Users/**/*"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousStreamRegex
+    type: regex
+    default: "(?i)^(Zone\\.Identifier|[^:]*(exe|dll|ps1|bat|cmd|vbs|js|hta|txt|dat|bin|payload|key|log|config|data)(:\\S+)?)$"
+
+sources:
+  - name: ADSFromGlob
+    description: Scan target glob for files with alternate data streams
+    query: |
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=TargetGlob)
+      
+      LET WithStreams <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM AllFiles
+      
+      SELECT Base.OSPath AS BaseFilePath, Base.Size AS BaseSize, Base.Mtime AS BaseMtime,
+          Base.Atime AS BaseAtime, Base.Ctime AS BaseCtime,
+          Stream.OSPath AS StreamPath,
+          Stream.Size AS StreamSize,
+          Stream.Mtime AS StreamMtime,
+          hash(path=Stream.OSPath, hashselect="MD5,SHA256") AS StreamHash
+        FROM foreach(row=WithStreams, query={
+          SELECT * FROM glob(globs=OSPath + ":*")
+        })
+        WHERE StreamPath =~ FilterRegex
+
+  - name: HighRiskADS
+    description: Scan high-risk user directories for suspicious ADS
+    query: |
+      LET HighRiskPaths <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=HighRiskGlob)
+      
+      LET HighRiskWithStreams <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM HighRiskPaths
+      
+      SELECT Base.OSPath AS BaseFilePath, Base.Size AS BaseSize, Base.Mtime AS BaseMtime,
+          Stream.OSPath AS StreamPath,
+          Stream.Size AS StreamSize,
+          Stream.Mtime AS StreamMtime,
+          hash(path=Stream.OSPath, hashselect="MD5,SHA256") AS StreamHash,
+          if(condition=Stream.OSPath =~ SuspiciousStreamRegex,
+             then="SUSPICIOUS", else="BENIGN") AS Verdict
+        FROM foreach(row=HighRiskWithStreams, query={
+          SELECT * FROM glob(globs=OSPath + ":*")
+        })
+        WHERE StreamPath =~ FilterRegex
+
+  - name: ADSZoneIdentifier
+    description: Find Zone.Identifier ADS entries showing files downloaded from the internet
+    query: |
+      SELECT OSPath, Size, Mtime,
+          read_file(filename=OSPath, length=4096) AS ZoneContent,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM glob(globs=TargetGlob + ":Zone.Identifier")
+        WHERE OSPath =~ FilterRegex
+
+column_types:
+  - name: BaseMtime
+    type: timestamp
+  - name: BaseAtime
+    type: timestamp
+  - name: BaseCtime
+    type: timestamp
+  - name: StreamMtime
+    type: timestamp

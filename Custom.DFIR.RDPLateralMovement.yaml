@@ -1,0 +1,213 @@
+name: Custom.DFIR.RDPLateralMovement
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect RDP lateral movement by analyzing Windows Security Event Logs 4624, 4648, and 4778.
+  
+  Identifies suspicious RDP logons including:
+  - Event 4624 (Logon) with LogonType 10 (RemoteInteractive) or LogonType 7 (Unlock) from non-local sources
+  - Event 4648 (Explicit Credential Logon) indicating lateral movement attempts
+  - Event 4778 (RDP session reconnection) tracking session persistence
+  
+  Correlates source IPs, target machines, and user accounts to highlight potential lateral movement chains.
+
+reference:
+  - https://attack.mitre.org/techniques/T1021.001/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+  - name: LookbackDays
+    type: int
+    default: 7
+  - name: SourceIPRegex
+    type: regex
+    default: "."
+  - name: SuspiciousUserRegex
+    type: regex
+    default: "^(Administrator|admin|svc_|service_)"
+  - name: IgnoreLocalIPs
+    type: regex
+    default: "^(127\\.|::1|fe80::)"
+  - name: UploadEvtx
+    type: bool
+    default: false
+
+sources:
+  - name: RDPLogon4624
+    description: |
+      Detect RDP logon events (4624) with LogonType 10 (RemoteInteractive) or 7 (Unlock).
+      Filters out local loopback sources to highlight remote RDP sessions.
+    query: |
+      LET Lookback <= timestamp(epoch=now() - LookbackDays * 86400)
+
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET Parsed <= SELECT *
+        FROM foreach(
+          row=EvtxFiles,
+          query={
+            SELECT
+              timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+              System.EventID.Value AS EventID,
+              EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4624
+              AND System.TimeCreated.SystemTime > Lookback
+          }
+        )
+
+      LET RDPLogons <= SELECT
+          EventTime,
+          EventID,
+          EventData.TargetUserName AS TargetUser,
+          EventData.TargetDomainName AS TargetDomain,
+          EventData.IpAddress AS SourceIP,
+          EventData.IpPort AS SourcePort,
+          EventData.LogonType AS LogonType,
+          EventData.WorkstationName AS Workstation,
+          EventData.LogonProcessName AS LogonProcess
+        FROM Parsed
+        WHERE LogonType IN (7, 10)
+          AND EventData.IpAddress =~ SourceIPRegex
+          AND NOT EventData.IpAddress =~ IgnoreLocalIPs
+
+      SELECT * FROM if(condition=UploadEvtx,
+        then={
+          SELECT *, upload(file=OSPath) AS EvtxUpload
+          FROM foreach(row=EvtxFiles, query={
+            SELECT OSPath FROM glob(globs=EvtxGlob)
+          })
+          LIMIT 0
+        },
+        else={
+          SELECT
+            EventTime,
+            TargetUser,
+            TargetDomain,
+            SourceIP,
+            SourcePort,
+            LogonType,
+            Workstation,
+            LogonProcess,
+            EventID
+          FROM RDPLogons
+          ORDER BY EventTime DESC
+        })
+
+  - name: ExplicitCredential4648
+    description: |
+      Detect explicit credential logon events (4648) indicating lateral movement via
+      runas /netonly or PsExec-style credential reuse.
+    query: |
+      LET Lookback <= timestamp(epoch=now() - LookbackDays * 86400)
+
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET Parsed <= SELECT *
+        FROM foreach(
+          row=EvtxFiles,
+          query={
+            SELECT
+              timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+              System.EventID.Value AS EventID,
+              EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4648
+              AND System.TimeCreated.SystemTime > Lookback
+          }
+        )
+
+      SELECT
+        EventTime,
+        EventData.SubjectUserName AS SubjectUser,
+        EventData.SubjectDomainName AS SubjectDomain,
+        EventData.TargetUserName AS TargetUser,
+        EventData.TargetServerName AS TargetServer,
+        EventData.IpAddress AS SourceIP,
+        EventData.IpPort AS SourcePort,
+        EventID
+      FROM Parsed
+      WHERE EventData.IpAddress =~ SourceIPRegex
+        AND NOT EventData.IpAddress =~ IgnoreLocalIPs
+        AND EventData.TargetServerName =~ "."
+      ORDER BY EventTime DESC
+
+  - name: RDPSessionReconnect4778
+    description: |
+      Detect RDP session reconnection events (4778) showing session persistence
+      and potential lateral movement chains between hosts.
+    query: |
+      LET Lookback <= timestamp(epoch=now() - LookbackDays * 86400)
+
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET Parsed <= SELECT *
+        FROM foreach(
+          row=EvtxFiles,
+          query={
+            SELECT
+              timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+              System.EventID.Value AS EventID,
+              EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4778
+              AND System.TimeCreated.SystemTime > Lookback
+          }
+        )
+
+      SELECT
+        EventTime,
+        EventData.UserName AS UserName,
+        EventData.DomainName AS Domain,
+        EventData.SessionName AS SessionName,
+        EventData.ClientAddress AS ClientAddress,
+        EventData.ClientName AS ClientName,
+        EventID
+      FROM Parsed
+      WHERE EventData.ClientAddress =~ SourceIPRegex
+        AND NOT EventData.ClientAddress =~ IgnoreLocalIPs
+      ORDER BY EventTime DESC
+
+  - name: SuspiciousRDPSummary
+    description: |
+      Aggregated summary highlighting suspicious RDP lateral movement indicators:
+      admin accounts, unusual source IPs, and cross-machine session chains.
+    query: |
+      LET RDPLogons <= SELECT
+          EventTime,
+          TargetUser,
+          SourceIP,
+          LogonType,
+          Workstation,
+          "RDP Logon" AS DetectionType
+        FROM source(artifact="Custom.DFIR.RDPLateralMovement/RDPLogon4624")
+        WHERE TargetUser =~ SuspiciousUserRegex
+
+      LET ExplicitCreds <= SELECT
+          EventTime,
+          SubjectUser AS TargetUser,
+          SourceIP,
+          "" AS LogonType,
+          TargetServer AS Workstation,
+          "Explicit Credential" AS DetectionType
+        FROM source(artifact="Custom.DFIR.RDPLateralMovement/ExplicitCredential4648")
+        WHERE SubjectUser =~ SuspiciousUserRegex
+          OR TargetUser =~ SuspiciousUserRegex
+
+      SELECT * FROM chain(
+        a={SELECT * FROM RDPLogons},
+        b={SELECT * FROM ExplicitCreds},
+        h=9223372036854775807
+      )
+      ORDER BY EventTime DESC
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: SourceIP
+    type: ip
+  - name: ClientAddress
+    type: ip

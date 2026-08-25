@@ -1,0 +1,139 @@
+name: Custom.DFIR.LargeFileStagingInUserAndTempDirectories
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects large files staged in temporary and user-writable directories before possible exfiltration.
+
+  Attackers frequently collect and compress data into large archives or containers under temp,
+  downloads, desktop, documents, or shared user-writable locations before exfiltration. This artifact
+  checks common Windows, Linux, and macOS staging paths, applies size and regex filters, and can
+  optionally hash matching files for triage.
+
+reference:
+  - https://attack.mitre.org/techniques/T1074.001/
+
+type: CLIENT
+
+parameters:
+  - name: WindowsUserGlob
+    type: glob
+    default: "C:/Users/**"
+  - name: WindowsTempGlob
+    type: glob
+    default: "C:/Windows/Temp/**"
+  - name: UnixTempGlob
+    type: glob
+    default: "/{tmp,var/tmp}/**"
+  - name: UnixUserGlob
+    type: glob
+    default: "/{home,Users}/**"
+  - name: IncludeRegex
+    type: regex
+    default: '(?i)(\.zip$|\.7z$|\.rar$|\.tar$|\.gz$|\.tgz$|\.bz2$|\.xz$|\.iso$|\.vhd$|\.vhdx$|\.pst$|\.ost$|backup|dump|archive|exfil|staging|collect)'
+  - name: ExcludeRegex
+    type: regex
+    default: '(?i)(/node_modules/|/\.git/|/Library/Caches/|/AppData/Local/Packages/|/AppData/Local/Microsoft/WindowsApps/)'
+  - name: MinSizeBytes
+    type: int
+    default: 104857600
+  - name: CalculateHashes
+    type: bool
+    default: false
+
+sources:
+  - name: WindowsUserLargeStagedFiles
+    description: Large staged files under Windows user profiles.
+    query: |
+      LET CandidateFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=WindowsUserGlob)
+        WHERE Size >= MinSizeBytes
+          AND OSPath =~ IncludeRegex
+          AND NOT OSPath =~ ExcludeRegex
+
+      LET WithHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM CandidateFiles
+
+      LET WithoutHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          NULL AS Hash
+        FROM CandidateFiles
+
+      SELECT * FROM if(condition=CalculateHashes,
+        then={ SELECT * FROM WithHashes },
+        else={ SELECT * FROM WithoutHashes })
+
+  - name: WindowsTempLargeStagedFiles
+    description: Large staged files under Windows temporary directories.
+    query: |
+      LET CandidateFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=WindowsTempGlob)
+        WHERE Size >= MinSizeBytes
+          AND OSPath =~ IncludeRegex
+          AND NOT OSPath =~ ExcludeRegex
+
+      LET WithHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM CandidateFiles
+
+      LET WithoutHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          NULL AS Hash
+        FROM CandidateFiles
+
+      SELECT * FROM if(condition=CalculateHashes,
+        then={ SELECT * FROM WithHashes },
+        else={ SELECT * FROM WithoutHashes })
+
+  - name: UnixTempLargeStagedFiles
+    description: Large staged files under Linux and macOS temporary directories.
+    query: |
+      LET CandidateFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=UnixTempGlob)
+        WHERE Size >= MinSizeBytes
+          AND OSPath =~ IncludeRegex
+          AND NOT OSPath =~ ExcludeRegex
+
+      LET WithHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM CandidateFiles
+
+      LET WithoutHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          NULL AS Hash
+        FROM CandidateFiles
+
+      SELECT * FROM if(condition=CalculateHashes,
+        then={ SELECT * FROM WithHashes },
+        else={ SELECT * FROM WithoutHashes })
+
+  - name: UnixUserLargeStagedFiles
+    description: Large staged files under Linux and macOS user directories.
+    query: |
+      LET CandidateFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=UnixUserGlob)
+        WHERE Size >= MinSizeBytes
+          AND OSPath =~ IncludeRegex
+          AND NOT OSPath =~ ExcludeRegex
+
+      LET WithHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM CandidateFiles
+
+      LET WithoutHashes <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+          NULL AS Hash
+        FROM CandidateFiles
+
+      SELECT * FROM if(condition=CalculateHashes,
+        then={ SELECT * FROM WithHashes },
+        else={ SELECT * FROM WithoutHashes })
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Hash
+    type: hash

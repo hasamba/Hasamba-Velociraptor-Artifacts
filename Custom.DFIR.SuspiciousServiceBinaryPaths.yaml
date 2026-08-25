@@ -1,0 +1,68 @@
+name: Custom.DFIR.SuspiciousServiceBinaryPaths
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Enumerates Windows services with suspicious binary paths that may indicate persistence or privilege escalation.
+  
+  Checks all registered services for binary paths exhibiting common attacker patterns:
+  - Paths outside standard system directories (Program Files, Windows, System32)
+  - Paths referencing temp/user-writable directories
+  - Paths with suspicious keywords (download, update, patch, hack, crack, payload)
+  - Services running from non-standard drives or unusual extensions
+  
+  MITRE ATT&CK: T1543.003 - Create or Modify System Process: Windows Service
+
+reference:
+  - https://attack.mitre.org/techniques/T1543.003/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousKeywordsRegex
+    type: regex
+    default: "(?i)(download|update|patch|hack|crack|payload|shell|reverse|bind|dropper|loader|backdoor|c2|beacon|stager|tmp|temp|public|appdata|programdata)"
+    description: Regex pattern for suspicious keywords in binary paths
+  - name: SuspiciousExtensionsRegex
+    type: regex
+    default: "(?i)\\.(bat|cmd|ps1|vbs|js|hta|scr|com|pif|dll|tmp)$"
+    description: Regex for suspicious executable extensions
+  - name: TrustedPathRegex
+    type: regex
+    default: "(?i)^(C:\\\\Windows\\\\|C:\\\\Windows\\\\System32\\\\|C:\\\\Windows\\\\SysWOW64\\\\|C:\\\\Program Files\\\\|C:\\\\Program Files \\(x86\\)\\\\)"
+    description: Regex for trusted system paths (services outside these are flagged)
+
+sources:
+  - name: SuspiciousServices
+    description: Enumerates services with suspicious binary paths
+    query: |
+      LET ServiceImagePaths <= SELECT
+        OSPath AS KeyPath,
+        basename(path=OSPath) AS ServiceName,
+        Data.value AS BinaryPath
+      FROM glob(
+        globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/*/ImagePath",
+        accessor="registry")
+      WHERE Data.value AND len(list=Data.value) > 0
+
+      LET Enriched <= SELECT
+        ServiceName,
+        BinaryPath,
+        BinaryPath =~ SuspiciousKeywordsRegex AS KeywordHit,
+        BinaryPath =~ SuspiciousExtensionsRegex AS ExtHit,
+        BinaryPath =~ TrustedPathRegex AS TrustedPath
+      FROM ServiceImagePaths
+
+      SELECT
+        ServiceName,
+        BinaryPath,
+        if(condition=KeywordHit, then="KeywordMatch",
+           else=if(condition=ExtHit, then="SuspiciousExtension",
+           else=if(condition=TrustedPath = False, then="NonStandardPath",
+           else="Normal"))) AS SuspicionReason,
+        hash(path=BinaryPath, hashselect="MD5,SHA256") AS BinaryHash,
+        stat(accessor="file", filename=BinaryPath) AS BinaryStat
+      FROM Enriched
+      WHERE KeywordHit OR ExtHit OR TrustedPath = False
+
+column_types:
+  - name: BinaryPath
+    type: path

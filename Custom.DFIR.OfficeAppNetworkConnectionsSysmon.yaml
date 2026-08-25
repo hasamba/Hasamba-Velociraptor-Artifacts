@@ -1,0 +1,104 @@
+name: Custom.DFIR.OfficeAppNetworkConnectionsSysmon
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect suspicious network connections initiated by Office applications (Word, Excel, PowerPoint, Outlook, OneNote, MSAccess)
+  via Sysmon Event ID 3 (NetworkConnect). Office apps making outbound connections — especially to non-standard ports
+  or rare destinations — are a strong indicator of macro-based malware, COM object abuse, or exploit payload delivery
+  (MITRE T1071 — Application Layer Protocol).
+
+reference:
+  - https://attack.mitre.org/techniques/T1071/
+  - https://www.elastic.co/guide/en/security/current/suspicious-ms-office-child-process.html
+  - https://docs.microsoft.com/en-us/sysinternals/downloads/sysmon
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+  - name: OfficeProcessRegex
+    type: regex
+    default: "(?i)(WINWORD|EXCEL|POWERPNT|OUTLOOK|ONENOTE|MSACCESS|MSPUB|VISIO)\\.EXE$"
+  - name: SuspiciousPortRegex
+    type: regex
+    default: "^(4444|5555|6666|8888|9999|1234|31337|4443|8080|8443|9999)$"
+  - name: SuspiciousIPRegex
+    type: regex
+    default: "(?i)^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|255\\.255\\.255\\.255|224\\.|239\\.)"
+  - name: TargetPortFilter
+    type: regex
+    default: "."
+  - name: UploadResults
+    type: bool
+    default: false
+
+sources:
+  - name: NetworkConnections
+    description: Parse Sysmon Event ID 3 records and filter for network connections initiated by Office applications.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated_SystemTime AS EventTime,
+            System.EventID_Value AS EventID,
+            EventData.Image AS Image,
+            EventData.SourceIp AS SourceIp,
+            EventData.SourcePort AS SourcePort,
+            EventData.DestinationIp AS DestinationIp,
+            EventData.DestinationPort AS DestinationPort,
+            EventData.DestinationHostname AS DestinationHostname,
+            EventData.Protocol AS Protocol,
+            EventData.Initiated AS Initiated,
+            EventData.User AS User,
+            EventData.ProcessId AS ProcessId,
+            OSPath AS EvtxFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID_Value = 3
+            AND EventData.Image =~ OfficeProcessRegex
+            AND EventData.Initiated = "true"
+        })
+
+      LET FilteredEvents <= SELECT
+        EventTime,
+        Image,
+        SourceIp,
+        SourcePort,
+        DestinationIp,
+        DestinationPort,
+        DestinationHostname,
+        Protocol,
+        User,
+        ProcessId,
+        EvtxFile,
+        if(condition=DestinationPort =~ SuspiciousPortRegex,
+           then="Suspicious Port",
+           else=if(condition=DestinationIp =~ SuspiciousIPRegex,
+                   then="Suspicious IP",
+                   else="Standard")) AS RiskCategory
+      FROM RawEvents
+      WHERE DestinationPort =~ TargetPortFilter
+
+      SELECT * FROM if(condition=UploadResults,
+        then={ SELECT EventTime, Image, SourceIp, SourcePort, DestinationIp, DestinationPort,
+                      DestinationHostname, Protocol, User, ProcessId, RiskCategory, EvtxFile,
+                      upload(file=EvtxFile) AS EvtxUpload
+               FROM FilteredEvents },
+        else={ SELECT EventTime, Image, SourceIp, SourcePort, DestinationIp, DestinationPort,
+                      DestinationHostname, Protocol, User, ProcessId, RiskCategory, EvtxFile
+               FROM FilteredEvents })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: SourceIp
+    type: ip
+  - name: DestinationIp
+    type: ip
+  - name: DestinationPort
+    type: integer
+  - name: SourcePort
+    type: integer

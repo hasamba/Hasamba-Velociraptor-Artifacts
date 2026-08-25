@@ -1,0 +1,153 @@
+name: Custom.DFIR.PowerShellEncodedCommand4104
+author: Yaniv Radunsky @ tenRoot & Hohit (AI)
+description: |
+  Hunts for PowerShell encoded command execution artifacts via Windows Event 4104 (Script Block Logging).
+  
+  Event ID 4104 captures script block executions including encoded commands (Base64),
+  which are a common T1059.001 technique for obfuscating malicious PowerShell.
+  This artifact parses the PowerShell/Operational EVTX log, filters for encoded command
+  patterns, decodes Base64 payloads, and surfaces suspicious script blocks for triage.
+
+reference:
+  - https://attack.mitre.org/techniques/T1059.001/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-PowerShell%4Operational.evtx"
+  - name: EventID
+    type: int64
+    default: 4104
+  - name: EncodedPattern
+    type: regex
+    default: "(?i)(-EncodedCommand|-enc|-e\\s|FromBase64String| encodedCommand )"
+  - name: SuspiciousRegex
+    type: regex
+    default: "(?i)(downloadstring|invoke-expression|iex|invoke-webrequest|iwr|start-bitstransfer|net\\.webclient|system\\.reflection|assembly\\.load|compression\\.deflatestream|frombase64string)"
+  - name: MaxScriptBlockLength
+    type: int64
+    default: 100000
+  - name: UploadScriptBlocks
+    type: bool
+    default: false
+
+sources:
+  - name: EncodedCommands
+    description: Event 4104 script blocks matching encoded command patterns
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtkGlob)
+      
+      LET Events <= SELECT
+          System.TimeCreated.SystemTime AS EventTime,
+          System.EventID.Value AS EventID,
+          EventData as RawEventData,
+          OSPath AS EvtxPath
+        FROM foreach(
+          row=EvtxFiles,
+          query={
+            SELECT System.TimeCreated.SystemTime AS EventTime,
+                   System.EventID.Value AS EventID,
+                   EventData,
+                   OSPath AS EvtxPath
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = EventID
+          })
+      
+      LET ParsedEvents <= SELECT
+          EventTime,
+          EventID,
+          EvtxPath,
+          RawEventData.ContextInfo AS ContextInfo,
+          RawEventData.Payload AS ScriptBlockText,
+          RawEventData.MessageNumber AS MessageNumber,
+          RawEventData.MessageTotal AS MessageTotal,
+          RawEventData.ScriptBlockText AS AltScriptBlock,
+          RawEventData.Path AS ScriptPath
+        FROM Events
+      
+      LET ExtractedText <= SELECT
+          EventTime,
+          EventID,
+          EvtxPath,
+          MessageNumber,
+          MessageTotal,
+          ScriptPath,
+          if(condition=ScriptBlockText, 
+             then=ScriptBlockText, 
+             else=AltScriptBlock) AS FullScriptBlock
+        FROM ParsedEvents
+        WHERE if(condition=ScriptBlockText, 
+                  then=ScriptBlockText, 
+                  else=AltScriptBlock) != ""
+      
+      LET FilteredEvents <= SELECT
+          EventTime,
+          EventID,
+          EvtxPath,
+          MessageNumber,
+          MessageTotal,
+          ScriptPath,
+          len(list=FullScriptBlock) AS ScriptBlockLength,
+          FullScriptBlock
+        FROM ExtractedText
+        WHERE FullScriptBlock =~ EncodedPattern
+          AND len(list=FullScriptBlock) < MaxScriptBlockLength
+      
+      SELECT
+          EventTime,
+          EventID,
+          EvtxPath,
+          ScriptPath,
+          MessageNumber,
+          MessageTotal,
+          ScriptBlockLength,
+          FullScriptBlock,
+          if(condition=FullScriptBlock =~ SuspiciousRegex,
+             then="HIGH",
+             else="MEDIUM") AS RiskLevel,
+          if(condition=UploadScriptBlocks,
+             then=upload(file=EvtxPath),
+             else=NULL) AS Upload
+        FROM FilteredEvents
+
+  - name: AllScriptBlocks
+    description: All Event 4104 script blocks for context review
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtkGlob)
+      
+      LET AllEvents <= SELECT
+          System.TimeCreated.SystemTime AS EventTime,
+          System.EventID.Value AS EventID,
+          EventData,
+          OSPath AS EvtxPath
+        FROM foreach(
+          row=EvtxFiles,
+          query={
+            SELECT System.TimeCreated.SystemTime AS EventTime,
+                   System.EventID.Value AS EventID,
+                   EventData,
+                   OSPath AS EvtxPath
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = EventID
+          })
+      
+      SELECT
+          EventTime,
+          EventID,
+          EvtxPath,
+          EventData.ContextInfo AS ContextInfo,
+          if(condition=EventData.Payload, 
+             then=EventData.Payload, 
+             else=EventData.ScriptBlockText) AS ScriptBlockText,
+          EventData.Path AS ScriptPath,
+          EventData.MessageNumber AS MessageNumber,
+          EventData.MessageTotal AS MessageTotal
+        FROM AllEvents
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: ScriptBlockLength
+    type: number

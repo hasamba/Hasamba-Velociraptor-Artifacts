@@ -1,0 +1,55 @@
+name: Custom.DFIR.LinuxCronPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Finds evidence of cron-based persistence on Linux.
+  
+  This artifact scans system-wide crontabs (/etc/crontab, /etc/cron.d/*) and user-specific crontabs (/var/spool/cron/crontabs/*) 
+  to identify scheduled tasks that may be used for persistence.
+
+reference:
+  - https://attack.mitre.org/techniques/T1053.003/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlobs
+    type: csv
+    default: |
+      Glob
+      /etc/crontab
+      /etc/cron.d/**/*
+      /etc/cron.hourly/**/*
+      /etc/cron.daily/**/*
+      /etc/cron.weekly/**/*
+      /etc/cron.monthly/**/*
+      /var/spool/cron/crontabs/**/*
+      /var/spool/cron/atjobs/*
+      /var/spool/cron/atspool/*
+  - name: FilterRegex
+    type: regex
+    default: .
+
+sources:
+  - name: CronFiles
+    description: Metadata of identified cron files.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Ctime, Mode FROM glob(globs=TargetGlobs.Glob)
+      SELECT OSPath, Size, Mtime, Ctime, Mode FROM Files WHERE OSPath =~ FilterRegex
+
+  - name: CronContent
+    description: Individual lines from cron files, excluding comments.
+    query: |
+      LET Files <= SELECT OSPath FROM glob(globs=TargetGlobs.Glob)
+      SELECT * FROM foreach(
+        row=Files,
+        query={
+           SELECT OSPath, Line FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+           WHERE NOT Line =~ "^\\s*#" AND Line =~ FilterRegex AND Line =~ "\\S"
+        }
+      )
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp

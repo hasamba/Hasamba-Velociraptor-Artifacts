@@ -1,0 +1,167 @@
+name: Custom.DFIR.SuspiciousOutboundLongRunningProcs
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for suspicious outbound network connections established by long-running processes.
+  Correlates netstat() with pslist() to identify processes running for extended periods
+  that maintain outbound connections to external IPs — a potential indicator of C2 beaconing
+  or data exfiltration (MITRE ATT&CK T1041).
+
+  The artifact flags connections based on:
+  - Process uptime exceeding a configurable threshold
+  - Remote address being non-local (RFC1918 exclusion)
+  - Optional regex filtering on process name, command line, or remote IP
+  - Process reputation: processes running from non-standard paths or with suspicious command lines
+
+reference:
+  - https://attack.mitre.org/techniques/T1041/
+
+type: CLIENT
+
+parameters:
+  - name: MinUptimeSeconds
+    type: int
+    default: 3600
+    description: "Minimum process uptime in seconds to be considered long-running (default: 1 hour)"
+  - name: ExcludeLocalRanges
+    type: bool
+    default: true
+    description: Exclude RFC1918 private IP ranges from results
+  - name: ProcessNameRegex
+    type: regex
+    default: "."
+    description: Regex to filter process names (default matches all)
+  - name: SuspiciousPathRegex
+    type: regex
+    default: "(?i)(temp|appdata|users|downloads|tmp|var/tmp|/dev/shm)"
+    description: Regex to flag processes running from suspicious paths
+  - name: KnownGoodRegex
+    type: regex
+    default: "(?i)^(svchost|lsass|winlogon|csrss|services|smss|wininit|dwm|explorer|chrome|msedge|firefox|system|idle)$"
+    description: Regex of known-good process names to de-prioritize
+
+sources:
+  - name: LongRunningConnections
+    description: Outbound network connections from long-running processes
+    query: |
+      LET StartTime <= timestamp(epoch=now())
+
+      // Get all running processes with their start times
+      LET Procs <= SELECT
+          Pid,
+          Ppid,
+          Name,
+          Exe,
+          CommandLine,
+          Username,
+          CreateTime
+      FROM pslist()
+
+      // Calculate uptime in seconds
+      LET ProcsWithUptime <= SELECT
+          Pid,
+          Ppid,
+          Name,
+          Exe,
+          CommandLine,
+          Username,
+          CreateTime,
+          StartTime,
+          (StartTime - CreateTime) / 1000000 AS UptimeSeconds
+      FROM Procs
+      WHERE CreateTime > 0
+        AND (StartTime - CreateTime) / 1000000 > MinUptimeSeconds
+
+      // Get active network connections
+      LET Connections <= SELECT
+          Pid,
+          Status,
+          Laddr.IP AS LocalIP,
+          Laddr.Port AS LocalPort,
+          Raddr.IP AS RemoteIP,
+          Raddr.Port AS RemotePort,
+          Family
+      FROM netstat()
+      WHERE Status = "ESTABLISHED"
+        AND Raddr.IP != ""
+
+      // Filter out local/private ranges if requested
+      LET FilteredConnections <= SELECT
+          Pid,
+          Status,
+          LocalIP,
+          LocalPort,
+          RemoteIP,
+          RemotePort
+      FROM Connections
+      WHERE NOT (ExcludeLocalRanges AND (
+          RemoteIP =~ "^10\\."
+          OR RemoteIP =~ "^172\\.(1[6-9]|2[0-9]|3[01])\\."
+          OR RemoteIP =~ "^192\\.168\\."
+          OR RemoteIP =~ "^127\\."
+          OR RemoteIP =~ "^169\\.254\\."
+          OR RemoteIP =~ "^::1$"
+          OR RemoteIP =~ "^fe80"
+          OR RemoteIP =~ "^fc00"
+          OR RemoteIP =~ "^fd"
+      ))
+
+      // Join: iterate over filtered connections, look up matching long-running process
+      LET Joined <= SELECT
+          Pid,
+          Ppid,
+          Name AS ProcessName,
+          Exe AS ExecutablePath,
+          CommandLine,
+          Username,
+          CreateTime AS ProcessCreateTime,
+          UptimeSeconds,
+          RemoteIP,
+          RemotePort,
+          LocalIP,
+          LocalPort,
+          ConnStatus
+      FROM foreach(
+        row={
+          SELECT Pid AS ConnPid, RemoteIP, RemotePort, LocalIP, LocalPort, Status AS ConnStatus
+          FROM FilteredConnections
+        },
+        query={
+          SELECT ConnPid AS Pid, Ppid, Name AS ProcessName, Exe AS ExecutablePath,
+                 CommandLine, Username, CreateTime AS ProcessCreateTime,
+                 UptimeSeconds,
+                 RemoteIP, RemotePort, LocalIP, LocalPort, ConnStatus
+          FROM ProcsWithUptime
+          WHERE Pid = ConnPid
+            AND Name =~ ProcessNameRegex
+        }
+      )
+
+      // Annotate with suspicion indicators
+      SELECT
+          Pid,
+          Ppid,
+          ProcessName,
+          ExecutablePath,
+          CommandLine,
+          Username,
+          timestamp(epoch=ProcessCreateTime) AS ProcessCreateTime,
+          UptimeSeconds,
+          format(format="%v:%v", args=[RemoteIP, RemotePort]) AS RemoteEndpoint,
+          RemoteIP,
+          RemotePort,
+          LocalIP,
+          LocalPort,
+          ConnStatus,
+          if(condition=ExecutablePath =~ SuspiciousPathRegex, then="SUSPICIOUS_PATH", else="NORMAL_PATH") AS PathRisk,
+          if(condition=ProcessName =~ KnownGoodRegex, then="KNOWN_GOOD", else="UNKNOWN") AS Reputation,
+          if(condition=CommandLine =~ "(?i)(powershell|cmd|wscript|cscript|rundll32|regsvr32|mshta|certutil|bitsadmin)", then="SUSPICIOUS_CMDLINE", else="NORMAL_CMDLINE") AS CmdLineRisk,
+          if(condition=RemotePort IN (4444, 4445, 8080, 8443, 1234, 1337, 9001, 31337, 6667, 6668, 6669), then="SUSPICIOUS_PORT", else="NORMAL_PORT") AS PortRisk
+      FROM Joined
+
+column_types:
+  - name: ProcessCreateTime
+    type: timestamp
+  - name: ExecutablePath
+    type: path
+  - name: CommandLine
+    type: text

@@ -1,0 +1,148 @@
+name: Custom.DFIR.DetectCloudMetadataAccessBySuspiciousProcesses
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect processes connecting to the cloud instance metadata service at 169.254.169.254.
+
+  Adversaries may query cloud metadata services to obtain instance credentials or other
+  sensitive cloud configuration data (MITRE ATT&CK T1552.005). This artifact correlates
+  live network connections with process metadata, filters for metadata IP access, and
+  highlights suspicious process names, command lines, executable paths, and ports.
+
+  Platform: Windows / Linux (cross-platform).
+
+reference:
+  - https://attack.mitre.org/techniques/T1552.005/
+  - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html
+  - https://learn.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service
+
+type: CLIENT
+
+parameters:
+  - name: MetadataIPRegex
+    description: Regex for metadata service IP addresses to match.
+    type: regex
+    default: "^169\\.254\\.169\\.254$"
+  - name: ProcessRegex
+    description: Regex for suspicious process names.
+    type: regex
+    default: "(?i)(curl|wget|powershell(\\.exe)?|pwsh(\\.exe)?|python(\\.exe|3)?|perl|ruby|php|bash|sh|zsh|nc|ncat|netcat|busybox|certutil(\\.exe)?|mshta(\\.exe)?|rundll32(\\.exe)?|regsvr32(\\.exe)?|wmic(\\.exe)?)"
+  - name: CommandLineRegex
+    description: Regex for suspicious command line content.
+    type: regex
+    default: "(?i)(169\\.254\\.169\\.254|metadata|latest/meta-data|computeMetadata|Metadata:true|iam/security-credentials|instance-identity)"
+  - name: SuspiciousPathRegex
+    description: Regex for suspicious executable locations.
+    type: regex
+    default: "(?i)(AppData\\\\Local\\\\Temp|AppData\\\\Roaming|ProgramData|Users\\\\Public|Windows\\\\Temp|Recycle\\.Bin|/tmp/|/var/tmp/|/dev/shm/|/home/[^/]+/\\.|/run/)"
+  - name: StateRegex
+    description: Regex for connection state to include.
+    type: regex
+    default: "."
+  - name: CalculateHashes
+    description: Calculate MD5 and SHA256 for matching executable paths.
+    type: bool
+    default: false
+  - name: UploadBinary
+    description: Upload matching executable binaries.
+    type: bool
+    default: false
+
+sources:
+  - name: MetadataAccessFindings
+    description: Correlate metadata-service network connections with suspicious process telemetry.
+    query: |
+      LET NetConns <=
+        SELECT
+          Pid AS ConnPid,
+          Status,
+          Laddr.IP AS LocalIP,
+          Laddr.Port AS LocalPort,
+          Raddr.IP AS RemoteIP,
+          Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Raddr.IP =~ MetadataIPRegex
+          AND Status =~ StateRegex
+
+      LET Procs <=
+        SELECT
+          Pid,
+          Ppid,
+          Name,
+          Exe,
+          CommandLine,
+          Username,
+          CreateTime
+        FROM pslist()
+
+      LET Correlated <=
+        SELECT *
+        FROM foreach(
+          row=NetConns,
+          query={
+            SELECT
+              ConnPid AS Pid,
+              Ppid,
+              Name,
+              Exe,
+              CommandLine,
+              Username,
+              CreateTime,
+              Status,
+              LocalIP,
+              LocalPort,
+              RemoteIP,
+              RemotePort
+            FROM Procs
+            WHERE Pid = ConnPid
+          })
+
+      LET Hits <=
+        SELECT
+          Pid,
+          Ppid,
+          Name,
+          Exe,
+          CommandLine,
+          Username,
+          CreateTime,
+          Status,
+          LocalIP,
+          LocalPort,
+          RemoteIP,
+          RemotePort,
+          if(condition=Name =~ ProcessRegex, then="NameMatch", else="") AS NameIndicator,
+          if(condition=CommandLine =~ CommandLineRegex, then="CommandLineMatch", else="") AS CommandLineIndicator,
+          if(condition=Exe =~ SuspiciousPathRegex, then="PathMatch", else="") AS PathIndicator,
+          if(condition=CalculateHashes AND Exe, then=hash(path=Exe, hashselect="MD5,SHA256"), else="") AS ExecutableHashes
+        FROM Correlated
+        WHERE Name =~ ProcessRegex
+          OR CommandLine =~ CommandLineRegex
+          OR Exe =~ SuspiciousPathRegex
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime,
+        Status,
+        LocalIP,
+        LocalPort,
+        RemoteIP,
+        RemotePort,
+        NameIndicator,
+        CommandLineIndicator,
+        PathIndicator,
+        ExecutableHashes,
+        if(condition=UploadBinary AND Exe, then=upload(file=Exe), else="") AS Upload
+      FROM Hits
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: path
+  - name: ExecutableHashes
+    type: string

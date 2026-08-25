@@ -1,0 +1,160 @@
+name: Custom.DFIR.COMHijackPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Identify persistence through COM object hijacking in the Windows registry.
+  
+  Adversaries hijack COM object registry entries to achieve persistence by modifying
+  InprocServer32/LocalServer32 values, adding TreatAs entries, or replacing CLSID
+  ProgIDs to point to malicious DLLs or executables. This artifact scans known COM
+  persistence locations and flags suspicious entries such as executables in user-writable
+  paths, unsigned binaries, and InprocServer32 values that do not point to system directories.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.015/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousPathRegex
+    type: regex
+    default: "(?i)(C:\\\\Users\\\\|C:\\\\ProgramData\\\\|C:\\\\Temp\\\\|C:\\\\Users\\\\Public\\\\|AppData\\\\|Downloads\\\\|\\\\Temp\\\\)"
+  - name: CheckSigning
+    type: bool
+    default: "Y"
+
+sources:
+  - name: InprocServer32Hijacks
+    description: |
+      Scans HKLM and HKCU CLSID InprocServer32 entries for DLLs located in
+      user-writable or non-standard paths, which may indicate COM hijacking.
+    query: |
+      LET SuspiciousInprocHKLM <= SELECT
+        OSPath AS KeyPath,
+        regex_replace(re="//InprocServer32$", replace="", source=str(str=OSPath)) AS CLSIDPath,
+        OSPath.Basename AS ValueName,
+        get(item=OSPath, field="Data") AS DllPath,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\CLSID\\*\\InprocServer32",
+        accessor="registry")
+      WHERE DllPath =~ SuspiciousPathRegex
+
+      LET SuspiciousInprocHKCU <= SELECT
+        OSPath AS KeyPath,
+        regex_replace(re="//InprocServer32$", replace="", source=str(str=OSPath)) AS CLSIDPath,
+        OSPath.Basename AS ValueName,
+        get(item=OSPath, field="Data") AS DllPath,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_CURRENT_USER\\SOFTWARE\\Classes\\CLSID\\*\\InprocServer32",
+        accessor="registry")
+      WHERE DllPath =~ SuspiciousPathRegex
+
+      SELECT KeyPath, CLSIDPath, ValueName, DllPath, ValueType, FindingType
+      FROM chain(
+        q1={SELECT KeyPath, CLSIDPath, ValueName, DllPath, ValueType, "InprocServer32" AS FindingType FROM SuspiciousInprocHKLM},
+        q2={SELECT KeyPath, CLSIDPath, ValueName, DllPath, ValueType, "InprocServer32" AS FindingType FROM SuspiciousInprocHKCU}
+      )
+
+  - name: LocalServer32Hijacks
+    description: |
+      Scans LocalServer32 entries for executables in suspicious paths,
+      indicating potential COM object hijacking for persistence.
+    query: |
+      LET SuspiciousLocalHKLM <= SELECT
+        OSPath AS KeyPath,
+        regex_replace(re="//LocalServer32$", replace="", source=str(str=OSPath)) AS CLSIDPath,
+        OSPath.Basename AS ValueName,
+        get(item=OSPath, field="Data") AS ExePath,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\CLSID\\*\\LocalServer32",
+        accessor="registry")
+      WHERE ExePath =~ SuspiciousPathRegex
+
+      LET SuspiciousLocalHKCU <= SELECT
+        OSPath AS KeyPath,
+        regex_replace(re="//LocalServer32$", replace="", source=str(str=OSPath)) AS CLSIDPath,
+        OSPath.Basename AS ValueName,
+        get(item=OSPath, field="Data") AS ExePath,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_CURRENT_USER\\SOFTWARE\\Classes\\CLSID\\*\\LocalServer32",
+        accessor="registry")
+      WHERE ExePath =~ SuspiciousPathRegex
+
+      SELECT KeyPath, CLSIDPath, ValueName, ExePath, ValueType, FindingType
+      FROM chain(
+        q1={SELECT KeyPath, CLSIDPath, ValueName, ExePath, ValueType, "LocalServer32" AS FindingType FROM SuspiciousLocalHKLM},
+        q2={SELECT KeyPath, CLSIDPath, ValueName, ExePath, ValueType, "LocalServer32" AS FindingType FROM SuspiciousLocalHKCU}
+      )
+
+  - name: TreatAsEntries
+    description: |
+      Detects TreatAs registry entries that redirect a COM object to a different
+      CLSID, a common hijacking technique for persistence.
+    query: |
+      LET TreatAsHKLM <= SELECT
+        OSPath AS KeyPath,
+        get(item=OSPath, field="Data") AS RedirectedCLSID,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes\\CLSID\\*\\TreatAs",
+        accessor="registry")
+
+      LET TreatAsHKCU <= SELECT
+        OSPath AS KeyPath,
+        get(item=OSPath, field="Data") AS RedirectedCLSID,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_CURRENT_USER\\SOFTWARE\\Classes\\CLSID\\*\\TreatAs",
+        accessor="registry")
+
+      SELECT KeyPath, RedirectedCLSID, ValueType, FindingType
+      FROM chain(
+        q1={SELECT KeyPath, RedirectedCLSID, ValueType, "TreatAs" AS FindingType FROM TreatAsHKLM},
+        q2={SELECT KeyPath, RedirectedCLSID, ValueType, "TreatAs" AS FindingType FROM TreatAsHKCU}
+      )
+
+  - name: ProgIDHijacks
+    description: |
+      Detects ProgID entries under HKCU that override HKLM COM registrations,
+      a stealthy persistence mechanism.
+    query: |
+      LET HKCUProgIDs <= SELECT
+        OSPath AS KeyPath,
+        get(item=OSPath, field="Data") AS Value,
+        get(item=OSPath, field="Type") AS ValueType
+      FROM glob(
+        globs="HKEY_CURRENT_USER\\SOFTWARE\\Classes\\CLSID\\*\\ProgID",
+        accessor="registry")
+
+      SELECT
+        KeyPath,
+        Value AS ProgID,
+        ValueType,
+        "ProgID Override" AS FindingType
+      FROM HKCUProgIDs
+
+  - name: HKCUCLSIDOverrides
+    description: |
+      Lists all CLSID registrations under HKCU, which override HKLM entries
+      and are a primary indicator of COM hijacking persistence.
+    query: |
+      LET HKCUCLSIDs <= SELECT
+        OSPath AS KeyPath,
+        OSPath.Basename AS CLSID
+      FROM glob(
+        globs="HKEY_CURRENT_USER\\SOFTWARE\\Classes\\CLSID\\*",
+        accessor="registry")
+      WHERE NOT OSPath =~ "(?i)(InprocServer32|LocalServer32|ProgID|TreatAs|TypeLib|Version|Flags|Implemented Categories)"
+
+      SELECT
+        KeyPath,
+        CLSID,
+        "HKCU CLSID Override" AS FindingType
+      FROM HKCUCLSIDs
+
+column_types:
+  - name: KeyPath
+    type: path

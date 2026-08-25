@@ -1,0 +1,166 @@
+name: Custom.DFIR.SchtasksEncodedCommands
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for scheduled tasks created via schtasks.exe with encoded commands.
+  
+  Adversaries abuse schtasks.exe to establish persistence by creating scheduled tasks
+  that execute encoded/obfuscated commands (e.g., base64-encoded PowerShell via -EncodedCommand).
+  This artifact scans Windows scheduled task XML files for encoded command indicators,
+  examines schtasks creation events in the Security and Task Scheduler logs,
+  and checks running processes spawned from scheduled tasks with suspicious command lines.
+
+reference:
+  - https://attack.mitre.org/techniques/T1053.005/
+
+type: CLIENT
+
+parameters:
+  - name: TaskGlob
+    type: glob
+    default: "C:/Windows/System32/Tasks/**/*.xml"
+  - name: EncodedRegex
+    type: regex
+    default: "(?i)(-Encod|-e\\s+nc|FromBase64|\\\\x[0-9a-f]{2}|%[0-9a-f]{2}[0-9a-f]{2}|IEX|Invoke-Expression|DownloadString|DownloadFile|Start-Process|cmd\\.exe.*/c|powershell.*/c|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin)"
+  - name: SuspiciousTaskRegex
+    type: regex
+    default: "(?i)(powershell|cmd\\.exe|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin)"
+  - name: UploadFiles
+    type: bool
+    default: "N"
+
+sources:
+  - name: SuspiciousTaskXML
+    description: |
+      Parse scheduled task XML files looking for encoded or obfuscated commands
+      within task actions.
+    query: |
+      LET TaskFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=TaskGlob)
+      
+      LET Parsed <= SELECT * FROM foreach(
+        row={
+          SELECT OSPath, Size, Mtime FROM TaskFiles
+        },
+        query={
+          SELECT 
+            OSPath AS TaskFile,
+            Mtime AS TaskModifiedTime,
+            Size AS TaskFileSize,
+            regex_replace(re="^[\\s\\S]*$", replace="", source="") AS _Dummy,
+            read_file(filename=OSPath, length=65536) AS Content
+          FROM scope()
+        })
+      
+      LET Filtered <= SELECT 
+        TaskFile,
+        TaskModifiedTime,
+        TaskFileSize,
+        Content,
+        if(condition=Content =~ EncodedRegex,
+           then="EncodedCommandDetected",
+           else=if(condition=Content =~ SuspiciousTaskRegex,
+                    then="SuspiciousInterpreter",
+                    else="Clean")) AS Verdict
+      FROM Parsed
+      WHERE Content =~ SuspiciousTaskRegex
+      
+      SELECT 
+        TaskFile,
+        TaskModifiedTime,
+        TaskFileSize,
+        Verdict,
+        if(condition=UploadFiles,
+           then=upload(file=TaskFile),
+           else=None) AS Upload,
+        regex_replace(re="<Command>([^<]+)</Command>", replace="<Command>REDACTED</Command>", source=if(condition=Verdict="EncodedCommandDetected", then=Content, else="")) AS Snippet
+      FROM Filtered
+
+  - name: SchtasksCreationEvents
+    description: |
+      Search Security event log for schtasks.exe task creation events (Event ID 4698)
+      and Task Scheduler operational log for task registration (Event ID 106).
+    query: |
+      LET SecLog <= SELECT * FROM foreach(
+        row={
+          SELECT OSPath FROM glob(globs="C:/Windows/System32/winevt/Logs/Security.evtx")
+        },
+        query={
+          SELECT 
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.CommandLine AS CommandLine,
+            EventData.TaskName AS TaskName,
+            EventData.SubjectUserName AS SubjectUser,
+            OSPath AS LogFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4698
+            AND EventData.CommandLine =~ SuspiciousTaskRegex
+        })
+      
+      LET TaskSchedulerLog <= SELECT * FROM foreach(
+        row={
+          SELECT OSPath FROM glob(globs="C:/Windows/System32/winevt/Logs/Microsoft-Windows-TaskScheduler%4Operational.evtx")
+        },
+        query={
+          SELECT 
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.TaskName AS TaskName,
+            EventData.ActionName AS ActionName,
+            if(condition=EventData.ActionContent,
+               then=EventData.ActionContent,
+               else="") AS ActionContent,
+            OSPath AS LogFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 106
+            AND (EventData.ActionContent =~ EncodedRegex
+              OR EventData.ActionName =~ SuspiciousTaskRegex)
+        })
+      
+      SELECT * FROM chain(
+        a={ SELECT EventTime, EventID, CommandLine, TaskName, SubjectUser, LogFile FROM SecLog },
+        b={ SELECT EventTime, EventID, TaskName, ActionName, ActionContent, LogFile FROM TaskSchedulerLog },
+        c={ SELECT * FROM scope() WHERE FALSE }
+      )
+
+  - name: RunningSchtasksProcesses
+    description: |
+      Identify running processes that were spawned by schtasks.exe or have
+      command lines matching encoded command patterns.
+    query: |
+      LET Processes <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username FROM pslist()
+      
+      LET SuspiciousProcs <= SELECT 
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        if(condition=CommandLine =~ EncodedRegex,
+           then="EncodedCommand",
+           else=if(condition=CommandLine =~ SuspiciousTaskRegex,
+                    then="SuspiciousInterpreter",
+                    else="Unknown")) AS Verdict
+      FROM Processes
+      WHERE (CommandLine =~ EncodedRegex OR CommandLine =~ SuspiciousTaskRegex)
+        AND Name =~ "(?i)(powershell|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|schtasks)"
+      
+      SELECT 
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        Verdict
+      FROM SuspiciousProcs
+
+column_types:
+  - name: TaskModifiedTime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: TaskFile
+    type: path
+  - name: LogFile
+    type: path

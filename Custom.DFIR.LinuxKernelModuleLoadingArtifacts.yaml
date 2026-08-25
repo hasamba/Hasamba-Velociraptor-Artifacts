@@ -1,0 +1,215 @@
+name: Custom.DFIR.LinuxKernelModuleLoadingArtifacts
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects Linux kernel module loading artifacts by parsing the current loaded modules list,
+  inspecting module metadata exposed through /proc/modules and /sys/module, and reviewing
+  module-load related configuration files.
+  
+  This artifact helps investigate potential rootkit persistence or stealthy kernel module
+  loading activity associated with MITRE ATT&CK T1014.
+
+reference:
+  - https://attack.mitre.org/techniques/T1014/
+  - https://man7.org/linux/man-pages/man5/proc_modules.5.html
+  - https://man7.org/linux/man-pages/man8/lsmod.8.html
+
+type: CLIENT
+
+parameters:
+  - name: ConfigGlobs
+    type: csv
+    default: "/etc/modules,/etc/modules-load.d/*.conf,/usr/lib/modules-load.d/*.conf,/run/modules-load.d/*.conf,/usr/local/lib/modules-load.d/*.conf"
+  - name: ModuleNameRegex
+    type: regex
+    default: "."
+  - name: ConfigLineRegex
+    type: regex
+    default: "."
+  - name: HashFiles
+    type: bool
+    default: false
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: ProcModules
+    description: Parse /proc/modules and enrich loaded module entries with sysfs metadata.
+    query: |
+      LET LoadedModules <= SELECT
+        Line,
+        split(string=Line, sep_string=" ")[0] AS ModuleName,
+        atoi(string=split(string=Line, sep_string=" ")[1]) AS ModuleSize,
+        atoi(string=split(string=Line, sep_string=" ")[2]) AS RefCount,
+        split(string=Line, sep_string=" ")[3] AS UsedBy,
+        split(string=Line, sep_string=" ")[4] AS ModuleState,
+        split(string=Line, sep_string=" ")[5] AS ModuleAddress,
+        "/sys/module/" + split(string=Line, sep_string=" ")[0] AS SysModulePath
+      FROM split_records(filenames="/proc/modules", regex="\n", columns=["Line"])
+      WHERE Line =~ "\\S" AND split(string=Line, sep_string=" ")[0] =~ ModuleNameRegex
+
+      LET ModuleMeta <= SELECT
+        ModuleName,
+        ModuleSize,
+        RefCount,
+        UsedBy,
+        ModuleState,
+        ModuleAddress,
+        SysModulePath,
+        read_file(filename=SysModulePath + "/initstate") AS InitState,
+        read_file(filename=SysModulePath + "/coresize") AS CoreSizeRaw,
+        read_file(filename=SysModulePath + "/taint") AS TaintFlags,
+        read_file(filename=SysModulePath + "/srcversion") AS SrcVersion,
+        read_file(filename=SysModulePath + "/holders") AS HoldersRaw
+      FROM LoadedModules
+
+      SELECT * FROM if(
+        condition=HashFiles,
+        then={
+          SELECT
+            ModuleName,
+            ModuleSize,
+            RefCount,
+            UsedBy,
+            ModuleState,
+            ModuleAddress,
+            SysModulePath,
+            InitState,
+            CoreSizeRaw,
+            TaintFlags,
+            SrcVersion,
+            HoldersRaw,
+            hash(path=SysModulePath, hashselect="MD5,SHA256") AS SysPathHash
+          FROM ModuleMeta
+        },
+        else={
+          SELECT
+            ModuleName,
+            ModuleSize,
+            RefCount,
+            UsedBy,
+            ModuleState,
+            ModuleAddress,
+            SysModulePath,
+            InitState,
+            CoreSizeRaw,
+            TaintFlags,
+            SrcVersion,
+            HoldersRaw,
+            "" AS SysPathHash
+          FROM ModuleMeta
+        })
+
+  - name: SysModuleFiles
+    description: Enumerate files and symlinks present under /sys/module for currently loaded modules.
+    query: |
+      LET ModuleEntries <= SELECT
+        OSPath,
+        Name,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        IsDir
+      FROM glob(globs="/sys/module/**")
+      WHERE OSPath =~ ModuleNameRegex
+
+      SELECT * FROM if(
+        condition=UploadFiles,
+        then={
+          SELECT
+            OSPath,
+            Name,
+            Size,
+            Mtime,
+            Ctime,
+            Btime,
+            IsDir,
+            upload(file=OSPath) AS Upload
+          FROM ModuleEntries
+        },
+        else={
+          SELECT
+            OSPath,
+            Name,
+            Size,
+            Mtime,
+            Ctime,
+            Btime,
+            IsDir,
+            "" AS Upload
+          FROM ModuleEntries
+        })
+
+  - name: ModuleLoadConfigs
+    description: Review module auto-load configuration files for suspicious or unexpected entries.
+    query: |
+      LET ConfigFiles <= SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime
+      FROM glob(globs=split(string=ConfigGlobs, sep_string=","))
+
+      LET ParsedLines <= SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        Line
+      FROM foreach(
+        row=ConfigFiles,
+        query={
+          SELECT
+            OSPath,
+            Size,
+            Mtime,
+            Ctime,
+            Btime,
+            Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+        })
+      WHERE Line =~ "\\S" AND NOT Line =~ "^\\s*#" AND Line =~ ConfigLineRegex
+
+      SELECT * FROM if(
+        condition=HashFiles,
+        then={
+          SELECT
+            OSPath,
+            Size,
+            Mtime,
+            Ctime,
+            Btime,
+            Line,
+            hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+          FROM ParsedLines
+        },
+        else={
+          SELECT
+            OSPath,
+            Size,
+            Mtime,
+            Ctime,
+            Btime,
+            Line,
+            "" AS Hashes
+          FROM ParsedLines
+        })
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: SysModulePath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Hashes
+    type: hash
+  - name: SysPathHash
+    type: hash

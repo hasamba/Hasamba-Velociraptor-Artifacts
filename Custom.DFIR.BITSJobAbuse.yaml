@@ -1,0 +1,104 @@
+name: Custom.DFIR.BITSJobAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect BITS (Background Intelligent Transfer Service) job abuse for persistence or stealthy downloads.
+  
+  Adversaries abuse BITS to schedule persistent download/upload jobs that survive reboots and bypass
+  network monitoring. This artifact enumerates active BITS jobs via the bitsadmin CLI, parses BITS job
+  queue files, checks for suspicious URLs, and correlates BITS activity with persistence mechanisms.
+
+reference:
+  - https://attack.mitre.org/techniques/T1197/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousUrlRegex
+    type: regex
+    default: "(?i)(\\.ps1|\\.bat|\\.cmd|\\.vbs|\\.vbe|\\.js|\\.exe|\\.dll|pastebin|githubusercontent|transfer\\.sh|dump\\.io|ghostbin)"
+  - name: SuspiciousNameRegex
+    type: regex
+    default: "(?i)(update|install|patch|setup|deploy|payload|stager|beacon|c2|download|drop)"
+  - name: CheckBitsEventLogs
+    type: bool
+    default: Y
+  - name: CheckPersistence
+    type: bool
+    default: Y
+
+sources:
+  - name: ActiveJobs
+    description: Enumerate active BITS transfer jobs via bitsadmin /list /verbose
+    query: |
+      LET BitsAdminOutput <= SELECT Stdout
+      FROM execve(argv=["bitsadmin", "/list", "/verbose"])
+      LET Lines <= SELECT Line FROM split_records(
+        filenames=BitsAdminOutput.Stdout,
+        regex="\n",
+        columns=["Line"])
+      LET JobBlocks <= SELECT Line
+      FROM Lines
+      WHERE Line =~ "(?i)^(Job|GUID|DisplayName|Transfer type|Priority|State|Owner|Notify|Description|URL|Remote|Local|Temporary|Attempted|Error)"
+      SELECT
+        Line,
+        if(condition=Line =~ SuspiciousUrlRegex, then="SUSPICIOUS_URL",
+            else=if(condition=Line =~ SuspiciousNameRegex, then="SUSPICIOUS_NAME", else="OK")) AS Suspicion
+      FROM JobBlocks
+
+  - name: BITSJobFiles
+    description: Enumerate BITS job queue and data files from disk
+    query: |
+      LET JobFiles <= SELECT OSPath, Size, Mtime
+      FROM glob(globs=["C:/ProgramData/Microsoft/Network/Downloader/**/*.dat",
+                        "C:/ProgramData/Microsoft/Network/Downloader/**/*.qdb"])
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        basename(path=OSPath) AS FileName,
+        if(condition=basename(path=OSPath) =~ "(?i)qmgr", then="BITS_QUEUE_DB", else="BITS_DATA") AS FileType
+      FROM JobFiles
+
+  - name: BITSEventLogs
+    description: Parse BITS-related Windows Event Logs for job creation and completion
+    query: |
+      LET BitsEvtx <= SELECT OSPath
+      FROM glob(globs=["C:/Windows/System32/winevt/Logs/Microsoft-Windows-Bits-Client%4Operational.evtx"])
+      LET ParsedEvents <= SELECT *
+      FROM foreach(
+        row=BitsEvtx,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData AS EventData
+          FROM parse_evtx(filename=OSPath)
+        })
+      SELECT EventTime, EventID, EventData,
+        if(condition=EventData =~ SuspiciousUrlRegex, then="SUSPICIOUS_URL", else="OK") AS URLSuspicion
+      FROM ParsedEvents
+      WHERE CheckBitsEventLogs AND EventID IN (59, 60, 61, 62, 63, 3)
+
+  - name: BITSPersistence
+    description: Check for BITS-based persistence via registry Run keys and running bitsadmin processes
+    query: |
+      LET BitsRunPersist <= SELECT OSPath, Data
+      FROM glob(globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*", accessor="registry")
+      WHERE Data =~ "(?i)bitsadmin"
+      LET BitsAdminProc <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username
+      FROM pslist()
+      WHERE CommandLine =~ "(?i)bitsadmin"
+      LET Combined <= SELECT * FROM chain(
+        a={ SELECT "REGISTRY_RUN_KEY" AS Source, OSPath AS Detail, Data FROM BitsRunPersist },
+        b={ SELECT "RUNNING_PROCESS" AS Source, format(format="%v: %v", args=[Name, CommandLine]) AS Detail, "" AS Data FROM BitsAdminProc },
+        max=100
+      )
+      SELECT * FROM Combined WHERE CheckPersistence
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: OSPath
+    type: path

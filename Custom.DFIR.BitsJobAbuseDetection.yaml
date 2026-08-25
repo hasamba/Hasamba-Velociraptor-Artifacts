@@ -1,0 +1,172 @@
+name: Custom.DFIR.BitsJobAbuseDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects BITS (Background Intelligent Transfer Service) job abuse for persistence or unauthorized file downloads.
+
+  Attackers abuse BITS to download malicious payloads from remote URLs, establish persistence via
+  notification callbacks, and evade detection since BITS traffic blends with legitimate Windows update activity.
+
+  This artifact examines:
+  - BITS operational event log for job creation and transfer events
+  - BITS queue manager database files for persisted job records and embedded URLs
+  - BITS registry configuration entries for policy tampering indicators
+  - Suspicious BITS-related process command lines that invoke bitsadmin or PowerShell transfer cmdlets
+
+reference:
+  - https://attack.mitre.org/techniques/T1197/
+  - https://www.mandiant.com/resources/blog/bits-jobs-and-bitsadmin
+
+type: CLIENT
+
+parameters:
+  - name: BITSEventLog
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Bits-Client%4Operational.evtx"
+    description: Path to the BITS operational event log
+  - name: BITSDbGlob
+    type: glob
+    default: "C:/ProgramData/Microsoft/Network/Downloader/{qmgr*.dat,qmgr.db}"
+    description: Glob for BITS queue manager database files
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: General filter regex applied to paths and message fields
+  - name: SuspiciousUrlRegex
+    type: regex
+    default: "(?i)(http|https|ftp)://"
+    description: Regex to match suspicious URLs in BITS artifacts
+  - name: ProcessRegex
+    type: regex
+    default: "(?i)(bitsadmin|start-bitstransfer|add-bitstransfer|set-bitstransfer|copy-bitstransfer|qmgr)"
+    description: Regex to match BITS-related process activity
+  - name: RegistryRegex
+    type: regex
+    default: "."
+    description: Regex to filter registry results
+  - name: UploadFiles
+    type: bool
+    default: "N"
+    description: Upload BITS database files for offline analysis
+
+sources:
+  - name: BITSEventLog
+    description: BITS operational event log entries showing job lifecycle and transfer activity
+    query: |
+      LET EventLogFiles <= SELECT OSPath FROM glob(globs=BITSEventLog)
+      SELECT
+        OSPath,
+        System.TimeCreated.SystemTime AS EventTime,
+        System.EventID.Value AS EventID,
+        System.Computer AS Computer,
+        System.Security.UserID AS UserID,
+        get(item=EventData, field="jobTitle") AS JobTitle,
+        get(item=EventData, field="jobId") AS JobID,
+        get(item=EventData, field="jobOwner") AS JobOwner,
+        get(item=EventData, field="url") AS URL,
+        get(item=EventData, field="processPath") AS ProcessPath,
+        get(item=EventData, field="bytesTotal") AS BytesTotal,
+        get(item=EventData, field="bytesTransferred") AS BytesTransferred
+      FROM foreach(
+        row=EventLogFiles,
+        query={
+          SELECT * FROM parse_evtx(filename=OSPath)
+        })
+      WHERE System.EventID.Value IN (3, 4, 5, 59, 60, 16403)
+        AND (
+          OSPath =~ FilterRegex
+          OR JobTitle =~ ProcessRegex
+          OR JobOwner =~ ProcessRegex
+          OR ProcessPath =~ ProcessRegex
+          OR URL =~ SuspiciousUrlRegex
+        )
+
+  - name: BITSDatabaseFiles
+    description: BITS queue manager database files containing persisted job data and embedded URL strings
+    query: |
+      LET DBFiles <= SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hash,
+        read_file(filename=OSPath, length=131072) AS Content
+      FROM glob(globs=BITSDbGlob)
+      WHERE OSPath =~ FilterRegex
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Hash.MD5 AS MD5,
+        Hash.SHA256 AS SHA256,
+        Content
+      FROM DBFiles
+      WHERE Content =~ SuspiciousUrlRegex
+        OR Content =~ ProcessRegex
+        OR OSPath =~ FilterRegex
+        OR Content =~ FilterRegex
+
+  - name: BITSRegistryConfig
+    description: BITS registry configuration entries for tampering detection
+    query: |
+      LET BITSRegEntries <= SELECT
+        OSPath,
+        Data.value AS Value,
+        Data.type AS Type,
+        Mtime
+      FROM glob(
+        globs=[
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/BITS/**",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Policies/Microsoft/Windows/BITS/**"
+        ],
+        accessor="registry")
+      SELECT
+        OSPath,
+        Value,
+        Type,
+        Mtime
+      FROM BITSRegEntries
+      WHERE OSPath =~ RegistryRegex
+        OR Value =~ ProcessRegex
+        OR Value =~ SuspiciousUrlRegex
+
+  - name: SuspiciousProcesses
+    description: Process command lines commonly used to create or abuse BITS jobs
+    query: |
+      LET ProcRows <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime
+      FROM ProcRows
+      WHERE CommandLine =~ ProcessRegex
+        OR CommandLine =~ SuspiciousUrlRegex
+        OR Name =~ ProcessRegex
+        OR Exe =~ FilterRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: Exe
+    type: path
+  - name: SHA256
+    type: hash
+  - name: MD5
+    type: hash
