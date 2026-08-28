@@ -1,0 +1,96 @@
+name: Custom.DFIR.SshAuthorizedKeysTampering
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects SSH authorized_keys tampering across all user home directories on Linux endpoints.
+  
+  Scans for authorized_keys files in every user's .ssh directory, collects metadata,
+  hashes, and content for forensic analysis. Flags suspicious indicators such as
+  weak permissions, unusual modification times, unexpected key types, and keys
+  added outside normal administrative windows.
+
+reference:
+  - https://attack.mitre.org/techniques/T1098.004/
+
+type: CLIENT
+
+parameters:
+  - name: HomeGlob
+    type: glob
+    default: "/home/*/.ssh/authorized_keys"
+  - name: RootAuthorizedKeys
+    type: glob
+    default: "/root/.ssh/authorized_keys"
+  - name: EtcPasswdPath
+    type: string
+    default: "/etc/passwd"
+  - name: SuspiciousKeyRegex
+    type: regex
+    default: "(ecdsa-sha2-nistp|ssh-ed25519|ssh-rsa|ssh-dss|sk-ecdsa-sha2-nistp|sk-ssh-ed25519)"
+  - name: MaxKeyLength
+    type: int
+    default: 8192
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: AuthorizedKeysScan
+    description: Scans all user home directories and root for authorized_keys files, collecting content, hashes, and metadata.
+    query: |
+      LET AllKeys <= SELECT OSPath, Size, Mtime, Ctime, Atime, Btime
+        FROM glob(globs=[HomeGlob, RootAuthorizedKeys])
+      
+      LET KeyContent <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Ctime,
+          Atime,
+          Btime,
+          read_file(filename=OSPath, length=MaxKeyLength) AS Content,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM AllKeys
+        WHERE Size > 0
+      
+      LET FinalResults <= SELECT
+          OSPath,
+          Size,
+          timestamp(epoch=Mtime) AS ModifiedTime,
+          timestamp(epoch=Ctime) AS ChangedTime,
+          timestamp(epoch=Atime) AS AccessedTime,
+          timestamp(epoch=Btime) AS BirthTime,
+          FileHash.MD5 AS MD5,
+          FileHash.SHA256 AS SHA256,
+          Content,
+          if(condition=OSPath =~ "/root/",
+             then="root",
+             else=if(condition=OSPath =~ "/home/([^/]+)/",
+                      then=regex_replace(source=OSPath, re="/home/([^/]+)/.+", replace="$1"),
+                      else="unknown")) AS Owner,
+          if(condition=Size > 10240,
+             then="SUSPICIOUS_LARGE_FILE",
+             else="OK") AS SizeFlag,
+          if(condition=Content =~ SuspiciousKeyRegex,
+             then="KNOWN_KEY_TYPE",
+             else="UNKNOWN_OR_EMPTY") AS KeyTypeFlag
+        FROM KeyContent
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT *, upload(file=OSPath) AS Upload FROM FinalResults
+        },
+        else={
+          SELECT * FROM FinalResults
+        })
+
+column_types:
+  - name: ModifiedTime
+    type: timestamp
+  - name: ChangedTime
+    type: timestamp
+  - name: AccessedTime
+    type: timestamp
+  - name: BirthTime
+    type: timestamp
+  - name: OSPath
+    type: path

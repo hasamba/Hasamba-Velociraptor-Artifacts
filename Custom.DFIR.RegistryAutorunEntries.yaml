@@ -1,0 +1,61 @@
+name: Custom.DFIR.RegistryAutorunEntries
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Discover persistence autorun entries in HKCU and HKLM Software\Microsoft\Windows\CurrentVersion\Run and RunOnce registry keys.
+  
+  Adversaries commonly establish persistence via the Run/RunOnce registry keys (MITRE ATT&CK T1547.001). This artifact enumerates all values under both HKCU and HKLM Run and RunOnce hives, collecting the executable path, command line, and metadata for each entry.
+
+reference:
+  - https://attack.mitre.org/techniques/T1547.001/
+
+type: CLIENT
+
+parameters:
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: HKLMRun
+    description: Autorun entries from HKLM Run and RunOnce keys
+    query: |
+      LET HKLMRun <= SELECT OSPath, Name, Data, Mtime FROM glob(
+        globs=[
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/WOW6432Node/Microsoft/Windows/CurrentVersion/Run/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/WOW6432Node/Microsoft/Windows/CurrentVersion/RunOnce/*"
+        ],
+        accessor="registry"
+      )
+      SELECT
+        OSPath,
+        Name,
+        Data,
+        Mtime,
+        "HKLM" AS Hive
+      FROM HKLMRun
+      WHERE Name =~ FilterRegex
+
+  - name: HKCURun
+    description: Autorun entries from HKCU Run and RunOnce keys
+    query: |
+      LET HKCURun <= SELECT OSPath, Name, Data, Mtime FROM glob(
+        globs=[
+          "HKEY_CURRENT_USER/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*",
+          "HKEY_CURRENT_USER/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*"
+        ],
+        accessor="registry"
+      )
+      SELECT
+        OSPath,
+        Name,
+        Data,
+        Mtime,
+        "HKCU" AS Hive
+      FROM HKCURun
+      WHERE Name =~ FilterRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp

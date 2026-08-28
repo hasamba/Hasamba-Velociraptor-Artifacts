@@ -1,0 +1,168 @@
+name: Custom.DFIR.AppLockerBypassMSBuildInstallUtil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects AppLocker bypass attempts using MSBuild.exe and InstallUtil.exe by analyzing
+  process creation logs (Security Event ID 4688) and Sysmon Event ID 1.
+
+  Adversaries abuse trusted .NET framework binaries (MSBuild, InstallUtil, Regasm, Regsvcs)
+  to execute arbitrary code while bypassing application whitelisting controls such as
+  AppLocker. This artifact scans Event Logs for suspicious invocations of these binaries,
+  including cases where they execute from non-standard paths, process unsigned content,
+  or are spawned by unusual parent processes (e.g., Office applications, scripting hosts).
+
+  MITRE ATT&CK: T1218.004 - System Binary Proxy Execution: InstallUtil
+
+reference:
+  - https://attack.mitre.org/techniques/T1218.004/
+  - https://lolbas-project.github.io/lolbas/Binaries/MSBuild/
+  - https://lolbas-project.github.io/lolbas/Binaries/InstallUtil/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityEvtxGlob
+    description: Glob for Windows Security event log files
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+  - name: SysmonEvtxGlob
+    description: Glob for Sysmon event log files
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+  - name: ProcessNameRegex
+    description: Regex to match suspicious .NET framework binaries used for AppLocker bypass
+    type: regex
+    default: "(?i)(msbuild\\.exe|installutil\\.exe|regasm\\.exe|regsvcs\\.exe)"
+  - name: SuspiciousParentRegex
+    description: Regex for parent processes commonly associated with bypass activity
+    type: regex
+    default: "(?i)(cmd\\.exe|powershell\\.exe|wscript\\.exe|cscript\\.exe|winword\\.exe|excel\\.exe|outlook\\.exe|rundll32\\.exe|mshta\\.exe)"
+  - name: SuspiciousCommandLineRegex
+    description: Regex for command-line patterns indicating bypass activity
+    type: regex
+    default: "(?i)(/logfile|/LogToConsole|/u\\s|/uninstall|\\.sln|\\.csproj|\\.vbproj|inmem|/inh|/noinstall|http|https|ftp|\\\\\\\\Users\\\\.*\\\\AppData)"
+
+sources:
+  - name: SecurityEvent4688
+    description: Process creation events from Windows Security log (Event ID 4688)
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=[SecurityEvtxGlob])
+
+      LET Events <= SELECT
+        System.TimeCreated.SystemTime AS EventTime,
+        System.EventID.Value AS EventID,
+        EventData.SubjectUserName AS SubjectUser,
+        EventData.SubjectDomainName AS SubjectDomain,
+        EventData.NewProcessName AS NewProcessName,
+        EventData.CommandLine AS CommandLine,
+        EventData.ProcessId AS ProcessId,
+        EventData.CreatorProcessName AS ParentProcess,
+        EventData.TokenElevationType AS TokenElevation
+      FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT * FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+        }
+      )
+
+      LET Filtered <= SELECT
+        EventTime,
+        "Security 4688" AS Source,
+        SubjectUser,
+        Domain,
+        NewProcessName AS ProcessName,
+        CommandLine,
+        ProcessId AS PID,
+        ParentProcess,
+        TokenElevation
+      FROM Events
+      WHERE NewProcessName =~ ProcessNameRegex
+
+      SELECT
+        EventTime,
+        Source,
+        SubjectUser,
+        Domain,
+        ProcessName,
+        CommandLine,
+        PID,
+        ParentProcess,
+        if(condition=ParentProcess =~ SuspiciousParentRegex,
+           then="SUSPICIOUS_PARENT",
+           else="") AS ParentFlag,
+        if(condition=CommandLine =~ SuspiciousCommandLineRegex,
+           then="SUSPICIOUS_CMDLINE",
+           else="") AS CmdFlag
+      FROM Filtered
+
+  - name: SysmonEvent1
+    description: Process creation events from Sysmon log (Event ID 1)
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=[SysmonEvtxGlob])
+
+      LET Events <= SELECT
+        System.TimeCreated.SystemTime AS EventTime,
+        System.EventID.Value AS EventID,
+        EventData.RuleName AS RuleName,
+        EventData.OriginalFileName AS OriginalFileName,
+        EventData.Image AS Image,
+        EventData.CommandLine AS CommandLine,
+        EventData.ProcessId AS ProcessId,
+        EventData.ParentImage AS ParentImage,
+        EventData.ParentCommandLine AS ParentCommandLine,
+        EventData.User AS User,
+        EventData.Hashes AS Hashes
+      FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT * FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+        }
+      )
+
+      LET Filtered <= SELECT
+        EventTime,
+        "Sysmon 1" AS Source,
+        User,
+        Image AS ProcessName,
+        CommandLine,
+        ProcessId AS PID,
+        ParentImage AS ParentProcess,
+        ParentCommandLine,
+        OriginalFileName,
+        Hashes,
+        RuleName
+      FROM Events
+      WHERE Image =~ ProcessNameRegex OR OriginalFileName =~ ProcessNameRegex
+
+      SELECT
+        EventTime,
+        Source,
+        User,
+        ProcessName,
+        CommandLine,
+        PID,
+        ParentProcess,
+        ParentCommandLine,
+        OriginalFileName,
+        Hashes,
+        RuleName,
+        if(condition=ParentProcess =~ SuspiciousParentRegex,
+           then="SUSPICIOUS_PARENT",
+           else="") AS ParentFlag,
+        if(condition=CommandLine =~ SuspiciousCommandLineRegex,
+           then="SUSPICIOUS_CMDLINE",
+           else="") AS CmdFlag
+      FROM Filtered
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: ProcessName
+    type: path
+  - name: ParentProcess
+    type: path
+  - name: CommandLine
+    type: text
+  - name: ParentCommandLine
+    type: text

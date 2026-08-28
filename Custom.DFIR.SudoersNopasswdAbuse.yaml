@@ -1,0 +1,82 @@
+name: Custom.DFIR.SudoersNopasswdAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects sudo rule abuse and NOPASSWD entries across all sudoers configuration files.
+
+  Adversaries with partial access may write NOPASSWD entries into /etc/sudoers or
+  /etc/sudoers.d/* to escalate privileges without a password prompt. This artifact
+  scans the main sudoers file and the drop-in directory for dangerous patterns
+  (NOPASSWD, ALL=(ALL), wildcard commands) and returns file metadata alongside
+  matched lines.
+
+  MITRE ATT&CK: T1548.003 — Abuse Elevation Control Mechanism: Sudo and Sudo Caching
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.003/
+  - https://www.sudo.ws/docs/man/sudoers.man/
+
+type: CLIENT
+
+parameters:
+  - name: SudoersGlob
+    description: Glob covering main sudoers file and drop-in directory
+    type: glob
+    default: "/etc/sudoers,/etc/sudoers.d/*"
+  - name: FilterRegex
+    description: Regex applied to each line to flag suspicious rules
+    type: regex
+    default: "NOPASSWD|ALL=\\(ALL\\)|\\bALL\\b"
+  - name: UploadFiles
+    description: Upload matching sudoers files to the server
+    type: bool
+    default: "N"
+
+sources:
+  - name: SudoersRules
+    description: Lines matching suspicious sudo rules with file metadata
+    query: |
+      LET AllFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=split(string=SudoersGlob, sep=","))
+
+      LET MatchedLines <= SELECT
+          OSPath AS FilePath,
+          Line
+        FROM foreach(
+          row=AllFiles,
+          query={
+            SELECT OSPath, Line
+            FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+            WHERE Line =~ FilterRegex
+              AND NOT Line =~ "^\\s*#"
+          })
+
+      SELECT
+        FilePath,
+        Line AS SuspiciousRule,
+        hash(path=FilePath, hashselect="MD5,SHA256") AS Hash
+      FROM MatchedLines
+
+  - name: SudoersMetadata
+    description: Full metadata for all sudoers files found (for timeline analysis)
+    query: |
+      LET AllFiles2 <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=split(string=SudoersGlob, sep=","))
+
+      SELECT
+        OSPath AS FilePath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        if(condition=UploadFiles,
+           then=upload(file=OSPath),
+           else=NULL) AS Upload
+      FROM AllFiles2
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp

@@ -1,0 +1,101 @@
+name: Custom.DFIR.SuspiciousOutboundLongRunning
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for suspicious outbound network connections originating from long-running processes.
+  
+  Adversaries often establish persistent C2 channels through long-lived processes that
+  maintain outbound connections. This artifact identifies processes with extended uptime
+  that have active or recent outbound network connections, correlating process metadata
+  with network state to flag anomalies such as:
+  - Long-running processes with connections to suspicious ports
+  - Processes with outbound connections not matching expected behavior
+  - Unsigned or mismatched binaries making outbound connections
+  - Connections to known C2 port patterns
+
+reference:
+  - https://attack.mitre.org/techniques/T1041/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousPortsRegex
+    type: regex
+    default: "^(4444|5555|6666|6667|8888|9999|8443|1337|31337|1234|4242)$"
+  - name: ExcludeLocalRegex
+    type: regex
+    default: "^(127\\.|0\\.0\\.|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)"
+  - name: MinProcessUptimeHours
+    type: int
+    default: 24
+
+sources:
+  - name: LongRunningOutboundConnections
+    description: |
+      Identifies long-running processes with active outbound network connections,
+      enriching with process metadata, digital signature, and risk scoring.
+    query: |
+      LET MinUptimeSeconds <= MinProcessUptimeHours * 3600
+      
+      LET LongProcesses <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        CreateTime
+        FROM pslist()
+        WHERE CreateTime
+        AND (now() - CreateTime) > MinUptimeSeconds * 1000000000
+      
+      LET Enriched <= SELECT
+        Pid, Name AS ProcessName, Ppid, Exe, CommandLine, Username,
+        CreateTime, RemoteIP, RemotePort, LocalIP, LocalPort, Status,
+        if(condition=RemotePort =~ SuspiciousPortsRegex,
+          then="HIGH_PORT_SUSPICIOUS",
+          else=if(condition=Exe =~ "(?i)(cmd|powershell|rundll32|wmic|cscript|wscript|mshta|certutil)",
+            then="SUSPICIOUS_BINARY",
+            else="NORMAL")) AS RiskLevel
+        FROM foreach(row=LongProcesses,
+          query={
+            SELECT Pid, Name, Ppid, Exe, CommandLine, Username, CreateTime,
+              Status, Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+              Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+              FROM netstat()
+              WHERE RemoteIP AND NOT RemoteIP =~ ExcludeLocalRegex
+              AND Pid = Pid
+          })
+      
+      LET Signed <= SELECT *,
+        if(condition=Exe,
+           then=authenticode(filename=Exe).Signed, else="N/A") AS IsSigned
+        FROM Enriched
+      
+      SELECT Pid, ProcessName, Ppid, Exe, CommandLine, Username, CreateTime,
+        RemoteIP, RemotePort, LocalIP, LocalPort, Status, RiskLevel, IsSigned
+        FROM Signed
+
+  - name: ConnectionSummary
+    description: |
+      Aggregated summary of outbound connections grouped by long-running process.
+    query: |
+      LET MinUptimeSeconds <= MinProcessUptimeHours * 3600
+      
+      LET LongProcesses <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        CreateTime
+        FROM pslist()
+        WHERE CreateTime
+        AND (now() - CreateTime) > MinUptimeSeconds * 1000000000
+      
+      SELECT p.Name AS ProcessName, p.Pid, p.Exe, p.Username, p.CreateTime,
+        count(items=c.RemoteIP) AS ConnectionCount,
+        enumerate(items=c.RemotePort) AS RemotePorts
+        FROM foreach(row=LongProcesses,
+          query={
+            SELECT Pid, Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+              FROM netstat()
+              WHERE RemoteIP AND NOT RemoteIP =~ ExcludeLocalRegex
+              AND Pid = Pid
+          })
+        GROUP BY Pid
+        ORDER BY ConnectionCount DESC
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: path

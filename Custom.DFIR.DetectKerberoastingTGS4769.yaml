@@ -1,0 +1,97 @@
+name: Custom.DFIR.DetectKerberoastingTGS4769
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect potential Kerberoasting activity by parsing Windows Security Event ID 4769
+  (Kerberos Service Ticket requests) from EVTX logs.
+
+  The artifact highlights suspicious TGS requests for service accounts, supports
+  regex-based hunting, and can optionally prioritize RC4 ticket encryption usage
+  commonly associated with Kerberoasting tradecraft (MITRE ATT&CK T1558.003).
+
+reference:
+  - https://attack.mitre.org/techniques/T1558.003/
+
+type: CLIENT
+
+parameters:
+  - name: EventLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+  - name: AccountRegex
+    type: regex
+    default: "(?i).*(svc|sql|backup|krbtgt|admin).*"
+  - name: ServiceRegex
+    type: regex
+    default: "(?i).*(MSSQLSvc|HTTP|CIFS|HOST|LDAP|RPCSS).*"
+  - name: IpRegex
+    type: regex
+    default: ".*"
+  - name: TicketEncryptionRegex
+    type: regex
+    default: "(?i)(0x17|23|rc4)"
+  - name: RC4Only
+    type: bool
+    default: false
+
+sources:
+  - name: KerberoastingSignals
+    description: Parse Event ID 4769 and surface suspicious TGS requests for service accounts.
+    query: |
+      LET CandidateEvents <= SELECT
+          OSPath AS EvtxPath,
+          System.TimeCreated.SystemTime AS EventTime,
+          System.Computer AS Computer,
+          System.EventRecordID AS EventRecordID,
+          EventData.TargetUserName AS TargetUserName,
+          EventData.ServiceName AS ServiceName,
+          EventData.TicketEncryptionType AS TicketEncryptionType,
+          EventData.IpAddress AS IpAddress,
+          EventData.IpPort AS IpPort,
+          EventData.Status AS Status,
+          EventData.TicketOptions AS TicketOptions
+      FROM foreach(
+        row={
+          SELECT OSPath
+          FROM glob(globs=EventLogGlob)
+        },
+        query={
+          SELECT System, EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4769
+        }
+      )
+
+      LET HuntResults <= SELECT
+          EventTime,
+          Computer,
+          EvtxPath,
+          hash(path=EvtxPath, hashselect="MD5,SHA256") AS EvtxHash,
+          EventRecordID,
+          TargetUserName,
+          ServiceName,
+          TicketEncryptionType,
+          IpAddress,
+          IpPort,
+          Status,
+          TicketOptions
+      FROM CandidateEvents
+      WHERE
+        TargetUserName =~ AccountRegex
+        AND ServiceName =~ ServiceRegex
+        AND IpAddress =~ IpRegex
+        AND (
+          RC4Only = false
+          OR TicketEncryptionType =~ TicketEncryptionRegex
+        )
+
+      SELECT *
+      FROM HuntResults
+      ORDER BY EventTime DESC
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: EvtxPath
+    type: path
+  - name: EvtxHash
+    type: hash

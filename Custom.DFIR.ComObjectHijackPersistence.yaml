@@ -1,0 +1,111 @@
+name: Custom.DFIR.ComObjectHijackPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Identifies potential persistence through COM object hijacking in the Windows registry.
+  
+  Adversaries can hijack COM object registry entries (InprocServer32, TreatAs, PersistentAddOnRegistered)
+  to redirect legitimate COM object instantiation to malicious DLLs. This artifact scans common
+  hijackable COM registry paths, checks for suspicious DLL paths, abnormal filenames, and
+  missing or unsigned binaries.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.015/
+
+type: CLIENT
+
+parameters:
+  - name: InprocServerGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/InprocServer32/*"
+  - name: TreatAsGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/TreatAs/*"
+  - name: PersistentAddOnGlob
+    type: glob
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/PersistentAddOnRegistered/*"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousPathRegex
+    type: regex
+    default: "(?i)(temp|appdata|programdata|downloads|public|users\\\\.*\\\\documents|\\\\tmp\\\\|roaming)"
+  - name: SuspiciousExtRegex
+    type: regex
+    default: "(?i)\\.(dll|ocx)$"
+
+sources:
+  - name: InprocServerHijacks
+    description: Scans CLSID InprocServer32 entries for suspicious or hijacked COM objects pointing to anomalous DLL paths.
+    query: |
+      LET InprocEntries <= SELECT OSPath, Data.value AS Value, Data.name AS KeyName
+        FROM glob(globs=InprocServerGlob, accessor="registry")
+      
+      LET CleanedInproc <= SELECT OSPath, Value, KeyName,
+         regex_replace(re="^\"(.+)\".*$", replace="$1", source=Value) AS CleanPath
+        FROM InprocEntries
+        WHERE KeyName = "(Default)" OR KeyName =~ "(?i)^threadingmodel$"
+      
+      LET SuspiciousPaths <= SELECT OSPath, CleanPath,
+         if(condition= CleanPath =~ SuspiciousPathRegex,
+            then= true,
+            else= false) AS IsSuspiciousPath
+        FROM CleanedInproc
+        WHERE CleanPath =~ SuspiciousExtRegex AND OSPath =~ FilterRegex
+      
+      SELECT OSPath, CleanPath AS DLLPath, IsSuspiciousPath
+        FROM SuspiciousPaths
+
+  - name: TreatAsHijacks
+    description: Scans CLSID TreatAs entries that redirect one COM object to another, a common hijack technique.
+    query: |
+      LET TreatAsEntries <= SELECT OSPath, Data.value AS TreatAsCLSID
+        FROM glob(globs=TreatAsGlob, accessor="registry")
+        WHERE Data.name = "(Default)"
+      
+      SELECT OSPath, TreatAsCLSID
+        FROM TreatAsEntries
+        WHERE OSPath =~ FilterRegex
+
+  - name: PersistentAddOnRegistered
+    description: Scans PersistentAddOnRegistered entries used for COM object persistence hijacking.
+    query: |
+      LET PersistentEntries <= SELECT OSPath, Data.value AS AddOnCLSID
+        FROM glob(globs=PersistentAddOnGlob, accessor="registry")
+        WHERE Data.name = "(Default)"
+      
+      SELECT OSPath, AddOnCLSID
+        FROM PersistentEntries
+        WHERE OSPath =~ FilterRegex
+
+  - name: InprocServerBinaryValidation
+    description: Validates whether the DLL referenced by each InprocServer32 entry actually exists on disk and collects hash information.
+    query: |
+      LET InprocEntries <= SELECT OSPath, Data.value AS Value
+        FROM glob(globs=InprocServerGlob, accessor="registry")
+        WHERE Data.name = "(Default)"
+      
+      LET CleanedPaths <= SELECT OSPath,
+         regex_replace(re="^\"(.+)\".*$", replace="$1", source=Value) AS CleanPath
+        FROM InprocEntries
+      
+      LET Validated <= SELECT OSPath, CleanPath,
+         if(condition= len(list=CleanPath) > 0,
+            then= stat(filename=CleanPath),
+            else= dict(Size=0, Mode=0)) AS FileStat
+        FROM CleanedPaths
+        WHERE len(list=CleanPath) > 0 AND OSPath =~ FilterRegex
+      
+      LET WithHashes <= SELECT OSPath, CleanPath AS DLLPath, FileStat.Size AS FileSize,
+         if(condition= FileStat.Size > 0,
+            then= hash(path=CleanPath, hashselect="MD5,SHA256"),
+            else= dict(MD5="", SHA256="")) AS Hashes
+        FROM Validated
+      
+      SELECT OSPath, DLLPath, FileSize, Hashes.MD5 AS MD5, Hashes.SHA256 AS SHA256
+        FROM WithHashes
+
+column_types:
+  - name: OSPath
+    type: registry_path
+  - name: DLLPath
+    type: path

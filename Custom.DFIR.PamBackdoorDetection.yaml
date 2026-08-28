@@ -1,0 +1,105 @@
+name: Custom.DFIR.PamBackdoorDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect PAM module backdoors by scanning /etc/pam.d configuration files and
+  shared library hashes for indicators of compromise.
+
+  Attackers may inject malicious PAM modules or modify PAM configuration to
+  intercept authentication credentials, bypass auth, or maintain persistence
+  (MITRE T1556.003 - Pluggable Authentication Modules).
+
+reference:
+  - https://attack.mitre.org/techniques/T1556.003/
+
+type: CLIENT
+
+parameters:
+  - name: PamConfGlob
+    type: glob
+    default: /etc/pam.d/**
+  - name: PamLibGlob
+    type: glob
+    default: /lib/security/**/*.so
+  - name: PamLib64Glob
+    type: glob
+    default: /lib64/security/**/*.so
+  - name: SuspiciousModuleRegex
+    type: regex
+    default: "pam_(exec|dots|succeed_if|allowdebug|backdoor)"
+  - name: SuspiciousLineRegex
+    type: regex
+    default: "(password|auth)\\s+(sufficient|optional)\\s+pam_(unix|dots|succeed|env|exec|allowdebug)"
+
+sources:
+  - name: PamConfigAnalysis
+    description: |
+      Parse all PAM configuration files under /etc/pam.d and flag suspicious
+      entries such as unusual auth modules, custom module paths, or directives
+      that may indicate credential harvesting or auth bypass.
+    query: |
+      LET PamConfigs <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=PamConfGlob)
+        WHERE Size > 0
+
+      LET SuspiciousLines <= SELECT
+        OSPath,
+        Mtime,
+        Line,
+        if(condition=Line =~ SuspiciousLineRegex,
+           then=True, else=False) AS IsSuspiciousLine,
+        if(condition=Line =~ SuspiciousModuleRegex,
+           then=True, else=False) AS IsHighRiskModule
+      FROM foreach(
+        row={ SELECT OSPath, Mtime, read_file(filename=OSPath) AS Content FROM PamConfigs },
+        query={ SELECT OSPath, Mtime, Line, IsSuspiciousLine, IsHighRiskModule
+                  FROM split_records(accessor="data", filenames=Content, regex="\n", columns="Line")
+                }
+      )
+
+      SELECT OSPath, Mtime, Line, IsSuspiciousLine, IsHighRiskModule
+      FROM SuspiciousLines
+      WHERE IsSuspiciousLine OR IsHighRiskModule
+
+  - name: PamLibraryHashes
+    description: |
+      Enumerate PAM shared libraries in /lib/security and /lib64/security,
+      compute their hashes, and flag libraries that are suspiciously small
+      (potentially stub backdoors), recently modified, or have unusual names.
+    query: |
+      LET PamLibs <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=PamLibGlob)
+
+      LET PamLibs64 <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=PamLib64Glob)
+
+      LET AllLibs <= SELECT * FROM chain(
+        q1={ SELECT OSPath, Size, Mtime FROM PamLibs },
+        q2={ SELECT OSPath, Size, Mtime FROM PamLibs64 }
+      )
+
+      LET Hashed <= SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes,
+        if(condition=Size < 5000,
+           then=True, else=False) AS IsSmall,
+        if(condition=Mtime > now() - 86400 * 30,
+           then=True, else=False) AS IsRecentlyModified
+      FROM AllLibs
+      WHERE Size > 0
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Hashes.MD5 AS MD5,
+        Hashes.SHA256 AS SHA256,
+        IsSmall,
+        IsRecentlyModified
+      FROM Hashed
+      WHERE IsSmall OR IsRecentlyModified OR NOT OSPath =~ SuspiciousModuleRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp

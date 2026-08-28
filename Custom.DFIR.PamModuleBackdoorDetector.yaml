@@ -1,0 +1,98 @@
+name: Custom.DFIR.PamModuleBackdoorDetector
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects suspicious Linux PAM module backdoors by inspecting /etc/pam.d configuration files and hashing PAM shared libraries.
+
+  Attackers abusing MITRE ATT&CK T1556.003 may insert malicious PAM modules or unusual control lines into authentication stacks to capture credentials or bypass authentication. This artifact collects PAM configuration lines, highlights suspicious module names/options, and inventories PAM module library hashes for follow-up comparison against known-good baselines.
+
+reference:
+  - https://attack.mitre.org/techniques/T1556.003/
+
+type: CLIENT
+
+parameters:
+  - name: PamConfigGlob
+    type: glob
+    default: /etc/pam.d/*
+    description: Glob for PAM configuration files.
+  - name: PamLibraryGlob
+    type: glob
+    default: /{lib,lib64,usr/lib,usr/lib64}/**/security/pam_*.so
+    description: Glob for PAM shared libraries.
+  - name: ConfigLineRegex
+    type: regex
+    default: (?i)(auth|account|password|session).*pam_.*\.so
+    description: Regex for PAM configuration lines that reference PAM modules.
+  - name: SuspiciousRegex
+    type: regex
+    default: (?i)(pam_(exec|script|python|permissive|backdoor|shell|debug|userdb|mysql|radius|ldap)\.so|audit=0|silent|debug|expose_authtok|try_first_pass|use_first_pass|sufficient|optional|\bnullok\b|\btrust\b|\bseteuid\b|/tmp/|/dev/shm/|/var/tmp/|curl|wget|bash|sh\s+-c|nc\b|ncat|socat)
+    description: Regex used to flag suspicious PAM modules, control flags, paths, and options.
+  - name: LibraryPathRegex
+    type: regex
+    default: .
+    description: Regex filter for PAM library paths before hashing.
+  - name: IncludeAllConfigLines
+    type: bool
+    default: false
+    description: Include non-suspicious PAM module lines as well as suspicious matches.
+  - name: IncludeLibraryInventory
+    type: bool
+    default: true
+    description: Hash PAM module libraries found on disk.
+
+sources:
+  - name: PamConfigurationFindings
+    description: PAM configuration module references with suspicious lines flagged.
+    query: |
+      LET ConfigFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=PamConfigGlob)
+
+      LET PamLines <= SELECT * FROM foreach(
+        row=ConfigFiles,
+        query={
+          SELECT OSPath,
+                 Size,
+                 Mtime,
+                 Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ ConfigLineRegex
+        })
+
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Line,
+             Line =~ SuspiciousRegex AS Suspicious,
+             parse_string_with_regex(string=Line, regex="(?P<Module>pam_[A-Za-z0-9_@+.-]+\\.so)").Module AS Module,
+             parse_string_with_regex(string=Line, regex="^(?P<PamType>auth|account|password|session)\\s+").PamType AS PamType
+      FROM PamLines
+      WHERE IncludeAllConfigLines OR Line =~ SuspiciousRegex
+
+  - name: PamLibraryHashes
+    description: Inventory and hashes of PAM module shared libraries on Linux endpoints.
+    query: |
+      LET PamLibraries <= SELECT OSPath, Size, Mtime, Ctime, Atime, Mode, Uid, Gid
+        FROM glob(globs=PamLibraryGlob)
+        WHERE OSPath =~ LibraryPathRegex
+
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Ctime,
+             Atime,
+             Mode,
+             Uid,
+             Gid,
+             hash(path=OSPath, hashselect="MD5,SHA1,SHA256") AS Hash
+      FROM if(condition=IncludeLibraryInventory, then={ SELECT * FROM PamLibraries })
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Hash
+    type: hash

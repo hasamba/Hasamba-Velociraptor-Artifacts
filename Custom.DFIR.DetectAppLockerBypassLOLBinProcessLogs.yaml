@@ -1,0 +1,145 @@
+name: Custom.DFIR.DetectAppLockerBypassLOLBinProcessLogs
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects likely AppLocker bypass activity through trusted Microsoft LOLBins such as MSBuild.exe and InstallUtil.exe.
+  
+  This artifact hunts for suspicious process creation records in common Windows event log sources,
+  including Security.evtx process creation auditing (4688) and Sysmon Operational logs (Event ID 1).
+  It extracts image paths, command lines, parent processes, users, and hashes when the executable still exists,
+  then filters results with configurable regex controls to reduce noise during DFIR triage.
+
+reference:
+  - https://attack.mitre.org/techniques/T1218.004/
+  - https://lolbas-project.github.io/lolbas/Binaries/MSBuild/
+  - https://lolbas-project.github.io/lolbas/Binaries/Installutil/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+  - name: SysmonLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+  - name: BinaryRegex
+    type: regex
+    default: '(?i)(\\|/)(msbuild|installutil)\.exe$'
+  - name: CommandLineRegex
+    type: regex
+    default: '(?i)(\.csproj|\.vbproj|/logfile=|/u(ninstall)?|/AssemblyName=|/Logger:|/target:|https?://|\\\\)'
+  - name: ParentRegex
+    type: regex
+    default: "."
+  - name: UserRegex
+    type: regex
+    default: "."
+  - name: MaxRows
+    type: int
+    default: 500
+  - name: HashExecutables
+    type: bool
+    default: false
+
+sources:
+  - name: Results
+    description: Parse Security and Sysmon process creation events for MSBuild and InstallUtil execution patterns tied to AppLocker bypass.
+    query: |
+      LET SecurityHits <= SELECT
+        timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+        "Security" AS LogSource,
+        System.Computer AS Computer,
+        get(item=EventData, member="NewProcessName") AS ImagePath,
+        get(item=EventData, member="CommandLine") AS CommandLine,
+        get(item=EventData, member="ParentProcessName") AS ParentImage,
+        get(item=EventData, member="ProcessId") AS ProcessId,
+        get(item=EventData, member="CreatorProcessId") AS ParentProcessId,
+        get(item=EventData, member="SubjectUserName") AS Username,
+        get(item=EventData, member="SubjectDomainName") AS UserDomain,
+        get(item=EventData, member="TokenElevationType") AS TokenElevationType,
+        get(item=EventData, member="MandatoryLabel") AS IntegrityLevel
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs=SecurityLogGlob) },
+        query={
+          SELECT System, EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+        })
+      WHERE ImagePath =~ BinaryRegex
+        AND CommandLine =~ CommandLineRegex
+        AND ParentImage =~ ParentRegex
+        AND (UserDomain + "\\" + Username) =~ UserRegex
+
+      LET SysmonHits <= SELECT
+        timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+        "Sysmon" AS LogSource,
+        System.Computer AS Computer,
+        get(item=EventData, member="Image") AS ImagePath,
+        get(item=EventData, member="CommandLine") AS CommandLine,
+        get(item=EventData, member="ParentImage") AS ParentImage,
+        get(item=EventData, member="ProcessId") AS ProcessId,
+        get(item=EventData, member="ParentProcessId") AS ParentProcessId,
+        get(item=EventData, member="User") AS Username,
+        "" AS UserDomain,
+        "" AS TokenElevationType,
+        get(item=EventData, member="IntegrityLevel") AS IntegrityLevel
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs=SysmonLogGlob) },
+        query={
+          SELECT System, EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+        })
+      WHERE ImagePath =~ BinaryRegex
+        AND CommandLine =~ CommandLineRegex
+        AND ParentImage =~ ParentRegex
+        AND Username =~ UserRegex
+
+      LET Combined <= SELECT * FROM chain(a=SecurityHits, b=SysmonHits)
+
+      LET Enriched <= SELECT
+        EventTime,
+        LogSource,
+        Computer,
+        ImagePath,
+        CommandLine,
+        ParentImage,
+        ProcessId,
+        ParentProcessId,
+        UserDomain,
+        Username,
+        TokenElevationType,
+        IntegrityLevel,
+        if(condition=HashExecutables AND ImagePath,
+          then=hash(path=ImagePath, hashselect="MD5,SHA256"),
+          else=dict()) AS HashInfo
+      FROM Combined
+
+      SELECT
+        EventTime,
+        LogSource,
+        Computer,
+        ImagePath,
+        CommandLine,
+        ParentImage,
+        ProcessId,
+        ParentProcessId,
+        UserDomain,
+        Username,
+        TokenElevationType,
+        IntegrityLevel,
+        get(item=HashInfo, member="MD5") AS MD5,
+        get(item=HashInfo, member="SHA256") AS SHA256
+      FROM Enriched
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: ImagePath
+    type: path
+  - name: ParentImage
+    type: path
+  - name: MD5
+    type: string
+  - name: SHA256
+    type: string

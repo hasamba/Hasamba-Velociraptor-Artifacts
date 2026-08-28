@@ -1,0 +1,107 @@
+name: Custom.DFIR.ScheduledTasksEncodedCommands
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for Windows Scheduled Tasks created with schtasks.exe that launch encoded commands.
+
+  This artifact looks for two complementary signals: Security 4688 process creation
+  events where schtasks.exe creates or changes a task with encoded PowerShell-style
+  arguments, and scheduled task XML files whose actions contain encoded command
+  indicators. It is intended for DFIR triage of MITRE ATT&CK T1053.005.
+
+reference:
+  - https://attack.mitre.org/techniques/T1053.005/
+  - https://attack.mitre.org/techniques/T1059.001/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityEventLogGlob
+    type: glob
+    default: C:/Windows/System32/winevt/Logs/Security*.evtx
+  - name: TaskFileGlob
+    type: glob
+    default: C:/Windows/System32/Tasks/**
+  - name: SchtasksRegex
+    type: regex
+    default: '(?i)(^|\\\\|/)schtasks\.exe$'
+  - name: CreateOrChangeRegex
+    type: regex
+    default: '(?i)\s/(create|change|tn|tr|xml)\b'
+  - name: EncodedCommandRegex
+    type: regex
+    default: '(?i)(-enc(odedcommand)?\b|frombase64string|[A-Za-z0-9+/]{80,}={0,2})'
+  - name: TaskActionRegex
+    type: regex
+    default: '(?i)(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|bitsadmin|certutil|curl|wget|http|https|-enc(odedcommand)?\b|frombase64string|[A-Za-z0-9+/]{80,}={0,2})'
+  - name: MaxTaskFileBytes
+    type: int
+    default: 262144
+  - name: UploadMatchingTaskFiles
+    type: bool
+    default: false
+
+sources:
+  - name: SchtasksProcessCreationEvents
+    description: Security 4688 events for schtasks.exe creating or changing tasks with encoded command indicators.
+    query: |
+      LET EventLogs <= SELECT OSPath FROM glob(globs=SecurityEventLogGlob)
+      LET Hits <= SELECT * FROM foreach(
+        row=EventLogs,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            OSPath AS EventLog,
+            EventData.SubjectUserName AS SubjectUserName,
+            EventData.SubjectDomainName AS SubjectDomainName,
+            EventData.NewProcessName AS NewProcessName,
+            EventData.CommandLine AS CommandLine,
+            EventData.ParentProcessName AS ParentProcessName,
+            EventData.ProcessId AS ProcessId,
+            EventData.ParentProcessId AS ParentProcessId
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+            AND EventData.NewProcessName =~ SchtasksRegex
+            AND EventData.CommandLine =~ CreateOrChangeRegex
+            AND EventData.CommandLine =~ EncodedCommandRegex
+        })
+      SELECT * FROM Hits
+
+  - name: ScheduledTaskFilesWithEncodedActions
+    description: Scheduled task XML files containing encoded command or suspicious task action indicators.
+    query: |
+      LET TaskFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime FROM glob(globs=TaskFileGlob)
+      LET Matches <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Ctime,
+          Btime,
+          read_file(filename=OSPath, length=MaxTaskFileBytes) AS TaskXml
+        FROM TaskFiles
+        WHERE NOT IsDir
+          AND read_file(filename=OSPath, length=MaxTaskFileBytes) =~ TaskActionRegex
+          AND read_file(filename=OSPath, length=MaxTaskFileBytes) =~ EncodedCommandRegex
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        Btime,
+        TaskXml,
+        if(condition=UploadMatchingTaskFiles, then=upload(file=OSPath), else='') AS Upload
+      FROM Matches
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: EventLog
+    type: path
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp

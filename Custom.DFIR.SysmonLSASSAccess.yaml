@@ -1,0 +1,104 @@
+name: Custom.DFIR.SysmonLSASSAccess
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects credential dumping attempts via LSASS memory access by analyzing Sysmon Event ID 10 (ProcessAccess).
+  LSASS (Local Security Authority Subsystem Service) stores cached credentials; attackers use tools
+  like mimikatz, procdump, or comsvcs.dll to dump LSASS memory. This artifact queries Sysmon logs
+  for any process that opened a handle to lsass.exe with suspicious access rights
+  (PROCESS_VM_READ, PROCESS_QUERY_INFORMATION), and enriches results with process metadata.
+
+  MITRE ATT&CK: T1003.001 - OS Credential Dumping: LSASS Memory
+  Data Source: Sysmon Event ID 10 (ProcessAccess)
+  Platform: Windows
+
+reference:
+  - https://attack.mitre.org/techniques/T1003.001/
+  - https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+
+type: CLIENT
+
+parameters:
+  - name: SysmonEvtxGlob
+    description: Glob for Sysmon event log files
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+  - name: TargetProcessRegex
+    description: Regex to match the target process name (LSASS)
+    type: regex
+    default: "(?i)lsass\\.exe"
+  - name: SuspiciousAccessMaskRegex
+    description: Regex for suspicious access masks indicating memory read/dump operations
+    type: regex
+    default: "(0x1010|0x1410|0x143a|0x1f0fff|0x103a|0x1fffff)"
+  - name: SuspiciousSourceRegex
+    description: Regex to filter suspicious source process names
+    type: regex
+    default: "(?i)(mimikatz|procdump|lsassy|nanodump|pypydump|comsvcs|taskmgr|rundll32|cmd\\.exe|powershell)"
+  - name: ShowAllAccess
+    description: If true, show all processes accessing LSASS, not just suspicious ones
+    type: bool
+    default: false
+  - name: TimeAfter
+    description: Only show events after this timestamp (ISO format or epoch)
+    default: "0"
+
+sources:
+  - name: LSASSAccessEvents
+    description: Sysmon Event ID 10 records where target process is lsass.exe
+    query: |
+      LET ParsedEvents <= SELECT * FROM foreach(
+        row={ SELECT OSPath FROM glob(globs=SysmonEvtxGlob) },
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.SourceImage AS SourceImage,
+            EventData.TargetImage AS TargetImage,
+            EventData.SourceProcessId AS SourceProcessId,
+            EventData.TargetProcessId AS TargetProcessId,
+            EventData.GrantedAccess AS GrantedAccess,
+            EventData.CallTrace AS CallTrace,
+            EventData.SourceUser AS SourceUser,
+            EventData.TargetUser AS TargetUser,
+            OSPath AS EvtxFile
+          FROM parse_evtx(filename=OSPath)
+          WHERE EventID = 10
+            AND TargetImage =~ TargetProcessRegex
+        }
+      )
+      
+      LET ProcessInfo <= SELECT Pid, Name, Exe, CommandLine, Username FROM pslist()
+      
+      SELECT
+        EventTime,
+        SourceImage,
+        TargetImage,
+        SourceProcessId,
+        TargetProcessId,
+        GrantedAccess,
+        CallTrace,
+        SourceUser,
+        TargetUser,
+        EvtxFile,
+        if(condition=SourceImage =~ SuspiciousSourceRegex,
+           then="Suspicious source process",
+           else=if(condition=GrantedAccess =~ SuspiciousAccessMaskRegex,
+                   then="Suspicious access mask",
+                   else="Unknown")) AS DetectionReason,
+        {
+          SELECT CommandLine, Exe FROM ProcessInfo WHERE Pid = SourceProcessId LIMIT 1
+        } AS SourceProcessInfo
+      FROM ParsedEvents
+      WHERE if(condition=ShowAllAccess,
+               then=true,
+               else=SourceImage =~ SuspiciousSourceRegex
+                 OR GrantedAccess =~ SuspiciousAccessMaskRegex)
+        AND EventTime > TimeAfter
+      ORDER BY EventTime DESC
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: SourceImage
+    type: path
+  - name: TargetImage
+    type: path

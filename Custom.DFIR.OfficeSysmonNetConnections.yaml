@@ -1,0 +1,139 @@
+name: Custom.DFIR.OfficeSysmonNetConnections
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect suspicious network connections originating from Office applications (Word, Excel, PowerPoint, Outlook, OneNote) via Sysmon Event ID 3.
+  
+  Office applications making outbound network connections—especially to non-standard ports or external IPs—are strong indicators of malicious macro execution, CVE exploitation, or living-off-the-land abuse. This artifact parses Sysmon Event 3 records and filters for known Office binary names, flagging connections that deviate from typical enterprise patterns.
+
+reference:
+  - https://attack.mitre.org/techniques/T1071/
+
+type: CLIENT
+
+parameters:
+  - name: SysmonEvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon/Operational.evtx"
+  - name: OfficeBinariesRegex
+    type: regex
+    default: "(?i)(winword|excel|powerpnt|outlook|onenote|msaccess|mspub|visio|lync|teams|msedge)\\.exe$"
+  - name: SuspiciousPortRegex
+    type: regex
+    default: "(?i)^(4[0-9]{3}|5[0-9]{3}|6[0-9]{3}|7[0-9]{3}|8[0-9]{3}|9[0-9]{3}|444[4]|1337|4443|5555|666[6-9]|7777|8888|9999|31337|1234[0-9])$"
+  - name: WhitelistIPRegex
+    type: regex
+    default: "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.|127\\.|0\\.0\\.0\\.0)$"
+  - name: UploadEvtx
+    type: bool
+    default: "Y"
+
+sources:
+  - name: OfficeNetworkConnections
+    description: Parses Sysmon Event 3 for network connections initiated by Office binaries
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE EventID = 3
+            AND EventData.Image =~ OfficeBinariesRegex
+        })
+
+      LET Connections <= SELECT
+        EventTime,
+        EventData.Image AS ProcessPath,
+        if(condition=EventData.Image,
+           then=regex_replace(re="^.+\\\\", replace="", source=EventData.Image)) AS ProcessName,
+        EventData.SourceIp AS SourceIP,
+        EventData.SourcePort AS SourcePort,
+        EventData.DestinationIp AS DestinationIP,
+        EventData.DestinationPort AS DestinationPort,
+        EventData.DestinationHostname AS DestinationHostname,
+        EventData.Protocol AS Protocol,
+        EventData.User AS User,
+        EventData.Initiated AS Initiated,
+        EventData.ProcessId AS PID
+      FROM RawEvents
+
+      SELECT
+        EventTime,
+        ProcessPath,
+        ProcessName,
+        SourceIP,
+        SourcePort,
+        DestinationIP,
+        DestinationPort,
+        DestinationHostname,
+        Protocol,
+        User,
+        Initiated,
+        PID,
+        if(condition=DestinationIP =~ WhitelistIPRegex,
+           then="Whitelisted",
+           else=if(condition=DestinationPort =~ SuspiciousPortRegex,
+                   then="High-Risk Port",
+                   else="External")) AS RiskCategory
+      FROM Connections
+      ORDER BY EventTime DESC
+
+  - name: SuspiciousSummary
+    description: Summary of suspicious connections excluding whitelisted IPs
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+
+      LET RawEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE EventID = 3
+            AND EventData.Image =~ OfficeBinariesRegex
+        })
+
+      LET Suspicious <= SELECT
+        EventTime,
+        EventData.Image AS ProcessPath,
+        if(condition=EventData.Image,
+           then=regex_replace(re="^.+\\\\", replace="", source=EventData.Image)) AS ProcessName,
+        EventData.DestinationIp AS DestinationIP,
+        EventData.DestinationPort AS DestinationPort,
+        EventData.DestinationHostname AS DestinationHostname,
+        EventData.Protocol AS Protocol,
+        EventData.User AS User
+      FROM RawEvents
+      WHERE NOT EventData.DestinationIp =~ WhitelistIPRegex
+
+      SELECT
+        ProcessName,
+        DestinationIP,
+        DestinationPort,
+        DestinationHostname,
+        Protocol,
+        count(items=DestinationIP) AS ConnectionCount,
+        User
+      FROM Suspicious
+      GROUP BY ProcessName, DestinationIP, DestinationPort
+      ORDER BY ConnectionCount DESC
+
+  - name: EvtxUpload
+    description: Uploads the Sysmon evtx file for offline analysis
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+      SELECT * FROM if(condition=UploadEvtx,
+        then={ SELECT OSPath, upload(file=OSPath) AS Upload FROM EvtxFiles },
+        else={ SELECT OSPath FROM EvtxFiles })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: ProcessPath
+    type: path

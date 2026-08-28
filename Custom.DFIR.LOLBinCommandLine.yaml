@@ -1,0 +1,91 @@
+name: Custom.DFIR.LOLBinCommandLine
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects abuse of common Living-Off-The-Land Binaries (LOLBins) — mshta.exe, regsvr32.exe, and certutil.exe — by inspecting running processes and recent command-line activity.
+
+  Adversaries abuse these signed Microsoft binaries to proxy-execute malicious code, download payloads, or encode/decode data while blending in with legitimate system activity. This artifact surfaces suspicious invocations based on known abuse patterns and command-line indicators.
+
+reference:
+  - https://attack.mitre.org/techniques/T1218/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousRegex
+    type: regex
+    default: "(?i)(mshta\\.exe\\s+.*(http|https|ftp|\\\\\\\\|vbscript|javascript|\\.hta|scriptlet|regsvr))|(regsvr32\\.exe\\s+.*(http|https|ftp|\\\\\\\\|\\.dll|\\.sct|scriptlet|regsvr|i:))|(certutil\\.exe\\s+.*(urlcache|verifyctl|decode|encode|\\-urlcache|\\-f|\\-split|http|https|ftp))"
+  - name: ProcessNameRegex
+    type: regex
+    default: "(?i)^(mshta|regsvr32|certutil)\\.exe$"
+
+sources:
+  - name: RunningProcesses
+    description: Suspicious LOLBin processes currently running on the endpoint.
+    query: |
+      LET ProcessResults <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, StartTime
+        FROM pslist()
+        WHERE Name =~ ProcessNameRegex
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        StartTime,
+        if(condition=CommandLine =~ SuspiciousRegex,
+          then="SUSPICIOUS",
+          else="REVIEW") AS Verdict
+      FROM ProcessResults
+      WHERE CommandLine =~ SuspiciousRegex OR Name =~ ProcessNameRegex
+
+  - name: RecentCommands
+    description: LOLBin command lines from recent process activity including parent process context.
+    query: |
+      LET AllProcs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, StartTime
+        FROM pslist()
+
+      LET LOLBins <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, StartTime
+        FROM AllProcs
+        WHERE Name =~ ProcessNameRegex
+
+      SELECT
+        Pid AS ChildPid,
+        Ppid AS ParentPid,
+        Name AS ChildName,
+        CommandLine AS ChildCommandLine,
+        Username,
+        StartTime,
+        get(item=AllProcs, field=Ppid + ".Name") AS ParentName,
+        get(item=AllProcs, field=Ppid + ".CommandLine") AS ParentCommandLine,
+        if(condition=CommandLine =~ SuspiciousRegex,
+          then="SUSPICIOUS",
+          else="REVIEW") AS Verdict
+      FROM LOLBins
+
+  - name: LOLBinBinaries
+    description: Enumerates mshta.exe, regsvr32.exe, and certutil.exe binaries on disk and checks their hashes.
+    query: |
+      LET Binaries <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=[
+          "C:/Windows/System32/mshta.exe",
+          "C:/Windows/System32/regsvr32.exe",
+          "C:/Windows/System32/certutil.exe",
+          "C:/Windows/SysWOW64/mshta.exe",
+          "C:/Windows/SysWOW64/regsvr32.exe",
+          "C:/Windows/SysWOW64/certutil.exe"
+        ])
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM Binaries
+
+column_types:
+  - name: StartTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp

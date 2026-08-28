@@ -1,0 +1,153 @@
+name: Custom.DFIR.BITSJobAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects BITS (Background Intelligent Transfer Service) job abuse for persistence or malicious downloads.
+  
+  Adversaries abuse BITS to download payloads, exfiltrate data, or maintain persistence through
+  auto-restarting jobs. This artifact enumerates active BITS jobs via PowerShell, checks the BITS
+  client service registry configuration, scans for suspicious BITS-related event log entries,
+  and inspects the BITS job queue files on disk.
+
+reference:
+  - https://attack.mitre.org/techniques/T1197/
+
+type: CLIENT
+
+parameters:
+  - name: EventLogDays
+    type: int
+    default: 7
+    description: Number of days to look back in BITS-related event logs.
+  - name: SuspiciousProcessRegex
+    type: regex
+    default: "(bitsadmin|powershell|cmd|rundll32|regsvr32)"
+    description: Regex to match process names that commonly abuse BITS.
+  - name: UploadJobFiles
+    type: bool
+    default: false
+    description: If true, upload BITS job queue files for offline analysis.
+
+sources:
+  - name: BITSJobs
+    description: Enumerate active and suspended BITS jobs via PowerShell.
+    query: |
+      LET BitsJobs <= SELECT stdout AS RawOutput
+      FROM execve(argv=[
+        "powershell.exe", "-NoProfile", "-Command",
+        "try { Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Select-Object JobId,DisplayName,TransferType,Priority,FilesList,BytesTotal,BytesTransferred,CreationTime,TransferState | ConvertTo-Json -Depth 5 } catch { Write-Output '[]' }"
+      ])
+
+      LET Parsed <= SELECT * FROM parse_json_array(data=RawOutput)
+
+      SELECT
+        JobId,
+        DisplayName,
+        TransferType,
+        Priority,
+        FilesList,
+        BytesTotal,
+        BytesTransferred,
+        timestamp(epoch=CreationTime) AS CreationTime,
+        TransferState
+      FROM Parsed
+
+  - name: BITSRegistry
+    description: Check BITS service registry configuration for tampering or disabled recovery.
+    query: |
+      LET RegRoot <= "HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/BITS"
+
+      LET RegKeys <= SELECT OSPath, Data, Name FROM glob(
+        globs=RegRoot + "/*",
+        accessor="registry")
+
+      SELECT
+        OSPath,
+        Name,
+        Data
+      FROM RegKeys
+      WHERE Name =~ "(Start|DelayedAutostart|ImagePath|FailureActions|Description)"
+
+  - name: BITSEventLogs
+    description: Scan BITS-related Windows Event Logs for job creation, completion, and errors.
+    query: |
+      LET TargetEvtx <= SELECT OSPath FROM glob(
+        globs=[
+          "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Bits-Client* Operational.evtx",
+          "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Bits-Client* Analytic.evtx",
+          "C:/Windows/System32/winevt/Logs/System.evtx"
+        ])
+
+      LET TimeBoundary <= now() - EventLogDays * 86400
+
+      LET ParsedEvents <= SELECT * FROM foreach(
+        row=TargetEvtx,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Provider.Name AS Provider,
+            EventData AS EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.TimeCreated.SystemTime > TimeBoundary
+            AND (System.Provider.Name =~ "Bits" OR System.EventID.Value IN (3, 4, 5, 6, 7, 59, 60, 61))
+        })
+
+      SELECT
+        timestamp(epoch=EventTime) AS EventTime,
+        EventID,
+        Provider,
+        EventData
+      FROM ParsedEvents
+      ORDER BY EventTime DESC
+
+  - name: BITSJobFiles
+    description: Scan BITS job queue files on disk for persisted job metadata.
+    query: |
+      LET JobFileGlob <= "C:/ProgramData/Microsoft/Network/Downloader/qmgr*.dat"
+
+      LET JobFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=JobFileGlob)
+
+      SELECT
+        OSPath,
+        Size,
+        timestamp(epoch=Mtime) AS Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM JobFiles
+
+  - name: SuspiciousBITSProcess
+    description: Detect processes spawning bitsadmin or using BITS PowerShell cmdlets.
+    query: |
+      LET AllProcs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+
+      LET Suspicious <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM AllProcs
+        WHERE Name =~ SuspiciousProcessRegex
+          AND (CommandLine =~ "(?i)bitsadmin"
+               OR CommandLine =~ "(?i)Start-BitsTransfer"
+               OR CommandLine =~ "(?i)Add-BitsTransfer"
+               OR CommandLine =~ "(?i)Complete-BitsTransfer"
+               OR CommandLine =~ "(?i)Remove-BitsTransfer"
+               OR CommandLine =~ "(?i)Get-BitsTransfer")
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM Suspicious
+
+column_types:
+  - name: CreationTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: Hashes
+    type: hash

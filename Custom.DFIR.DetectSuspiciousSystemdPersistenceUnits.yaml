@@ -1,0 +1,60 @@
+name: Custom.DFIR.DetectSuspiciousSystemdPersistenceUnits
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects suspicious systemd service unit files that may be used for persistence on Linux endpoints.
+  
+  The artifact enumerates common systemd unit locations, reads unit file content line by line,
+  filters for unit files and directives that match investigator-provided regexes, and returns
+  file metadata together with the matching line for triage.
+reference:
+  - https://attack.mitre.org/techniques/T1543.002/
+type: CLIENT
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: /etc/systemd/system/**/*.service
+  - name: UnitPathRegex
+    type: regex
+    default: (?i)(/etc/systemd/system/|/run/systemd/system/|/home/[^/]+/.config/systemd/user/|/root/.config/systemd/user/)
+  - name: DirectiveRegex
+    type: regex
+    default: (?i)(^ExecStart=|^ExecStartPre=|^ExecStartPost=|^User=|^WorkingDirectory=|/tmp/|/dev/shm/|/var/tmp/|curl\s|wget\s|bash\s|sh\s|python\s|nc\s|socat\s)
+  - name: UploadFiles
+    type: bool
+    default: false
+sources:
+  - name: SuspiciousUnits
+    description: Enumerate systemd service unit files and return matching suspicious lines.
+    query: |
+      LET UnitFiles <= SELECT OSPath, Size, Mtime
+      FROM glob(globs=TargetGlob)
+
+      LET MatchingLines <= SELECT OSPath, Size, Mtime, Line
+      FROM foreach(
+        row=UnitFiles,
+        query={
+          SELECT OSPath, Size, Mtime, Line
+          FROM split_records(filenames=OSPath, regex='\n', columns=['Line'])
+        })
+
+      LET Findings <= SELECT OSPath, Size, Mtime, Line
+      FROM MatchingLines
+      WHERE OSPath =~ UnitPathRegex
+        AND Line =~ DirectiveRegex
+
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Line AS MatchingLine,
+             hash(path=OSPath, hashselect='MD5,SHA256') AS Hashes,
+             if(condition=UploadFiles,
+                then=upload(file=OSPath),
+                else='') AS Upload
+      FROM Findings
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Hashes
+    type: hash

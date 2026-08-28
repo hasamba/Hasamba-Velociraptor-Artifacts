@@ -1,0 +1,195 @@
+name: Custom.DFIR.LOLBinAbuseMshtaRegsvr32Certutil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects LOLBin abuse via mshta.exe, regsvr32.exe, and certutil.exe command lines.
+
+  These Living-Off-the-Land Binaries (LOLBins) are frequently abused by threat actors
+  to execute malicious code, bypass application whitelisting, and perform stealthy
+  payload delivery. This artifact hunts process execution logs and prefetch artifacts
+  to surface suspicious command lines associated with these binaries.
+
+  MITRE ATT&CK T1218 — Signed Binary Proxy Execution:
+  - mshta.exe: executes HTA files or inline VBScript/JScript from URLs or UNC paths
+  - regsvr32.exe: "Squiblydoo" technique loading DLLs or SCT scripts remotely
+  - certutil.exe: used for download, decode, and base64 operations
+
+reference:
+  - https://attack.mitre.org/techniques/T1218/
+  - https://lolbas-project.github.io/lolbas/Binaries/Mshta/
+  - https://lolbas-project.github.io/lolbas/Binaries/Regsvr32/
+  - https://lolbas-project.github.io/lolbas/Binaries/Certutil/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousMshtaRegex
+    type: regex
+    default: "(?i)(http|https|ftp|\\\\\\\\|javascript:|vbscript:|.hta)"
+    description: Regex to match suspicious mshta.exe arguments (remote HTA, scripts)
+
+  - name: SuspiciousRegsvr32Regex
+    type: regex
+    default: "(?i)(/i:|scrobj|http|https|ftp|\\\\\\\\|.sct)"
+    description: Regex to match suspicious regsvr32.exe arguments (Squiblydoo / remote SCT)
+
+  - name: SuspiciousCertutilRegex
+    type: regex
+    default: "(?i)(urlcache|decode|encode|-f |http|https|ftp)"
+    description: Regex to match suspicious certutil.exe arguments (download/decode abuse)
+
+  - name: LookbackDays
+    type: int
+    default: 7
+    description: How many days back to look in process creation events
+
+  - name: ScanPrefetch
+    type: bool
+    default: true
+    description: Also scan prefetch files for LOLBin execution evidence
+
+sources:
+  - name: ProcessEvents
+    description: |
+      Hunt process creation events from Windows Event Log (Security 4688 + Sysmon 1)
+      for suspicious mshta.exe, regsvr32.exe, and certutil.exe command lines.
+    query: |
+      LET cutoff <= timestamp(epoch=now() - LookbackDays * 86400)
+
+      LET evtx_paths <= SELECT OSPath FROM glob(
+        globs=[
+          "C:/Windows/System32/winevt/Logs/Security.evtx",
+          "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+        ])
+
+      LET all_events <= SELECT * FROM foreach(
+        row=evtx_paths,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Computer AS Computer,
+            EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.TimeCreated.SystemTime >= cutoff
+            AND System.EventID.Value IN (4688, 1)
+        })
+
+      LET parsed_events <= SELECT
+        EventTime,
+        EventID,
+        Computer,
+        if(condition=EventID = 4688,
+           then=EventData.NewProcessName,
+           else=EventData.Image) AS ProcessPath,
+        if(condition=EventID = 4688,
+           then=EventData.CommandLine,
+           else=EventData.CommandLine) AS CommandLine,
+        if(condition=EventID = 4688,
+           then=EventData.SubjectUserName,
+           else=EventData.User) AS Username,
+        if(condition=EventID = 4688,
+           then=EventData.ParentProcessName,
+           else=EventData.ParentImage) AS ParentProcess,
+        if(condition=EventID = 1,
+           then=EventData.Hashes,
+           else="N/A") AS Hashes
+      FROM all_events
+      WHERE ProcessPath =~ "(?i)(mshta\\.exe|regsvr32\\.exe|certutil\\.exe)"
+
+      LET flagged <= SELECT
+        EventTime,
+        EventID,
+        Computer,
+        ProcessPath,
+        CommandLine,
+        Username,
+        ParentProcess,
+        Hashes,
+        if(condition=ProcessPath =~ "(?i)mshta\\.exe" AND CommandLine =~ SuspiciousMshtaRegex,
+           then="mshta_abuse",
+           else=if(condition=ProcessPath =~ "(?i)regsvr32\\.exe" AND CommandLine =~ SuspiciousRegsvr32Regex,
+                   then="regsvr32_abuse",
+                   else=if(condition=ProcessPath =~ "(?i)certutil\\.exe" AND CommandLine =~ SuspiciousCertutilRegex,
+                           then="certutil_abuse",
+                           else=""))) AS DetectionTag
+      FROM parsed_events
+      WHERE DetectionTag != ""
+
+      SELECT
+        EventTime,
+        Computer,
+        Username,
+        DetectionTag,
+        ProcessPath,
+        CommandLine,
+        ParentProcess,
+        Hashes
+      FROM flagged
+      ORDER BY EventTime DESC
+
+  - name: PrefetchEvidence
+    description: |
+      Scan Windows Prefetch files for evidence of mshta.exe, regsvr32.exe, and certutil.exe
+      execution. Prefetch files persist even after process termination and provide
+      historical execution evidence including last run time.
+    query: |
+      LET pf_files <= SELECT OSPath, Size, Mtime FROM glob(
+        globs="C:/Windows/Prefetch/*.pf")
+      WHERE OSPath =~ "(?i)(MSHTA|REGSVR32|CERTUTIL)"
+
+      SELECT
+        OSPath,
+        Mtime AS LastExecutionTime,
+        Size AS PrefetchSize,
+        regex_replace(source=basename(path=OSPath), re="\\.pf$", replace="") AS PrefetchName
+      FROM pf_files
+      WHERE ScanPrefetch
+
+  - name: RunningProcesses
+    description: |
+      Check currently running processes for any active mshta.exe, regsvr32.exe,
+      or certutil.exe instances with suspicious arguments.
+    query: |
+      LET live_procs <= SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime
+      FROM pslist()
+      WHERE Name =~ "(?i)(mshta\\.exe|regsvr32\\.exe|certutil\\.exe)"
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime,
+        if(condition=Name =~ "(?i)mshta\\.exe" AND CommandLine =~ SuspiciousMshtaRegex,
+           then="mshta_abuse",
+           else=if(condition=Name =~ "(?i)regsvr32\\.exe" AND CommandLine =~ SuspiciousRegsvr32Regex,
+                   then="regsvr32_abuse",
+                   else=if(condition=Name =~ "(?i)certutil\\.exe" AND CommandLine =~ SuspiciousCertutilRegex,
+                           then="certutil_abuse",
+                           else="clean_or_unchecked"))) AS DetectionTag
+      FROM live_procs
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: LastExecutionTime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: ProcessPath
+    type: path
+  - name: Exe
+    type: path
+  - name: OSPath
+    type: path
+  - name: ParentProcess
+    type: path

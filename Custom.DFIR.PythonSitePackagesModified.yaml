@@ -1,0 +1,125 @@
+name: Custom.DFIR.PythonSitePackagesModified
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for recently installed or modified Python/pip packages in site-packages directories.
+
+  Adversaries may supply malicious packages to package managers (T1195.001 - Supply Chain Compromise:
+  Modify System Image). This artifact scans all discovered site-packages directories for recently
+  created or modified files, flagging packages that were installed or changed within a configurable
+  time window. Useful for detecting suspicious or unexpected package installations.
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+
+type: CLIENT
+
+parameters:
+  - name: ModifiedSinceDays
+    type: int
+    description: Number of days to look back for recently modified files in site-packages.
+    default: 7
+  - name: FilterRegex
+    type: regex
+    description: Regex to filter results (e.g. package name or path pattern).
+    default: "."
+  - name: UploadFiles
+    type: bool
+    description: If true, upload suspicious files for offline analysis.
+    default: false
+
+sources:
+  - name: LinuxSitePackages
+    description: Scan Python site-packages directories on Linux.
+    query: |
+      LET Cutoff <= now() - ModifiedSinceDays * 86400
+
+      LET PythonDirs <= SELECT OSPath, Mtime
+        FROM glob(globs=[
+          "/usr/lib/python*/site-packages",
+          "/usr/lib/python3*/dist-packages",
+          "/usr/local/lib/python*/site-packages",
+          "/usr/local/lib/python*/dist-packages",
+          "/home/*/.local/lib/python*/site-packages",
+          "/opt/*/lib/python*/site-packages"
+        ])
+
+      LET PkgFiles <= SELECT OSPath, Size, Mtime, Ctime, Mode
+        FROM glob(globs=format(format="%s/**/*.py", args=PythonDirs.OSPath))
+        WHERE Mtime > Cutoff OR Ctime > Cutoff
+
+      LET Filtered <= SELECT * FROM PkgFiles WHERE OSPath =~ FilterRegex
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Ctime, upload(file=OSPath) AS Upload
+          FROM Filtered
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Ctime FROM Filtered
+        })
+
+  - name: WindowsSitePackages
+    description: Scan Python site-packages directories on Windows.
+    query: |
+      LET Cutoff <= now() - ModifiedSinceDays * 86400
+
+      LET PythonDirs <= SELECT OSPath, Mtime
+        FROM glob(globs=[
+          "C:/Python*/Lib/site-packages",
+          "C:/Python*/Lib/site-packages/*",
+          "C:/Users/*/AppData/Local/Programs/Python/Python*/Lib/site-packages",
+          "C:/Program Files/Python*/Lib/site-packages",
+          "C:/ProgramData/Python*/Lib/site-packages"
+        ])
+
+      LET PkgFiles <= SELECT OSPath, Size, Mtime, Ctime, Mode
+        FROM glob(globs=format(format="%s/**/*.py", args=PythonDirs.OSPath))
+        WHERE Mtime > Cutoff OR Ctime > Cutoff
+
+      LET Filtered <= SELECT * FROM PkgFiles WHERE OSPath =~ FilterRegex
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Ctime, upload(file=OSPath) AS Upload
+          FROM Filtered
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Ctime FROM Filtered
+        })
+
+  - name: DarwinSitePackages
+    description: Scan Python site-packages directories on macOS.
+    query: |
+      LET Cutoff <= now() - ModifiedSinceDays * 86400
+
+      LET PythonDirs <= SELECT OSPath, Mtime
+        FROM glob(globs=[
+          "/Library/Python/*/site-packages",
+          "/Users/*/Library/Python/*/lib/python/site-packages",
+          "/opt/homebrew/lib/python*/site-packages",
+          "/usr/local/lib/python*/site-packages",
+          "/opt/*/lib/python*/site-packages"
+        ])
+
+      LET PkgFiles <= SELECT OSPath, Size, Mtime, Ctime, Mode
+        FROM glob(globs=format(format="%s/**/*.py", args=PythonDirs.OSPath))
+        WHERE Mtime > Cutoff OR Ctime > Cutoff
+
+      LET Filtered <= SELECT * FROM PkgFiles WHERE OSPath =~ FilterRegex
+
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, Ctime, upload(file=OSPath) AS Upload
+          FROM Filtered
+        },
+        else={
+          SELECT OSPath, Size, Mtime, Ctime FROM Filtered
+        })
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: filepath

@@ -1,0 +1,71 @@
+name: Custom.DFIR.LinuxReverseShellBashHistory
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for reverse shell patterns in bash history files across all users on Linux endpoints.
+
+  Scans /root/.bash_history and all /home/*/.bash_history files for common reverse shell
+  techniques including bash TCP redirections (/dev/tcp), netcat connect-backs, Python/Perl/Ruby
+  socket one-liners, socat exec tunnels, mkfifo pipes, curl/wget piped to bash, and pty spawning.
+
+  Useful for post-compromise triage, lateral movement detection, and evidence of T1059.004
+  (Command and Scripting Interpreter: Unix Shell) abuse following initial access.
+
+reference:
+  - https://attack.mitre.org/techniques/T1059.004/
+  - https://gtfobins.github.io/
+
+type: CLIENT
+
+parameters:
+  - name: HistoryGlob
+    type: glob
+    default: "{/root/.bash_history,/home/*/.bash_history}"
+    description: Glob pattern to locate bash history files
+
+  - name: ReverseShellRegex
+    type: regex
+    default: "bash\\s+-[iI]|/dev/tcp/|/dev/udp/|nc\\s+-[elnvpw]|ncat\\s|netcat\\s|python[23]?.*socket|perl.*socket|ruby.*socket|socat.*exec|mkfifo|mknod.*\\|.*nc|php.*fsockopen|curl[^|]*\\|.*bash|wget[^|]*\\|.*bash|python.*pty\\.spawn|script.*\\|.*nc|openssl.*s_client"
+    description: Regex pattern to match reverse shell indicators in history lines
+
+  - name: UploadFiles
+    type: bool
+    default: "N"
+    description: Upload matching bash history files as forensic evidence
+
+sources:
+  - name: ReverseShellHits
+    description: Individual history lines matching reverse shell patterns
+    query: |
+      LET HistFiles <= SELECT OSPath, Mtime FROM glob(globs=HistoryGlob)
+
+      SELECT * FROM foreach(
+        row=HistFiles,
+        query={
+          SELECT
+            OSPath AS HistoryFile,
+            Mtime AS FileMtime,
+            Line AS SuspiciousCommand
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ ReverseShellRegex AND Line != ""
+        }
+      )
+
+  - name: HistoryFileInventory
+    description: All bash history files discovered with metadata and optional upload
+    query: |
+      LET HistFiles <= SELECT OSPath, Mtime, Size FROM glob(globs=HistoryGlob)
+
+      SELECT
+        OSPath,
+        Mtime,
+        Size,
+        if(condition=UploadFiles,
+           then=upload(file=OSPath),
+           else=NULL) AS Upload
+      FROM HistFiles
+
+column_types:
+  - name: FileMtime
+    type: timestamp
+  - name: Mtime
+    type: timestamp

@@ -1,0 +1,129 @@
+name: Custom.DFIR.Kerberoasting4769
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects potential Kerberoasting attacks by analyzing Windows Event ID 4769
+  (Kerberos Service Ticket Request) logs for suspicious TGS requests targeting
+  service accounts.
+
+  Kerberoasting (MITRE ATT&CK T1558.003) exploits the fact that service account
+  TGS tickets are encrypted with the account's NTLM hash. An attacker requests
+  TGS tickets for service accounts, then cracks them offline to recover plaintext
+  credentials.
+
+  This artifact flags Event 4769 entries where the requested service (SPN) is
+  NOT a common machine account (host$/cifs$) and uses weak encryption (RC4 /
+  0x17), which is the hallmark of a Kerberoasting request.
+
+reference:
+  - https://attack.mitre.org/techniques/T1558.003/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+  - name: ServiceRegexFilter
+    type: regex
+    default: "."
+  - name: WeakEncryptionTypes
+    type: regex
+    default: "0x17|0x3|0x1"
+  - name: CommonMachineAccountsRegex
+    type: regex
+    default: "\\$$"
+  - name: LookbackHours
+    type: int
+    default: 168
+
+sources:
+  - name: KerberoastEvents
+    description: |
+      Parses Security.evtx for Event ID 4769, filters for TGS requests to
+      service accounts using weak encryption (RC4), excluding common machine
+      account patterns that are benign.
+    query: |
+      LET LookbackEpoch <= now() - LookbackHours * 3600
+
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET ParsedEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.ServiceName AS ServiceName,
+            EventData.ServiceSid AS ServiceSid,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.TargetDomainName AS TargetDomainName,
+            EventData.IpAddress AS SourceIP,
+            EventData.IpPort AS SourcePort,
+            EventData.TicketEncryptionType AS EncryptionType,
+            EventData.TicketOptions AS TicketOptions,
+            EventData.FailureCode AS FailureCode,
+            EventData.TransmittedServices AS TransmittedServices,
+            OSPath
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4769
+            AND EventTime > LookbackEpoch
+        })
+
+      SELECT
+        EventTime,
+        ServiceName,
+        TargetUserName,
+        TargetDomainName,
+        SourceIP,
+        SourcePort,
+        EncryptionType,
+        TicketOptions,
+        FailureCode,
+        OSPath
+      FROM ParsedEvents
+      WHERE ServiceName =~ ServiceRegexFilter
+        AND NOT ServiceName =~ CommonMachineAccountsRegex
+        AND EncryptionType =~ WeakEncryptionTypes
+
+  - name: KerberoastSummary
+    description: |
+      Aggregated summary of distinct service accounts targeted with weak
+      encryption TGS requests, per source IP.
+    query: |
+      LET LookbackEpoch <= now() - LookbackHours * 3600
+
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET ParsedEvents <= SELECT * FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.ServiceName AS ServiceName,
+            EventData.IpAddress AS SourceIP,
+            EventData.TicketEncryptionType AS EncryptionType
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4769
+            AND EventTime > LookbackEpoch
+        })
+
+      SELECT
+        ServiceName,
+        SourceIP,
+        EncryptionType,
+        count(items=EventTime) AS RequestCount,
+        min(item=EventTime) AS FirstSeen,
+        max(item=EventTime) AS LastSeen
+      FROM ParsedEvents
+      WHERE NOT ServiceName =~ CommonMachineAccountsRegex
+        AND EncryptionType =~ WeakEncryptionTypes
+      GROUP BY ServiceName, SourceIP, EncryptionType
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp

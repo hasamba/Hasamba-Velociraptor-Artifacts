@@ -1,0 +1,93 @@
+name: Custom.DFIR.SysmonNamedPipeHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for named pipe creation/connection activity using Sysmon Event IDs 17 and 18.
+
+  This artifact parses Sysmon Operational EVTX logs on Windows endpoints, extracts
+  relevant named pipe telemetry, and supports regex-based filtering for pipe names,
+  images, users, and host-level scoping.
+
+reference:
+  - https://attack.mitre.org/techniques/T1559.001/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx
+  - name: PipeRegex
+    type: regex
+    default: (?i).*
+  - name: ImageRegex
+    type: regex
+    default: (?i).*
+  - name: UserRegex
+    type: regex
+    default: (?i).*
+  - name: ComputerRegex
+    type: regex
+    default: (?i).*
+  - name: StartTime
+    type: timestamp
+  - name: EndTime
+    type: timestamp
+
+sources:
+  - name: SysmonPipeEvents
+    description: Parse Sysmon EVTX and return Event ID 17/18 rows matching regex filters.
+    query: |
+      LET EvtxFiles <=
+        SELECT
+          OSPath,
+          Size,
+          Mtime,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS FileHashes
+        FROM glob(globs=EvtxGlob)
+
+      SELECT
+        EventTime,
+        timestamp(epoch=now()) AS CollectionTime,
+        EventID,
+        Computer,
+        EvtxPath,
+        EvtxSize,
+        EvtxMtime,
+        EvtxMD5,
+        EvtxSHA256,
+        EventDataText
+      FROM foreach(
+        row=EvtxFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Computer AS Computer,
+            OSPath AS EvtxPath,
+            Size AS EvtxSize,
+            Mtime AS EvtxMtime,
+            FileHashes.MD5 AS EvtxMD5,
+            FileHashes.SHA256 AS EvtxSHA256,
+            format(format="%v", args=EventData) AS EventDataText
+          FROM parse_evtx(filename=OSPath)
+          WHERE
+            (System.EventID.Value = 17 OR System.EventID.Value = 18)
+            AND format(format="%v", args=EventData) =~ PipeRegex
+            AND format(format="%v", args=EventData) =~ ImageRegex
+            AND format(format="%v", args=EventData) =~ UserRegex
+            AND System.Computer =~ ComputerRegex
+        })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: CollectionTime
+    type: timestamp
+  - name: EvtxPath
+    type: path
+  - name: EvtxMtime
+    type: timestamp
+  - name: EvtxMD5
+    type: md5
+  - name: EvtxSHA256
+    type: sha256

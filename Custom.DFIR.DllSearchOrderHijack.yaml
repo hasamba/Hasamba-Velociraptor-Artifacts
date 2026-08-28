@@ -1,0 +1,154 @@
+name: Custom.DFIR.DllSearchOrderHijack
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for evidence of DLL search order hijacking via temp directories and PATH analysis.
+  
+  This artifact detects T1574.001 (DLL Search Order Hijacking) by:
+  1. Identifying DLLs sitting in temp/appdata/public directories that could be hijack targets
+  2. Finding known hijackable DLLs placed in application directories alongside executables
+  3. Checking for suspicious PATH entries (user-writable directories ahead of System32)
+  4. Detecting processes running from suspicious directories that may load hijacked DLLs
+
+reference:
+  - https://attack.mitre.org/techniques/T1574.001/
+
+type: CLIENT
+
+parameters:
+  - name: TempGlob
+    type: glob
+    default: "C:/Users/*/AppData/Local/Temp/**/*.dll"
+  - name: PublicGlob
+    type: glob
+    default: "C:/Users/Public/**/*.dll"
+  - name: DownloadGlob
+    type: glob
+    default: "C:/Users/*/Downloads/**/*.dll"
+  - name: AppDataGlob
+    type: glob
+    default: "C:/Users/*/AppData/Roaming/**/*.dll"
+  - name: SuspiciousDllRegex
+    type: regex
+    default: "(version|cryptbase|msvcrt|uxtheme|dwmapi|propsys|ntmarta|userenv|profapi|dbghelp|winnsi|wtsapi32|samlib|dsrole|cryptsp|keyiso|eventaggr|wevtsvc|fveapi|tzres|msftedit|hlink|netutils|samcli|netlogon|wldp|devobj|cfgmgr32|msdart|system|powrprof|umpdc|profext|dbgeng|d3d9|d3d10|d3d11|dxgi|dinput8|xinput1|d3d8thk|d3dx9|d3dx11|d3dx12|dinput|dsound|xaudio2|mssamp|msacm32|winmm|avicap32|avifil32|mciavi32|msvfw32|avcodec|avformat|avutil|swresample|swscale)"
+  - name: ProcessFilterRegex
+    type: regex
+    default: "(temp|appdata|downloads|public|roaming|programdata)"
+  - name: ProgramFilesGlob
+    type: glob
+    default: "C:/Program Files/**/*.exe"
+  - name: ProgramFilesX86Glob
+    type: glob
+    default: "C:/Program Files (x86)/**/*.exe"
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: SuspiciousDllsInTempPaths
+    description: Find DLLs in temp/public/downloads directories that may indicate search order hijacking
+    query: |
+      LET TempDlls = SELECT OSPath, Size, Mtime, hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+        FROM glob(globs=TempGlob)
+      
+      LET PublicDlls = SELECT OSPath, Size, Mtime, hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+        FROM glob(globs=PublicGlob)
+      
+      LET DownloadDlls = SELECT OSPath, Size, Mtime, hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+        FROM glob(globs=DownloadGlob)
+      
+      LET AppDataDlls = SELECT OSPath, Size, Mtime, hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+        FROM glob(globs=AppDataGlob)
+      
+      LET AllSuspicious = SELECT * FROM chain(
+        temp={ SELECT * FROM TempDlls WHERE OSPath =~ SuspiciousDllRegex },
+        public={ SELECT * FROM PublicDlls WHERE OSPath =~ SuspiciousDllRegex },
+        downloads={ SELECT * FROM DownloadDlls WHERE OSPath =~ SuspiciousDllRegex },
+        appdata={ SELECT * FROM AppDataDlls WHERE OSPath =~ SuspiciousDllRegex }
+      )
+      
+      SELECT * FROM if(condition=UploadFiles,
+        then={ SELECT OSPath, Size, Mtime, Hashes.MD5 AS MD5, Hashes.SHA256 AS SHA256,
+                      upload(file=OSPath) AS Upload
+                 FROM AllSuspicious },
+        else={ SELECT OSPath, Size, Mtime, Hashes.MD5 AS MD5, Hashes.SHA256 AS SHA256
+                 FROM AllSuspicious })
+
+  - name: HijackableDllsInProgramDirs
+    description: Find known hijackable DLLs sitting alongside executables in Program Files directories
+    query: |
+      LET AllExes = SELECT OSPath AS ExePath, dirname(path=OSPath) AS ExeDir
+        FROM glob(globs=[ProgramFilesGlob, ProgramFilesX86Glob])
+      
+      LET DllMatches = SELECT ExePath, DllPath, DllSize, DllMtime, DllHash.MD5 AS MD5, DllHash.SHA256 AS SHA256
+        FROM foreach(
+          row=AllExes,
+          query={
+            SELECT ExePath, OSPath AS DllPath, Size AS DllSize,
+              Mtime AS DllMtime,
+              hash(path=OSPath, hashselect="MD5,SHA256") AS DllHash
+            FROM glob(globs=ExeDir + "/*.dll")
+            WHERE basename(path=OSPath) =~ SuspiciousDllRegex
+          })
+
+      SELECT * FROM DllMatches
+
+  - name: PathAnalysis
+    description: Analyze system PATH for user-writable directories that enable DLL hijacking
+    query: |
+      LET SysPath = SELECT Data AS PathString
+        FROM glob(globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Control/Session Manager/Environment/PATH",
+                  accessor="registry")
+      
+      LET UserPath = SELECT Data AS PathString
+        FROM glob(globs="HKEY_USERS/*/Environment/PATH",
+                  accessor="registry")
+      
+      LET AllPaths = SELECT * FROM chain(
+        system={ SELECT PathString FROM SysPath },
+        user={ SELECT PathString FROM UserPath }
+      )
+      
+      LET SplitEntries = SELECT split(sep_string=";", string=PathString) AS Entries,
+                                      PathString AS RawPath
+        FROM AllPaths
+      WHERE Entries
+      
+      LET ExpandedEntries = SELECT _value AS PathEntry, RawPath
+        FROM foreach(
+          row={ SELECT Entries, RawPath FROM SplitEntries },
+          query={ SELECT _value, RawPath FROM scope() WHERE _value AND len(list=_value) > 0 }
+        )
+      
+      LET PathStats = SELECT PathEntry, RawPath,
+        stat(filename=pathspec(Path=PathEntry, path_type="windows")) AS PathInfo
+        FROM ExpandedEntries
+      
+      SELECT PathEntry,
+             PathInfo.Size AS DirSize,
+             PathInfo.Mode AS DirMode,
+             RawPath
+        FROM PathStats
+        WHERE PathEntry =~ "(?i)temp|downloads|public|appdata|roaming|programdata"
+           OR PathEntry =~ ProcessFilterRegex
+
+  - name: ProcessesWithLoadedHijackedDlls
+    description: List running processes loading DLLs from suspicious directories
+    query: |
+      LET Processes = SELECT Pid, Ppid, Name, Exe, CommandLine, Username
+        FROM pslist()
+      
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username
+        FROM Processes
+        WHERE Exe =~ ProcessFilterRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: DllMtime
+    type: timestamp
+  - name: ExePath
+    type: file_path
+  - name: DllPath
+    type: file_path
+  - name: OSPath
+    type: file_path

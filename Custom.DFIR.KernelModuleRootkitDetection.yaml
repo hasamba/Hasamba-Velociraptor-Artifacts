@@ -1,0 +1,145 @@
+name: Custom.DFIR.KernelModuleRootkitDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect kernel module (rootkit) loading artifacts via /proc and loaded modules list.
+
+  Adversaries may use kernel modules to maintain persistence or elevate privileges (T1014).
+  This artifact scans /proc/modules, /sys/module/, and /lib/modules/ for suspicious entries,
+  cross-referencing loaded modules against known legitimate module lists and checking for
+  hidden/discrepancy indicators.
+
+reference:
+  - https://attack.mitre.org/techniques/T1014/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousModuleRegex
+    type: regex
+    default: "^(adore|knark|reptore|suckit|hide|rootkit|modhide|shv4|shv5|enyelkm|be2|dkom|kit|bd|fl|se|iv|lkm)"
+  - name: KnownBadModuleNames
+    type: regex
+    default: "^(adore|knark|reptore|suckit|shv4|shv5|enyelkm|bd|fl|se|iv|lkm|modhide|hidepid|kit|be2|dkom)"
+  - name: ProcModulesGlob
+    type: string
+    default: "/proc/modules"
+  - name: SysModuleGlob
+    type: string
+    default: "/sys/module/*"
+
+sources:
+  - name: ProcModules
+    description: Parse /proc/modules for loaded kernel modules and flag suspicious ones.
+    query: |
+      LET ProcModules <= SELECT Line FROM split_records(
+        filenames=ProcModulesGlob,
+        regex="\n",
+        columns=["Line"]
+      )
+      LET Parsed <= SELECT
+        regex_replace(re="^(\\S+)\\s+.*$", replace="$1", source=Line) AS ModuleName,
+        Line AS RawLine
+      FROM ProcModules
+      WHERE Line =~ "\\S"
+      SELECT
+        ModuleName,
+        RawLine,
+        if(condition=ModuleName =~ SuspiciousModuleRegex,
+           then="SUSPICIOUS",
+           else="NORMAL") AS Verdict
+      FROM Parsed
+
+  - name: SysModuleEntries
+    description: Enumerate /sys/module/ entries and check for hidden/suspicious modules.
+    query: |
+      LET SysModules <= SELECT OSPath, Name FROM glob(globs=SysModuleGlob)
+      SELECT
+        Name AS ModuleName,
+        OSPath AS ModulePath,
+        if(condition=Name =~ SuspiciousModuleRegex,
+           then="SUSPICIOUS",
+           else="NORMAL") AS Verdict,
+        if(condition=Name =~ KnownBadModuleNames,
+           then="KNOWN_BAD",
+           else="") AS ThreatFlag
+      FROM SysModules
+
+  - name: CrossReferenceModules
+    description: Cross-reference /proc/modules with /sys/module/ to detect hidden rootkits (present in /proc but missing from /sys).
+    query: |
+      LET ProcModuleNames <= SELECT
+        regex_replace(re="^(\\S+)\\s+.*$", replace="$1", source=Line) AS ModuleName
+      FROM split_records(
+        filenames=ProcModulesGlob,
+        regex="\n",
+        columns=["Line"]
+      )
+      WHERE Line =~ "\\S"
+      LET SysModuleNames <= SELECT Name AS ModuleName FROM glob(globs=SysModuleGlob)
+      LET ProcOnly <= SELECT ProcModuleNames.ModuleName AS ModuleName
+        FROM ProcModuleNames
+        WHERE NOT ModuleName IN SysModuleNames.ModuleName
+      SELECT
+        ModuleName,
+        "IN_PROC_NOT_SYS" AS AnomalyType,
+        if(condition=ModuleName =~ SuspiciousModuleRegex,
+           then="SUSPICIOUS",
+           else="REVIEW") AS Verdict
+      FROM ProcOnly
+
+  - name: ModuleParameters
+    description: Check suspicious /sys/module/ entries for parameters that may indicate rootkit behavior.
+    query: |
+      LET SuspiciousSys <= SELECT OSPath, Name FROM glob(globs=SysModuleGlob)
+        WHERE Name =~ SuspiciousModuleRegex
+      LET ParamFiles <= SELECT
+        SuspiciousSys.Name AS ModuleName,
+        SuspiciousSys.OSPath AS ModulePath,
+        Param.OSPath AS ParamPath,
+        read_file(filename=Param.OSPath, length=4096) AS ParamValue
+      FROM foreach(
+        row=SuspiciousSys,
+        query={
+          SELECT OSPath FROM glob(globs=OSPath + "/parameters/*")
+        })
+      SELECT
+        ModuleName,
+        ModulePath,
+        regex_replace(re="^.*/parameters/(.+)$", replace="$1", source=ParamPath) AS Parameter,
+        ParamValue,
+        if(condition=ParamValue =~ "1|true|yes|hide|inject|hook",
+           then="SUSPICIOUS_VALUE",
+           else="NORMAL_VALUE") AS Assessment
+      FROM ParamFiles
+
+  - name: KernelModuleFiles
+    description: Scan /lib/modules/ for .ko files matching suspicious module names.
+    query: |
+      LET KernelVersion <= SELECT
+        regex_replace(re="^(build|source)=$", replace="", source=Line) AS Version
+      FROM split_records(
+        filenames="/proc/version",
+        regex="\n",
+        columns=["Line"]
+      )
+      WHERE Line =~ "Linux version"
+      LET ModuleFiles <= SELECT OSPath, Name, Size, Mtime
+        FROM glob(globs="/lib/modules/**/*.ko*")
+      SELECT
+        Name AS FileName,
+        OSPath AS FilePath,
+        Size,
+        Mtime,
+        if(condition=Name =~ SuspiciousModuleRegex,
+           then="SUSPICIOUS",
+           else="NORMAL") AS Verdict
+      FROM ModuleFiles
+      WHERE Name =~ SuspiciousModuleRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: ModulePath
+    type: path
+  - name: FilePath
+    type: path

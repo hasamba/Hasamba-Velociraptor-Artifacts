@@ -1,0 +1,77 @@
+name: Custom.DFIR.DetectTorOrC2NetworkBeacons
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect processes that maintain network connections to TOR exit-node style infrastructure or known C2 IOC ranges.
+
+  This artifact correlates live socket data from netstat() with process metadata from pslist(), then enriches each match with SHA256 for rapid triage and pivoting.
+reference:
+  - https://attack.mitre.org/techniques/T1090.003/
+type: CLIENT
+parameters:
+  - name: SuspiciousIPRegex
+    type: regex
+    default: "^(185\\.220\\.|199\\.249\\.230\\.|104\\.244\\.7[2-9]\\.|198\\.98\\.5[0-9]\\.)"
+  - name: ProcessRegex
+    type: regex
+    default: "."
+  - name: ConnectionStateRegex
+    type: regex
+    default: "^(ESTABLISHED|SYN_SENT|TIME_WAIT)$"
+sources:
+  - name: SuspiciousConnections
+    description: Correlate active network sockets with owning process metadata and hashes.
+    query: |
+      LET SuspiciousConnections <=
+        SELECT
+          Pid,
+          Status,
+          Laddr.IP AS LocalIP,
+          Laddr.Port AS LocalPort,
+          Raddr.IP AS RemoteIP,
+          Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Raddr.IP =~ SuspiciousIPRegex
+          AND Status =~ ConnectionStateRegex
+
+      LET ProcessInventory <=
+        SELECT
+          Pid,
+          Ppid,
+          Name,
+          Exe AS ProcessPath,
+          CommandLine,
+          Username,
+          hash(path=Exe, hashselect="SHA256") AS ProcessHashes
+        FROM pslist()
+        WHERE Exe
+
+      SELECT * FROM foreach(
+        row={
+          SELECT * FROM SuspiciousConnections
+        },
+        query={
+          SELECT
+            timestamp(epoch=now()) AS SeenAt,
+            Pid,
+            Ppid,
+            Name AS ProcessName,
+            ProcessPath,
+            CommandLine,
+            Username,
+            row.Status AS ConnectionState,
+            row.LocalIP AS LocalIP,
+            row.LocalPort AS LocalPort,
+            row.RemoteIP AS RemoteIP,
+            row.RemotePort AS RemotePort,
+            ProcessHashes.SHA256 AS SHA256
+          FROM ProcessInventory
+          WHERE Pid = row.Pid
+            AND Name =~ ProcessRegex
+        })
+column_types:
+  - name: SeenAt
+    type: timestamp
+  - name: ProcessPath
+    type: path
+  - name: SHA256
+    type: hash

@@ -1,0 +1,133 @@
+name: Custom.DFIR.DetectPETimestomping
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects potential timestomping on Windows PE files by comparing filesystem MAC times
+  with executable metadata embedded in the PE header.
+
+  Attackers often backdate malicious binaries so they blend into the surrounding
+  filesystem timeline. This artifact enumerates PE files, extracts the PE compile
+  timestamp, and highlights cases where the file's Modified, Accessed, or Changed
+  times are significantly older than the embedded compile time.
+reference:
+  - https://attack.mitre.org/techniques/T1070.006/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: |
+      C:/Users/**/*.exe
+      C:/ProgramData/**/*.exe
+      C:/Windows/Temp/**/*.exe
+  - name: FileNameRegex
+    type: regex
+    default: ".(?i:exe|dll)$"
+  - name: SuspiciousDeltaSeconds
+    type: int
+    default: 86400
+  - name: HashFiles
+    type: bool
+    default: false
+
+sources:
+  - name: SuspiciousPETimeMismatches
+    description: Compare PE compile timestamps with filesystem times to flag probable timestomping.
+    query: |
+      LET Candidates <=
+        SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=TargetGlob)
+        WHERE NOT IsDir
+          AND OSPath =~ FileNameRegex
+
+      LET WithPE <=
+        SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          parse_pe(file=OSPath).FileHeader.TimeDateStamp AS PECompileTime
+        FROM Candidates
+
+      LET Scored <=
+        SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          PECompileTime,
+          if(condition=PECompileTime AND Mtime,
+             then=timestamp(epoch=PECompileTime) - Mtime,
+             else=0) AS MtimeDelta,
+          if(condition=PECompileTime AND Atime,
+             then=timestamp(epoch=PECompileTime) - Atime,
+             else=0) AS AtimeDelta,
+          if(condition=PECompileTime AND Ctime,
+             then=timestamp(epoch=PECompileTime) - Ctime,
+             else=0) AS CtimeDelta,
+          if(condition=PECompileTime AND Btime,
+             then=timestamp(epoch=PECompileTime) - Btime,
+             else=0) AS BtimeDelta
+        FROM WithPE
+        WHERE PECompileTime
+
+      LET Filtered <=
+        SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Atime,
+          Ctime,
+          Btime,
+          timestamp(epoch=PECompileTime) AS PECompileTimestamp,
+          MtimeDelta,
+          AtimeDelta,
+          CtimeDelta,
+          BtimeDelta,
+          if(condition=HashFiles,
+             then=hash(path=OSPath, hashselect="MD5,SHA256"),
+             else=dict(MD5='', SHA256='')) AS HashInfo
+        FROM Scored
+        WHERE MtimeDelta > SuspiciousDeltaSeconds
+           OR AtimeDelta > SuspiciousDeltaSeconds
+           OR CtimeDelta > SuspiciousDeltaSeconds
+           OR BtimeDelta > SuspiciousDeltaSeconds
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Btime,
+        PECompileTimestamp,
+        MtimeDelta,
+        AtimeDelta,
+        CtimeDelta,
+        BtimeDelta,
+        HashInfo.MD5 AS MD5,
+        HashInfo.SHA256 AS SHA256
+      FROM Filtered
+      ORDER BY PECompileTimestamp DESC
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: PECompileTimestamp
+    type: timestamp
+  - name: MD5
+    type: md5
+  - name: SHA256
+    type: sha256

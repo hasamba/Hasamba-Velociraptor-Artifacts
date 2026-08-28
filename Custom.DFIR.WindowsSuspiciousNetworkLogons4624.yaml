@@ -1,0 +1,100 @@
+name: Custom.DFIR.WindowsSuspiciousNetworkLogons4624
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for suspicious Windows Security Event ID 4624 network logons (LogonType 3)
+  that may indicate pass-the-hash or pass-the-ticket activity.
+
+  The artifact parses Security.evtx files and highlights successful network logons
+  using NTLM or Kerberos with investigator-controlled regex filters for user,
+  source IP, authentication package, and logon process. These events are not
+  proof on their own, but they are strong triage leads for lateral movement and
+  stolen-session abuse.
+reference:
+  - https://attack.mitre.org/techniques/T1550.002/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityLogGlob
+    type: glob
+    default: C:/Windows/System32/winevt/Logs/Security.evtx
+  - name: UserRegex
+    type: regex
+    default: .
+  - name: SourceIPRegex
+    type: regex
+    default: .
+  - name: AuthPackageRegex
+    type: regex
+    default: (?i)(NTLM|Kerberos)
+  - name: LogonProcessRegex
+    type: regex
+    default: (?i)(NtLmSsp|Kerberos)
+
+sources:
+  - name: SuspiciousNetworkLogons
+    description: Parse Security.evtx and return matching successful network logons.
+    query: |
+      LET SecurityEvents <= SELECT * FROM foreach(
+        row={
+          SELECT OSPath FROM glob(globs=SecurityLogGlob)
+        },
+        query={
+          SELECT
+            OSPath AS EVTXPath,
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.TargetDomainName AS TargetDomainName,
+            EventData.TargetLogonId AS TargetLogonId,
+            EventData.SubjectUserName AS SubjectUserName,
+            EventData.SubjectDomainName AS SubjectDomainName,
+            EventData.IpAddress AS IpAddress,
+            EventData.IpPort AS IpPort,
+            EventData.WorkstationName AS WorkstationName,
+            EventData.LogonType AS LogonType,
+            EventData.LogonProcessName AS LogonProcessName,
+            EventData.AuthenticationPackageName AS AuthenticationPackageName,
+            EventData.KeyLength AS KeyLength,
+            EventData.LmPackageName AS LmPackageName,
+            EventData.ImpersonationLevel AS ImpersonationLevel,
+            EventData.TransmittedServices AS TransmittedServices
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4624
+        })
+
+      SELECT
+        EventTime,
+        EVTXPath,
+        EventID,
+        TargetUserName,
+        TargetDomainName,
+        TargetLogonId,
+        SubjectUserName,
+        SubjectDomainName,
+        IpAddress,
+        IpPort,
+        WorkstationName,
+        LogonType,
+        LogonProcessName,
+        AuthenticationPackageName,
+        KeyLength,
+        LmPackageName,
+        ImpersonationLevel,
+        TransmittedServices,
+        if(
+          condition=AuthenticationPackageName =~ "(?i)NTLM",
+          then="Potential Pass-the-Hash lead",
+          else="Potential Pass-the-Ticket lead") AS Suspicion
+      FROM SecurityEvents
+      WHERE LogonType = "3"
+        AND TargetUserName =~ UserRegex
+        AND IpAddress =~ SourceIPRegex
+        AND AuthenticationPackageName =~ AuthPackageRegex
+        AND LogonProcessName =~ LogonProcessRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: EVTXPath
+    type: path
