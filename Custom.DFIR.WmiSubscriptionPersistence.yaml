@@ -1,81 +1,163 @@
 name: Custom.DFIR.WmiSubscriptionPersistence
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detects potential WMI permanent event subscription persistence on Windows systems.
+  Detect WMI subscription persistence via event filters, consumers, and filter-to-consumer bindings.
   
-  The artifact inspects MOF files under WBEM paths for suspicious __EventFilter,
-  consumer, and binding definitions, and reviews the registry list of autorecover
-  MOF entries that can be used to restore malicious subscriptions.
+  Queries the standard WMI repository registry paths and MOF files for __EventFilter,
+  __EventConsumer (ActiveScript, CommandLine), and __FilterToConsumerBinding instances.
+  Covers MITRE ATT&CK T1546.003 - Event Triggered Execution: WMI Event Subscription.
+
 reference:
   - https://attack.mitre.org/techniques/T1546.003/
 
 type: CLIENT
 
 parameters:
-  - name: TargetGlob
+  - name: WmiRegistryRoot
+    type: string
+    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM"
+    description: WMI repository registry root for CIMOM settings.
+  - name: MofGlob
     type: glob
     default: "C:/Windows/System32/wbem/**/*.mof"
-  - name: FileNameRegex
-    type: regex
-    default: '(?i).*(subscription|event|filter|consumer|binding|\.mof)$'
-  - name: MofContentRegex
-    type: regex
-    default: '(?is)(__EventFilter|EventConsumer|ToConsumerBinding|CommandLineEventConsumer|ActiveScriptEventConsumer|__IntervalTimerInstruction|ScriptText|ExecutablePath|CommandLineTemplate|Consumer=|Filter=)'
-  - name: RegistryGlob
+    description: Glob for MOF files that may define WMI subscriptions.
+  - name: AutoRecoveryMofGlob
     type: glob
-    default: "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/Autorecover MOFs/*"
-  - name: RegistryPathRegex
+    default: "C:/Windows/System32/wbem/AutoRecover/**/*.mof"
+    description: Glob for AutoRecover MOF files (persisted compiled subscriptions).
+  - name: FilterRegex
     type: regex
-    default: '(?i).*Autorecover MOFs.*'
-  - name: RegistryDataRegex
+    default: "(?i)(EventFilter|EventConsumer|FilterToConsumerBinding|ActiveScriptEventConsumer|CommandLineEventConsumer|__EventFilter|__EventConsumer|__FilterToConsumerBinding)"
+    description: Regex to match WMI subscription artifacts in MOF file content.
+  - name: SuspiciousConsumerRegex
     type: regex
-    default: '(?i).*(wbem|mof|subscription|consumer|filter|binding).*'
-  - name: MaxBytes
-    type: int
-    default: 1048576
+    default: "(?i)(cmd\\.exe|powershell|cscript|wscript|schtasks|net\\s+user|downloadstring|invoke-|rundll32|regsvr32|bitsadmin|certutil)"
+    description: Regex for suspicious commands inside WMI consumers.
 
 sources:
-  - name: MOFMatches
-    description: Scan MOF files for permanent WMI subscription definitions and suspicious consumer content.
+  - name: EventFilters
+    description: WMI __EventFilter instances from the repository.
     query: |
-      LET CandidateFiles <=
-        SELECT OSPath, Size, Mtime
-        FROM glob(globs=TargetGlob)
-        WHERE NOT IsDir
+      LET EventFilters <= SELECT
+          OSPath,
+          Data.name AS FilterName,
+          Data.Query AS FilterQuery,
+          Data.__NAMESPACE AS Namespace
+      FROM glob(
+          globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/__EventFilter/*",
+          accessor="registry")
 
       SELECT
-        OSPath,
-        Size,
-        Mtime,
-        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
-        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256,
-        read_file(filename=OSPath, length=MaxBytes) AS Content
-      FROM CandidateFiles
-      WHERE OSPath =~ FileNameRegex
-        OR read_file(filename=OSPath, length=MaxBytes) =~ MofContentRegex
+          FilterName,
+          FilterQuery,
+          Namespace,
+          "EventFilter" AS SubscriptionType,
+          OSPath
+      FROM EventFilters
+      WHERE FilterName
 
-  - name: RegistryAutorecoverMOFs
-    description: Review registry-managed autorecover MOF entries that may rehydrate malicious WMI subscriptions.
+  - name: EventConsumers
+    description: WMI __EventConsumer instances (ActiveScript and CommandLine) from the repository.
     query: |
-      LET RegEntries <=
-        SELECT OSPath, Mtime, Data, Type
-        FROM glob(globs=RegistryGlob, accessor="registry")
+      LET ActiveScriptConsumers <= SELECT
+          OSPath,
+          Data.name AS ConsumerName,
+          Data.ScriptText AS ScriptText,
+          Data.ScriptFileName AS ScriptFileName,
+          "ActiveScriptEventConsumer" AS ConsumerType
+      FROM glob(
+          globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/ActiveScriptEventConsumer/*",
+          accessor="registry")
+
+      LET CommandLineConsumers <= SELECT
+          OSPath,
+          Data.name AS ConsumerName,
+          Data.CommandLineTemplate AS CommandLineTemplate,
+          Data.ExecutablePath AS ExecutablePath,
+          "CommandLineEventConsumer" AS ConsumerType
+      FROM glob(
+          globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/CommandLineEventConsumer/*",
+          accessor="registry")
+
+      LET AllConsumers <= SELECT * FROM chain(
+          a={ SELECT * FROM ActiveScriptConsumers WHERE ConsumerName },
+          b={ SELECT * FROM CommandLineConsumers WHERE ConsumerName })
 
       SELECT
-        OSPath,
-        Mtime,
-        Type,
-        Data
-      FROM RegEntries
-      WHERE OSPath =~ RegistryPathRegex
-        AND format(format="%v", args=Data) =~ RegistryDataRegex
+          ConsumerName,
+          ConsumerType,
+          ScriptText,
+          ScriptFileName,
+          CommandLineTemplate,
+          ExecutablePath,
+          if(condition=CommandLineTemplate =~ SuspiciousConsumerRegex, then=True, else=False) AS SuspiciousCommand,
+          if(condition=ScriptText =~ SuspiciousConsumerRegex, then=True, else=False) AS SuspiciousScript,
+          OSPath
+      FROM AllConsumers
+
+  - name: FilterToConsumerBindings
+    description: WMI __FilterToConsumerBinding instances linking filters to consumers.
+    query: |
+      LET Bindings <= SELECT
+          OSPath,
+          Data.Filter AS FilterRef,
+          Data.Consumer AS ConsumerRef,
+          Data.__NAMESPACE AS Namespace
+      FROM glob(
+          globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/__FilterToConsumerBinding/*",
+          accessor="registry")
+
+      SELECT
+          FilterRef,
+          ConsumerRef,
+          Namespace,
+          "FilterToConsumerBinding" AS SubscriptionType,
+          OSPath
+      FROM Bindings
+      WHERE FilterRef
+
+  - name: MofFileSubscriptions
+    description: MOF files containing WMI subscription definitions (filters, consumers, bindings).
+    query: |
+      LET MofFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=MofGlob)
+      
+      LET AutoRecoverMofs <= SELECT OSPath, Size, Mtime FROM glob(globs=AutoRecoveryMofGlob)
+      
+      LET AllMofs <= SELECT * FROM chain(a={ SELECT * FROM MofFiles }, b={ SELECT * FROM AutoRecoverMofs })
+      
+      LET MofContent <= SELECT
+          OSPath,
+          Size,
+          Mtime,
+          read_file(filename=OSPath, length=1048576) AS Content
+      FROM AllMofs
+      WHERE Size > 0
+      
+      SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Content,
+          if(condition=Content =~ FilterRegex, then=True, else=False) AS ContainsSubscription
+      FROM MofContent
+      WHERE Content =~ FilterRegex
+
+  - name: Summary
+    description: Combined summary of all WMI subscription persistence artifacts found.
+    query: |
+      LET Filters <= SELECT FilterName, FilterQuery, "EventFilter" AS Type FROM EventFilters WHERE FilterName
+      
+      LET Consumers <= SELECT ConsumerName, ConsumerType AS Type, CommandLineTemplate, ScriptText FROM AllConsumers_0 WHERE ConsumerName
+      
+      LET BindingRefs <= SELECT FilterRef, ConsumerRef, "Binding" AS Type FROM Bindings WHERE FilterRef
+
+      SELECT * FROM chain(
+          a={ SELECT FilterName AS Name, Type, FilterQuery AS Detail FROM Filters },
+          b={ SELECT ConsumerName AS Name, Type, CommandLineTemplate AS Detail FROM Consumers },
+          c={ SELECT FilterRef AS Name, Type, ConsumerRef AS Detail FROM BindingRefs })
 
 column_types:
   - name: Mtime
     type: timestamp
   - name: OSPath
-    type: path
-  - name: MD5
-    type: hash
-  - name: SHA256
-    type: hash
+    type: filepath
