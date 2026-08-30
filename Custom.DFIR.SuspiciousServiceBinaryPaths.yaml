@@ -1,68 +1,140 @@
 name: Custom.DFIR.SuspiciousServiceBinaryPaths
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Enumerates Windows services with suspicious binary paths that may indicate persistence or privilege escalation.
-  
-  Checks all registered services for binary paths exhibiting common attacker patterns:
-  - Paths outside standard system directories (Program Files, Windows, System32)
-  - Paths referencing temp/user-writable directories
-  - Paths with suspicious keywords (download, update, patch, hack, crack, payload)
-  - Services running from non-standard drives or unusual extensions
-  
-  MITRE ATT&CK: T1543.003 - Create or Modify System Process: Windows Service
+  Enumerates Windows services with suspicious binary paths that may indicate persistence via service creation or modification (MITRE T1543.003).
+
+  This artifact queries the Windows registry for all installed services, then applies
+  heuristics to flag services whose ImagePath (binary path) exhibits characteristics
+  commonly associated with malware persistence:
+  - Binaries located in user-writable directories (Users, Temp, AppData, Public, Downloads)
+  - Binaries outside standard Windows directories (System32, SysWOW64, Program Files)
+  - Paths using suspicious file extensions or no extension
+  - Services with no description but a non-standard binary path
+  - Services configured for auto-start with unusual binary locations
+
+  Results include service name, display name, binary path, start type, and suspicious
+  indicators matched, enabling rapid triage of potential persistence mechanisms.
 
 reference:
-  - https://attack.mitre.org/techniques/T1543.003/
+  - https://attack.mitre.org/techniques/T1543/003/
 
 type: CLIENT
 
 parameters:
-  - name: SuspiciousKeywordsRegex
+  - name: SuspiciousPathRegex
     type: regex
-    default: "(?i)(download|update|patch|hack|crack|payload|shell|reverse|bind|dropper|loader|backdoor|c2|beacon|stager|tmp|temp|public|appdata|programdata)"
-    description: Regex pattern for suspicious keywords in binary paths
-  - name: SuspiciousExtensionsRegex
+    default: '(?i)(C:\\Users\\|C:\\Temp\\|C:\\Windows\\Temp\\|AppData|\\Downloads\\|\\Public\\|C:\\PerfLogs\\|C:\\ProgramData\\)'
+    description: Regex matching directories that are user-writable and commonly abused by attackers for service binaries.
+  - name: StandardPathRegex
     type: regex
-    default: "(?i)\\.(bat|cmd|ps1|vbs|js|hta|scr|com|pif|dll|tmp)$"
-    description: Regex for suspicious executable extensions
-  - name: TrustedPathRegex
+    default: '(?i)(C:\\Windows\\System32|C:\\Windows\\SysWOW64|C:\\Program Files|C:\\Program Files \(x86\))'
+    description: Regex matching standard Windows binary directories. Services outside these paths are flagged.
+  - name: SuspiciousExtensionRegex
     type: regex
-    default: "(?i)^(C:\\\\Windows\\\\|C:\\\\Windows\\\\System32\\\\|C:\\\\Windows\\\\SysWOW64\\\\|C:\\\\Program Files\\\\|C:\\\\Program Files \\(x86\\)\\\\)"
-    description: Regex for trusted system paths (services outside these are flagged)
+    default: '(?i)\.(bat|cmd|vbs|js|ps1|scr|com|pif)$'
+    description: Regex matching suspicious executable extensions for service binaries.
+  - name: EnableHash
+    type: bool
+    default: Y
+    description: If enabled, compute MD5 and SHA256 hashes of discovered service binaries.
 
 sources:
   - name: SuspiciousServices
-    description: Enumerates services with suspicious binary paths
+    description: Lists all services and flags those with suspicious binary paths.
     query: |
-      LET ServiceImagePaths <= SELECT
-        OSPath AS KeyPath,
-        basename(path=OSPath) AS ServiceName,
-        Data.value AS BinaryPath
-      FROM glob(
-        globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/*/ImagePath",
-        accessor="registry")
-      WHERE Data.value AND len(list=Data.value) > 0
+      LET Services <= SELECT
+          OSPath AS RegKey,
+          get(field="DisplayName") AS DisplayName,
+          get(field="ImagePath") AS ImagePath,
+          get(field="Start") AS StartType,
+          get(field="Type") AS ServiceType,
+          get(field="Description") AS Description,
+          get(field="ObjectName") AS ServiceAccount,
+          get(field="ErrorControl") AS ErrorControl
+      FROM glob(globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/*", accessor="registry")
+      WHERE ImagePath
 
-      LET Enriched <= SELECT
-        ServiceName,
-        BinaryPath,
-        BinaryPath =~ SuspiciousKeywordsRegex AS KeywordHit,
-        BinaryPath =~ SuspiciousExtensionsRegex AS ExtHit,
-        BinaryPath =~ TrustedPathRegex AS TrustedPath
-      FROM ServiceImagePaths
+      LET StartTypeMap <= dict(
+          `0`="Boot",
+          `1`="System",
+          `2`="Auto Start",
+          `3`="Manual",
+          `4`="Disabled"
+      )
+
+      LET NormalizedServices <= SELECT
+          RegKey,
+          DisplayName,
+          ImagePath,
+          StartType,
+          get(item=StartTypeMap, field=str(str=StartType)) AS StartTypeName,
+          ServiceType,
+          Description,
+          ServiceAccount,
+          ErrorControl
+      FROM Services
+
+      LET FlaggedServices <= SELECT
+          RegKey,
+          DisplayName,
+          ImagePath,
+          StartTypeName,
+          ServiceType,
+          Description,
+          ServiceAccount,
+          ErrorControl,
+          if(condition=ImagePath =~ SuspiciousPathRegex, then=1, else=0) AS InSuspiciousDir,
+          if(condition=NOT (ImagePath =~ StandardPathRegex), then=1, else=0) AS OutsideStandardDir,
+          if(condition=ImagePath =~ SuspiciousExtensionRegex, then=1, else=0) AS SuspiciousExt,
+          if(condition=NOT Description AND NOT (ImagePath =~ StandardPathRegex), then=1, else=0) AS NoDescriptionNonStandard,
+          if(condition=StartType = "2" AND NOT (ImagePath =~ StandardPathRegex), then=1, else=0) AS AutoStartNonStandard
+      FROM NormalizedServices
+
+      LET WithRiskScore <= SELECT
+          RegKey,
+          DisplayName,
+          ImagePath,
+          StartTypeName,
+          ServiceType,
+          Description,
+          ServiceAccount,
+          ErrorControl,
+          InSuspiciousDir,
+          OutsideStandardDir,
+          SuspiciousExt,
+          NoDescriptionNonStandard,
+          AutoStartNonStandard,
+          InSuspiciousDir + OutsideStandardDir + SuspiciousExt + NoDescriptionNonStandard + AutoStartNonStandard AS RiskScore
+      FROM FlaggedServices
 
       SELECT
-        ServiceName,
-        BinaryPath,
-        if(condition=KeywordHit, then="KeywordMatch",
-           else=if(condition=ExtHit, then="SuspiciousExtension",
-           else=if(condition=TrustedPath = False, then="NonStandardPath",
-           else="Normal"))) AS SuspicionReason,
-        hash(path=BinaryPath, hashselect="MD5,SHA256") AS BinaryHash,
-        stat(accessor="file", filename=BinaryPath) AS BinaryStat
-      FROM Enriched
-      WHERE KeywordHit OR ExtHit OR TrustedPath = False
+          RegKey,
+          DisplayName,
+          ImagePath,
+          StartTypeName,
+          ServiceType,
+          Description,
+          ServiceAccount,
+          ErrorControl,
+          InSuspiciousDir,
+          OutsideStandardDir,
+          SuspiciousExt,
+          NoDescriptionNonStandard,
+          AutoStartNonStandard,
+          RiskScore,
+          if(condition=EnableHash AND RiskScore > 0,
+              then={
+                  SELECT hash(path=ImagePath, hashselect="MD5,SHA256") AS Hashes
+                  FROM scope()
+              },
+              else={ SELECT NULL AS Hashes FROM scope() }
+          ) AS Hashes
+      FROM WithRiskScore
+      WHERE RiskScore > 0
+      ORDER BY RiskScore DESC
 
 column_types:
-  - name: BinaryPath
+  - name: ImagePath
     type: path
+  - name: Hashes
+    type: dict
