@@ -1,0 +1,168 @@
+name: Custom.DFIR.TempCompressionExfil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects evidence of data staged and compressed in temp directories for exfiltration.
+  
+  This artifact scans common temp directories for archive files (zip, tar, gz, 7z, rar, cab)
+  that may indicate data being staged for exfiltration. It also looks for recently executed
+  compression utilities and checks for large files in temp dirs that could be staged data
+  awaiting compression or transfer.
+
+reference:
+  - https://attack.mitre.org/techniques/T1560/001/
+
+type: CLIENT
+
+parameters:
+  - name: TempGlob
+    description: Glob pattern for temp directories to scan
+    type: glob
+    default: "C:/Users/*/AppData/Local/Temp/**"
+  - name: SystemTempGlob
+    description: Glob pattern for system temp directories
+    type: glob
+    default: "C:/Windows/Temp/**"
+  - name: ArchiveRegex
+    description: Regex to match archive file extensions
+    type: regex
+    default: "\\.(zip|tar|tar\\.gz|tgz|7z|rar|cab|gz|bz2|xz)$"
+  - name: LargeFileThreshold
+    description: Minimum file size in bytes to flag as suspiciously large in temp
+    type: int
+    default: 10485760
+  - name: ProcessRegex
+    description: Regex to match compression utility process names
+    type: regex
+    default: "(7z|7za|7zr|tar|zip|gzip|winrar|rar|compress|ar|cabarc|makecab)"
+  - name: LookBackHours
+    description: How many hours back to check for process activity
+    type: int
+    default: 48
+
+sources:
+  - name: ArchiveFilesInTemp
+    description: Finds archive files in temp directories that may indicate staging for exfiltration
+    query: |
+      LET TempArchives <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=TempGlob)
+        WHERE OSPath =~ ArchiveRegex AND Size > 0
+      
+      LET SystemTempArchives <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=SystemTempGlob)
+        WHERE OSPath =~ ArchiveRegex AND Size > 0
+      
+      LET AllArchives <= SELECT * FROM chain(
+        a={ SELECT OSPath, Size, Mtime, Atime, Ctime FROM TempArchives },
+        b={ SELECT OSPath, Size, Mtime, Atime, Ctime FROM SystemTempArchives }
+      )
+      
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM AllArchives
+      ORDER BY Mtime DESC
+
+  - name: LargeFilesInTemp
+    description: Finds unusually large files in temp directories that may be staged data
+    query: |
+      LET TempLargeFiles <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=TempGlob)
+        WHERE Size > LargeFileThreshold AND NOT OSPath =~ ArchiveRegex
+      
+      LET SystemTempLargeFiles <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=SystemTempGlob)
+        WHERE Size > LargeFileThreshold AND NOT OSPath =~ ArchiveRegex
+      
+      LET AllLargeFiles <= SELECT * FROM chain(
+        a={ SELECT OSPath, Size, Mtime, Ctime FROM TempLargeFiles },
+        b={ SELECT OSPath, Size, Mtime, Ctime FROM SystemTempLargeFiles }
+      )
+      
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM AllLargeFiles
+      ORDER BY Size DESC
+
+  - name: CompressionProcesses
+    description: Finds running or recently active compression utility processes
+    query: |
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM pslist()
+      WHERE Name =~ ProcessRegex
+
+  - name: CompressionToolBinaries
+    description: Finds compression utility binaries in temp directories (standalone executables dropped by attackers)
+    query: |
+      LET TempBinaries <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=TempGlob)
+        WHERE OSPath =~ "\\.(exe|dll|bat|ps1|cmd|vbs)$"
+        AND (
+          OSPath =~ ProcessRegex
+          OR OSPath =~ "(7z|tar|zip|rar|compress|cab)"
+        )
+      
+      LET SystemTempBinaries <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=SystemTempGlob)
+        WHERE OSPath =~ "\\.(exe|dll|bat|ps1|cmd|vbs)$"
+        AND (
+          OSPath =~ ProcessRegex
+          OR OSPath =~ "(7z|tar|zip|rar|compress|cab)"
+        )
+      
+      LET AllBinaries <= SELECT * FROM chain(
+        a={ SELECT OSPath, Size, Mtime, Ctime FROM TempBinaries },
+        b={ SELECT OSPath, Size, Mtime, Ctime FROM SystemTempBinaries }
+      )
+      
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM AllBinaries
+      ORDER BY Mtime DESC
+
+  - name: PrefetchCompressionEvidence
+    description: Checks Windows Prefetch for recent compression tool execution
+    query: |
+      LET PrefetchFiles <= SELECT OSPath, Mtime
+        FROM glob(globs="C:/Windows/Prefetch/*.pf")
+        WHERE OSPath =~ ProcessRegex
+      
+      SELECT
+        OSPath,
+        Mtime,
+        if(condition=OSPath =~ "7z", then="7-Zip",
+           else=if(condition=OSPath =~ "tar", then="tar",
+           else=if(condition=OSPath =~ "zip", then="zip",
+           else=if(condition=OSPath =~ "rar", then="WinRAR",
+           else=if(condition=OSPath =~ "cab", then="CAB tool",
+           else="Unknown"))))) AS ToolName
+      FROM PrefetchFiles
+      ORDER BY Mtime DESC
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
