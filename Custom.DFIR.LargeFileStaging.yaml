@@ -1,105 +1,106 @@
 name: Custom.DFIR.LargeFileStaging
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detect large files staged in temp and user directories before exfiltration.
-  
-  Adversaries often collect and stage data in local directories (e.g., temp folders,
-  user profiles, AppData) prior to exfiltration. This artifact identifies files
-  exceeding a configurable size threshold in known staging locations, helping
-  analysts spot pre-exfiltration activity early.
+  Detects large files staged in temporary and user directories that may indicate
+  collection and staging activity prior to exfiltration (MITRE ATT&CK T1074.001).
+
+  Adversaries often collect and stage large files in temp directories, user
+  profiles, or other writable locations before compressing and exfiltrating them.
+  This artifact scans common staging paths for files exceeding a size threshold,
+  flags recently modified files, and computes hashes for identification.
 
 reference:
-  - https://attack.mitre.org/techniques/T1074.001/
+  - https://attack.mitre.org/techniques/T1074/001/
 
 type: CLIENT
 
 parameters:
-  - name: SizeThresholdMB
+  - name: MinSizeMB
     type: int
-    default: "10"
-    description: Minimum file size in MB to flag as suspicious staging.
-  - name: TempGlobs
-    type: csv
-    default: |
-      Glob
-      C:/Windows/Temp/**/*
-      C:/Users/*/AppData/Local/Temp/**/*
-      C:/Users/*/Downloads/**/*
-      C:/Users/*/Desktop/**/*
-      /tmp/**/*
-      /var/tmp/**/*
-      /home/*/.cache/**/*
-      /home/*/Downloads/**/*
-  - name: SuspiciousExtensionsRegex
+    default: 50
+    description: Minimum file size in MB to flag as staged
+  - name: RecentDays
+    type: int
+    default: 7
+    description: Only show files modified within this many days
+  - name: TempGlob
+    type: glob
+    default: "C:/Windows/Temp/**"
+    description: Windows system temp directory glob
+  - name: UserTempGlob
+    type: glob
+    default: "C:/Users/*/AppData/Local/Temp/**"
+    description: Per-user temp directory glob
+  - name: UserProfileGlob
+    type: glob
+    default: "C:/Users/*/Downloads/**"
+    description: User Downloads directory glob
+  - name: StagingRegex
     type: regex
-    default: "\\.(zip|rar|7z|tar|gz|bz2|xz|cab|iso|dmg|exe|ps1|bat|cmd|psd1|vbs|vbe|doc|docx|xls|xlsx|ppt|pptx|pdf|csv|sql|bak|conf|cfg|ini|yml|yaml|json|xml)$"
-    description: Regex matching file extensions commonly associated with staged data.
-  - name: IgnoreRegex
-    type: regex
-    default: "\\.(log|tmp|lock|pid|sock)$"
-    description: Regex for file extensions to ignore (reduce noise).
+    default: "(?i)\\.(zip|rar|7z|tar|gz|iso|img|vhd|dmp|csv|pst|ost|db|sqlite)$"
+    description: Regex to match suspicious staging file extensions
 
 sources:
-  - name: StagedFiles
-    description: Find large files in common staging directories.
+  - name: TempDirStaging
+    description: Scans Windows system and user temp directories for large staged files
     query: |
-      LET SizeBytes <= SizeThresholdMB * 1048576
+      LET MinBytes = MinSizeMB * 1024 * 1024
+      LET Cutoff = timestamp(epoch=now() - RecentDays * 86400)
 
-      LET AllFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime,
-         basename(path=OSPath) AS Name
-      FROM foreach(row={
-         SELECT * FROM parse_csv(filename=TempGlobs, accessor="data")
-      }, query={
-         SELECT OSPath, Size, Mtime, Atime, Ctime
-         FROM glob(globs=Glob)
-         WHERE Size > SizeBytes
-            AND NOT Name =~ IgnoreRegex
-      })
+      LET TempFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=TempGlob)
+        WHERE NOT IsDir AND Size > MinBytes
 
-      SELECT OSPath, Size, Mtime, Atime, Ctime, Name,
-         if(condition=Name =~ SuspiciousExtensionsRegex,
-            then="Suspicious Extension",
-            else="Large File") AS MatchReason,
-         hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
-      FROM AllFiles
-      WHERE OSPath =~ "."
+      LET UserTempFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=UserTempGlob)
+        WHERE NOT IsDir AND Size > MinBytes
 
-  - name: StagedFileSummary
-    description: Summary statistics of staging activity per directory.
+      LET AllTempFiles <= SELECT * FROM chain(
+        a={ SELECT * FROM TempFiles },
+        b={ SELECT * FROM UserTempFiles }
+      )
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM AllTempFiles
+      WHERE Mtime > Cutoff
+      ORDER BY Size DESC
+
+  - name: UserDownloadsStaging
+    description: Scans user Downloads directories for large archived files matching staging patterns
     query: |
-      LET SizeBytes <= SizeThresholdMB * 1048576
+      LET MinBytes = MinSizeMB * 1024 * 1024
+      LET Cutoff = timestamp(epoch=now() - RecentDays * 86400)
 
-      LET AllFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime,
-         basename(path=OSPath) AS Name,
-         dirname(path=OSPath) AS Directory
-      FROM foreach(row={
-         SELECT * FROM parse_csv(filename=TempGlobs, accessor="data")
-      }, query={
-         SELECT OSPath, Size, Mtime, Atime, Ctime
-         FROM glob(globs=Glob)
-         WHERE Size > SizeBytes
-            AND NOT Name =~ IgnoreRegex
-      })
+      LET DownloadFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
+        FROM glob(globs=UserProfileGlob)
+        WHERE NOT IsDir AND Size > MinBytes
 
-      SELECT Directory,
-         count() AS FileCount,
-         sum(item=Size) AS TotalSize,
-         min(item=Mtime) AS OldestFile,
-         max(item=Mtime) AS NewestFile
-      FROM AllFiles
-      WHERE OSPath =~ "."
-      GROUP BY Directory
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        OSPath =~ StagingRegex AS MatchesStagingPattern,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM DownloadFiles
+      WHERE Mtime > Cutoff
+      ORDER BY Size DESC
 
 column_types:
+  - name: OSPath
+    type: path
   - name: Mtime
     type: timestamp
   - name: Atime
     type: timestamp
   - name: Ctime
     type: timestamp
-  - name: OldestFile
-    type: timestamp
-  - name: NewestFile
-    type: timestamp
-  - name: OSPath
-    type: path
+  - name: Size
+    type: number
