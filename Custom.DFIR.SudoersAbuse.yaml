@@ -1,11 +1,14 @@
 name: Custom.DFIR.SudoersAbuse
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detect evidence of sudo rule abuse or new NOPASSWD entries in sudoers configuration.
-  
-  Adversaries may modify sudoers files to elevate privileges, often adding NOPASSWD entries
-  to bypass authentication (MITRE ATT&CK T1548.003). This artifact collects and analyzes
-  sudoers configuration files, sudoers.d entries, and sudo log entries for signs of abuse.
+  Detects evidence of sudo rule abuse and unauthorized NOPASSWD entries in sudoers configuration.
+
+  This artifact scans /etc/sudoers and /etc/sudoers.d/* for NOPASSWD directives,
+  suspicious user/group rule additions, and recently modified sudoers files.
+  It also checks sudo log entries for privilege escalation activity and
+  examines running processes for those executing under sudo context.
+
+  MITRE ATT&CK T1548.003 - Abuse Elevation Control Mechanism: Sudo and Sudo Caching.
 
 reference:
   - https://attack.mitre.org/techniques/T1548.003/
@@ -15,97 +18,138 @@ type: CLIENT
 parameters:
   - name: SudoersGlob
     type: glob
-    default: "/etc/sudoers,/etc/sudoers.d/*"
-  - name: FilterRegex
-    type: regex
-    default: "(?i)(nopasswd|\\(root\\)|\\(all\\)|\\ball\\b.*\\ball\\b|\\b!root\\b|\\b\\(ALL\\s*:\\s*ALL\\))"
+    default: "/etc/sudoers"
+    description: Main sudoers file path.
+
+  - name: SudoersDGlob
+    type: glob
+    default: "/etc/sudoers.d/*"
+    description: Drop-in sudoers directory glob.
+
   - name: SudoLogGlob
     type: glob
-    default: "/var/log/sudo*"
+    default: "/var/log/sudo.log"
+    description: sudo log file path (may vary by distro).
+
   - name: AuthLogGlob
     type: glob
     default: "/var/log/auth.log*"
+    description: Auth log files for sudo session events.
+
+  - name: NopasswdRegex
+    type: regex
+    default: "NOPASSWD"
+    description: Regex to match NOPASSWD directives in sudoers files.
+
+  - name: SuspiciousSudoRegex
+    type: regex
+    default: "(ALL\\s*=\\s*ALL|ALL\\s*\\(ALL\\)|!authenticate|authenticate!)"
+    description: Regex for overly permissive or dangerous sudo rules.
+
+  - name: SudoAuthRegex
+    type: regex
+    default: "sudo.*COMMAND|sudo.*session|sudo:.*authentication"
+    description: Regex for sudo-related auth log entries.
 
 sources:
   - name: SudoersFiles
-    description: Collect and analyze sudoers configuration files for NOPASSWD and permissive rules.
+    description: Parse main sudoers and drop-in files for NOPASSWD and suspicious rules.
     query: |
-      LET SudoersFiles <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=SudoersGlob)
-      
-      LET ParsedLines <= SELECT OSPath, Line
-        FROM foreach(
-          row=SudoersFiles,
-          query={
-            SELECT OSPath, Line
-            FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
-            WHERE NOT Line =~ "^\s*#" AND NOT Line =~ "^\s*$"
-          })
-      
-      SELECT
-        OSPath AS SudoersFile,
-        Line,
-        Mtime,
-        if(condition=Line =~ "(?i)nopasswd", then="NOPASSWD", else="PermissiveRule") AS RuleType
-      FROM ParsedLines
-      WHERE Line =~ FilterRegex
+      LET SudoersPaths <= SELECT OSPath, Size, Mtime FROM glob(globs=SudoersGlob)
+      LET SudoersDPaths <= SELECT OSPath, Size, Mtime FROM glob(globs=SudoersDGlob)
+      LET AllSudoers <= SELECT * FROM chain(
+        a={ SELECT * FROM SudoersPaths },
+        b={ SELECT * FROM SudoersDPaths })
 
-  - name: SudoersDEntries
-    description: Enumerate all files in /etc/sudoers.d/ with metadata and content.
-    query: |
-      LET SudoersDEntries <= SELECT OSPath, Size, Mtime
-        FROM glob(globs="/etc/sudoers.d/*")
-      
-      SELECT
+      LET ParsedLines <= SELECT
         OSPath,
         Size,
         Mtime,
-        read_file(filename=OSPath, length=4096) AS Content,
-        if(condition=Content =~ "(?i)nopasswd", then=true, else=false) AS HasNopasswd
-      FROM SudoersDEntries
+        Line,
+        if(condition=Line =~ NopasswdRegex, then=TRUE, else=FALSE) AS HasNOPASSWD,
+        if(condition=Line =~ SuspiciousSudoRegex, then=TRUE, else=FALSE) AS IsSuspicious
+      FROM foreach(
+        row=AllSudoers,
+        query={
+          SELECT OSPath, Size, Mtime, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+        })
 
-  - name: SudoLogs
-    description: Collect sudo log entries showing command executions with timestamp and user.
+      SELECT
+        OSPath AS SudoersFile,
+        Mtime,
+        Line,
+        HasNOPASSWD,
+        IsSuspicious
+      FROM ParsedLines
+      WHERE HasNOPASSWD OR IsSuspicious OR Line =~ "^\\s*Defaults"
+      ORDER BY OSPath
+
+  - name: SudoersFileMetadata
+    description: Metadata for all sudoers files including modification times and hashes.
     query: |
-      LET SudoLogFiles <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=SudoLogGlob)
-      
+      LET AllFiles <= SELECT * FROM chain(
+        a={ SELECT OSPath, Size, Mtime FROM glob(globs=SudoersGlob) },
+        b={ SELECT OSPath, Size, Mtime FROM glob(globs=SudoersDGlob) })
+
+      SELECT
+        OSPath AS SudoersFile,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM AllFiles
+
+  - name: SudoAuthLogEntries
+    description: Parse auth logs for sudo session and command execution events.
+    query: |
+      LET AuthFiles <= SELECT OSPath FROM glob(globs=AuthLogGlob)
+
       SELECT
         OSPath AS LogFile,
-        Line,
-        Mtime
+        Line
+      FROM foreach(
+        row=AuthFiles,
+        query={
+          SELECT OSPath, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+        })
+      WHERE Line =~ SudoAuthRegex
+
+  - name: SudoLogEntries
+    description: Parse the dedicated sudo log file if it exists for command audit trail.
+    query: |
+      LET SudoLogFiles <= SELECT OSPath FROM glob(globs=SudoLogGlob)
+
+      SELECT
+        OSPath AS SudoLogFile,
+        Line
       FROM foreach(
         row=SudoLogFiles,
         query={
-          SELECT OSPath, Line, Mtime
+          SELECT OSPath, Line
           FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
-          WHERE Line =~ "(?i)sudo"
         })
 
-  - name: AuthLogSudoEntries
-    description: Collect auth.log entries related to sudo usage for privilege escalation audit.
+  - name: SudoProcesses
+    description: List currently running processes that may be executing under sudo context.
     query: |
-      LET AuthLogFiles <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=AuthLogGlob)
-      
+      LET Procs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username FROM pslist()
+
       SELECT
-        OSPath AS AuthLogFile,
-        Line,
-        Mtime
-      FROM foreach(
-        row=AuthLogFiles,
-        query={
-          SELECT OSPath, Line, Mtime
-          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
-          WHERE Line =~ "(?i)sudo|privilege|escalat"
-        })
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username
+      FROM Procs
+      WHERE
+        Username =~ "root" AND Ppid > 0
+        OR CommandLine =~ "(?i)sudo"
+        OR Name =~ "(?i)sudo"
 
 column_types:
   - name: Mtime
     type: timestamp
-  - name: SudoersFile
-    type: path
-  - name: LogFile
-    type: path
-  - name: AuthLogFile
-    type: path
+  - name: Hashes
+    type: hash
