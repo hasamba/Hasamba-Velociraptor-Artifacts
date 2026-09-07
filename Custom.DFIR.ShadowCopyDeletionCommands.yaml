@@ -1,243 +1,189 @@
 name: Custom.DFIR.ShadowCopyDeletionCommands
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detects shadow copy deletion and shadow storage tampering commands in Windows process execution logs.
+  Detects attempts to delete Volume Shadow Copy Service (VSS) snapshots via
+  command-line tooling: vssadmin.exe delete shadows, wmic shadowcopy delete,
+  diskshadow delete shadows, and PowerShell Win32_ShadowCopy WMI delete calls.
 
-  Ransomware and destructive intrusions often remove Volume Shadow Copy Service recovery points before encryption or
-  wiping activity. This artifact searches Security 4688 process creation, Sysmon Event ID 1 process creation, and
-  PowerShell 4104 script block logs for vssadmin, wmic, and PowerShell/WMI command patterns commonly used to delete
-  or weaken shadow copy recovery evidence.
-
-  Aligned with MITRE ATT&CK T1490 - Inhibit System Recovery.
+  Shadow copy deletion (MITRE ATT&CK T1490 - Inhibit System Recovery) is a
+  hallmark precursor of ransomware deployment and destructive attacks, removing
+  the primary local recovery path. This artifact correlates historical process
+  telemetry from three Windows event channels (Security 4688 process creation,
+  Sysmon Event ID 1 process creation, PowerShell 4104 script blocks) and adds a
+  live process sweep for vssadmin/wmic/diskshadow. Security 4688 command lines
+  require the "Audit Process Creation" and command-line auditing policies to be
+  enabled on the endpoint.
 
 reference:
   - https://attack.mitre.org/techniques/T1490/
-  - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/vssadmin-delete-shadows
-  - https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+  - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/vssadmin
+  - https://learn.microsoft.com/en-us/previous-versions/windows/desktop/vsswmi/delete-method-in-class-win32-shadowcopy
 
 type: CLIENT
 
 parameters:
-  - name: SecurityLogGlob
+  - name: SecurityEvtxGlob
+    description: Glob for the Security event log
     type: glob
     default: "C:/Windows/System32/winevt/Logs/Security.evtx"
-    description: Security event log path used to search Windows process creation event ID 4688.
-  - name: SysmonLogGlob
+  - name: SysmonEvtxGlob
+    description: Glob for the Sysmon operational event log (optional channel)
     type: glob
     default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
-    description: Sysmon Operational event log path used to search process creation event ID 1.
-  - name: PowerShellLogGlob
+  - name: PowerShellEvtxGlob
+    description: Glob for the PowerShell operational event log
     type: glob
     default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-PowerShell%4Operational.evtx"
-    description: PowerShell Operational event log path used to search script block logging event ID 4104.
-  - name: ToolRegex
-    type: regex
-    default: '(?i)\\b(vssadmin(?:\\.exe)?|wmic(?:\\.exe)?|powershell(?:\\.exe)?|pwsh(?:\\.exe)?|cmd(?:\\.exe)?)\\b'
-    description: Process image or script text must match this tool regex.
-  - name: ShadowDeletionRegex
-    type: regex
-    default: '(?i)(delete\\s+shadows|shadowcopy\\s+delete|win32_shadowcopy.*\\.delete\\(|win32_shadowcopy.*delete|remove-wmiobject\\s+.*win32_shadowcopy|resize\\s+shadowstorage\\s+.*(?:/maxsize=|/for=).*(?:401mb|300mb|1mb|unbounded))'
-    description: Command-line or script text pattern for shadow copy deletion or suspicious shadow storage changes.
-  - name: UserRegex
-    type: regex
-    default: "."
-    description: Return only events whose user field matches this regex.
-  - name: ImageRegex
-    type: regex
-    default: "."
-    description: Return only events whose process image field matches this regex.
   - name: CommandLineRegex
+    description: Regex matching shadow copy deletion command patterns
     type: regex
-    default: "."
-    description: Additional command-line filter applied after shadow deletion matching.
-  - name: ParentImageRegex
+    default: "(?i)(vssadmin.{0,80}delete.{0,80}shadow|wmic.{0,200}(shadowcopy|stdshadowcopy|win32_shadowcopy).{0,200}delete|win32_shadowcopy.{0,80}delete|(Get-WmiObject|Get-CimInstance).{0,120}win32_shadowcopy|diskshadow.{0,200}delete.{0,80}shadow|delete\\s+shadows|delete.{0,16}shadow)"
+  - name: ProcessNameRegex
+    description: Regex for suspicious shadow copy tool process names (live sweep)
     type: regex
-    default: "."
-    description: Return only events whose parent process image field matches this regex.
-  - name: IncludePowerShellScriptBlocks
-    type: bool
-    default: true
-    description: Search PowerShell 4104 script block logs for WMI shadow copy deletion patterns.
+    default: "(?i)(vssadmin|wmic|diskshadow)\\.exe$"
+  - name: DaysBack
+    description: Only consider events newer than this many days
+    type: int64
+    default: 30
 
 sources:
   - name: Security4688ProcessCreation
-    description: Security 4688 process creation events containing vssadmin or wmic shadow copy deletion commands.
+    description: Security event log 4688 process creation events with shadow copy deletion commands
     query: |
-      LET SecurityEvents <= SELECT
-          OSPath AS EvtxPath,
-          System.TimeCreated.SystemTime AS EventTime,
-          System.EventID.Value AS EventID,
-          EventData.NewProcessName AS Image,
-          EventData.CommandLine AS CommandLine,
-          EventData.ParentProcessName AS ParentImage,
-          EventData.SubjectUserName AS Username,
-          EventData.SubjectDomainName AS UserDomain,
-          EventData.NewProcessId AS ProcessId,
-          EventData.ProcessId AS ParentProcessId,
-          "Security4688" AS EvidenceType
-        FROM foreach(
-          row={
-            SELECT OSPath
-            FROM glob(globs=SecurityLogGlob)
-          },
-          query={
-            SELECT *
-            FROM parse_evtx(filename=OSPath)
-            WHERE System.EventID.Value = 4688
-          })
+      LET SecurityFiles <= SELECT OSPath FROM glob(globs=SecurityEvtxGlob)
+      LET TimeLowerBound <= now() - DaysBack * 86400
 
       SELECT
         EventTime,
-        EvidenceType,
         EventID,
-        Username,
-        UserDomain,
-        Image,
+        Computer,
+        AccountDomain,
+        AccountName,
+        NewProcessId,
+        NewProcessName,
+        CreatorProcessId,
+        ParentProcessName,
         CommandLine,
-        ParentImage,
-        ProcessId,
-        ParentProcessId,
-        EvtxPath,
-        if(condition=CommandLine =~ '(?i)(/quiet|/all|/nointeractive|shadowcopy)', then="HIGH", else="REVIEW") AS RiskLevel
-      FROM SecurityEvents
-      WHERE Username =~ UserRegex
-        AND Image =~ ImageRegex
-        AND ParentImage =~ ParentImageRegex
-        AND CommandLine =~ CommandLineRegex
-        AND (Image =~ ToolRegex OR CommandLine =~ ToolRegex)
-        AND CommandLine =~ ShadowDeletionRegex
+        EvtxPath
+      FROM foreach(
+        row=SecurityFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            System.EventID.Value AS EventID,
+            System.Computer AS Computer,
+            EventData.SubjectDomainName AS AccountDomain,
+            EventData.SubjectUserName AS AccountName,
+            EventData.NewProcessId AS NewProcessId,
+            EventData.NewProcessName AS NewProcessName,
+            EventData.ProcessId AS CreatorProcessId,
+            EventData.ParentProcessName AS ParentProcessName,
+            EventData.CommandLine AS CommandLine,
+            OSPath AS EvtxPath
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+        })
+      WHERE CommandLine =~ CommandLineRegex
+        AND EventTime > TimeLowerBound
 
-  - name: SysmonProcessCreation
-    description: Sysmon Event ID 1 process creation events containing shadow copy deletion or shadow storage tampering commands.
+  - name: SysmonProcessCreate
+    description: Sysmon Event ID 1 process creation events with shadow copy deletion commands
     query: |
-      LET SysmonEvents <= SELECT
-          OSPath AS EvtxPath,
-          System.TimeCreated.SystemTime AS EventTime,
-          System.EventID.Value AS EventID,
-          EventData.UtcTime AS UtcTime,
-          EventData.ProcessGuid AS ProcessGuid,
-          EventData.ProcessId AS ProcessId,
-          EventData.Image AS Image,
-          EventData.CommandLine AS CommandLine,
-          EventData.CurrentDirectory AS CurrentDirectory,
-          EventData.User AS Username,
-          EventData.ParentProcessGuid AS ParentProcessGuid,
-          EventData.ParentProcessId AS ParentProcessId,
-          EventData.ParentImage AS ParentImage,
-          EventData.ParentCommandLine AS ParentCommandLine,
-          EventData.Hashes AS Hashes,
-          "SysmonEvent1" AS EvidenceType
-        FROM foreach(
-          row={
-            SELECT OSPath
-            FROM glob(globs=SysmonLogGlob)
-          },
-          query={
-            SELECT *
-            FROM parse_evtx(filename=OSPath)
-            WHERE System.EventID.Value = 1
-          })
+      LET SysmonFiles <= SELECT OSPath FROM glob(globs=SysmonEvtxGlob)
+      LET TimeLowerBound <= now() - DaysBack * 86400
 
       SELECT
         EventTime,
-        UtcTime,
-        EvidenceType,
-        EventID,
-        Username,
-        ProcessGuid,
-        ProcessId,
+        User,
         Image,
+        OriginalFileName,
         CommandLine,
-        CurrentDirectory,
-        ParentProcessGuid,
-        ParentProcessId,
         ParentImage,
-        ParentCommandLine,
-        Hashes,
-        EvtxPath,
-        if(condition=CommandLine =~ '(?i)(/quiet|/all|/nointeractive|shadowcopy)', then="HIGH", else="REVIEW") AS RiskLevel
-      FROM SysmonEvents
-      WHERE Username =~ UserRegex
-        AND Image =~ ImageRegex
-        AND ParentImage =~ ParentImageRegex
-        AND CommandLine =~ CommandLineRegex
-        AND (Image =~ ToolRegex OR CommandLine =~ ToolRegex)
-        AND CommandLine =~ ShadowDeletionRegex
+        EvtxPath
+      FROM foreach(
+        row=SysmonFiles,
+        query={
+          SELECT
+            System.TimeCreated.SystemTime AS EventTime,
+            EventData.User AS User,
+            EventData.Image AS Image,
+            EventData.OriginalFileName AS OriginalFileName,
+            EventData.CommandLine AS CommandLine,
+            EventData.ParentImage AS ParentImage,
+            OSPath AS EvtxPath
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+        })
+      WHERE CommandLine =~ CommandLineRegex
+        AND EventTime > TimeLowerBound
 
   - name: PowerShell4104ScriptBlocks
-    description: PowerShell 4104 script blocks containing WMI shadow copy deletion commands.
+    description: PowerShell 4104 script blocks invoking shadow copy deletion
     query: |
-      LET ScriptBlockEvents <= SELECT
-          OSPath AS EvtxPath,
-          System.TimeCreated.SystemTime AS EventTime,
-          System.EventID.Value AS EventID,
-          EventData.ScriptBlockText AS ScriptBlockText,
-          EventData.ScriptBlockId AS ScriptBlockId,
-          EventData.Path AS ScriptPath,
-          EventData.ProcessID AS ProcessId,
-          EventData.UserID AS UserSID,
-          "PowerShell4104" AS EvidenceType
-        FROM foreach(
-          row={
-            SELECT OSPath
-            FROM glob(globs=PowerShellLogGlob)
-          },
-          query={
-            SELECT *
-            FROM parse_evtx(filename=OSPath)
-            WHERE System.EventID.Value = 4104
-          })
+      LET PowerShellFiles <= SELECT OSPath FROM glob(globs=PowerShellEvtxGlob)
+      LET TimeLowerBound <= now() - DaysBack * 86400
 
-      SELECT * FROM if(condition=IncludePowerShellScriptBlocks,
-        then={
+      SELECT
+        EventTime,
+        MessageNumber,
+        MessageTotal,
+        ScriptPath,
+        ScriptBlockText,
+        EvtxPath
+      FROM foreach(
+        row=PowerShellFiles,
+        query={
           SELECT
-            EventTime,
-            EvidenceType,
-            EventID,
-            UserSID,
-            ProcessId,
-            ScriptBlockId,
-            ScriptPath,
-            ScriptBlockText,
-            EvtxPath,
-            if(condition=ScriptBlockText =~ '(?i)(delete\\(|remove-wmiobject|win32_shadowcopy)', then="HIGH", else="REVIEW") AS RiskLevel
-          FROM ScriptBlockEvents
-          WHERE UserSID =~ UserRegex
-            AND ScriptBlockText =~ CommandLineRegex
-            AND ScriptBlockText =~ ToolRegex
-            AND ScriptBlockText =~ ShadowDeletionRegex
-        },
-        else={
-          SELECT
-            EventTime,
-            EvidenceType,
-            EventID,
-            UserSID,
-            ProcessId,
-            ScriptBlockId,
-            ScriptPath,
-            ScriptBlockText,
-            EvtxPath,
-            "DISABLED" AS RiskLevel
-          FROM ScriptBlockEvents
-          WHERE FALSE
+            System.TimeCreated.SystemTime AS EventTime,
+            EventData.MessageNumber AS MessageNumber,
+            EventData.MessageTotal AS MessageTotal,
+            EventData.Path AS ScriptPath,
+            EventData.ScriptBlockText AS ScriptBlockText,
+            OSPath AS EvtxPath
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4104
         })
+      WHERE ScriptBlockText =~ CommandLineRegex
+        AND EventTime > TimeLowerBound
+
+  - name: LiveSuspiciousProcesses
+    description: Currently running shadow copy tooling (vssadmin/wmic/diskshadow)
+    query: |
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime AS StartTime
+      FROM pslist()
+      WHERE CommandLine =~ CommandLineRegex
+        OR Name =~ ProcessNameRegex
 
 column_types:
   - name: EventTime
     type: timestamp
-  - name: UtcTime
+  - name: StartTime
     type: timestamp
   - name: EvtxPath
+    type: path
+  - name: NewProcessName
     type: path
   - name: Image
     type: path
   - name: ParentImage
     type: path
-  - name: CurrentDirectory
+  - name: ParentProcessName
     type: path
   - name: ScriptPath
     type: path
-  - name: Hashes
-    type: hashes
-
+  - name: NewProcessId
+    type: number
+  - name: CreatorProcessId
+    type: number
+  - name: Pid
+    type: number
+  - name: Ppid
+    type: number
