@@ -1,0 +1,107 @@
+name: Custom.DFIR.LinuxKernelModuleRootkitDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects Linux kernel rootkit (T1014) loading artifacts on the host.
+
+  Collects the live loaded-module list from /proc/modules, cross-checks
+  /proc/kallsyms module symbols against that list to surface hidden modules
+  (list-unlinking rootkits such as diamorphine stay visible in kallsyms while
+  vanishing from /proc/modules), inspects module auto-load persistence configs
+  (/etc/modules, /etc/modules-load.d, /etc/modprobe.d, /etc/rc.local) and
+  inventories on-disk .ko module binaries with MD5/SHA256 hashes.
+
+reference:
+  - https://attack.mitre.org/techniques/T1014/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousNameRegex
+    type: regex
+    default: "(?i)diamorphine|reptile|adore-ng|modhide|sutekh|enyelkm|kbeast|sysemptydump|hideme|rknitro|avlat|rootkit"
+  - name: ModuleFilterRegex
+    type: regex
+    default: "."
+  - name: PersistenceFilterRegex
+    type: regex
+    default: "."
+  - name: KmodFileFilterRegex
+    type: regex
+    default: "."
+  - name: KmodFilesGlob
+    type: string
+    default: "/lib/modules/**/*.ko*"
+  - name: UploadKmodFiles
+    type: bool
+    default: "N"
+
+sources:
+  - name: LoadedModules
+    description: |
+      Live loaded kernel modules from /proc/modules with suspicion flags for
+      suspicious names and non-Live states (Loading/Unloading).
+    query: |
+      LET ProcRows <= SELECT Name, Size, UsedCount, Dependencies, State, Address
+        FROM split_records(
+          filenames="/proc/modules",
+          regex="(?m)^\\s*(\\S+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+(\\S+)\\s*(0x[0-9a-fA-F]+)?[^\\n]*$",
+          columns=["Name", "Size", "UsedCount", "Dependencies", "State", "Address"])
+      SELECT Name, Size, UsedCount, Dependencies, State, Address,
+             Name =~ SuspiciousNameRegex AS SuspiciousName,
+             State =~ "Loading|Unloading" AS SuspiciousState,
+             Dependencies =~ SuspiciousNameRegex AS SuspiciousDependency
+      FROM ProcRows
+      WHERE Name =~ ModuleFilterRegex
+
+  - name: HiddenModuleCandidates
+    description: |
+      Module symbols present in /proc/kallsyms but missing from the loaded
+      module list - a classic sign of list-unlinking rootkits. Review each
+      hit before escalating; a clean host normally returns no rows.
+    query: |
+      LET ModulesText <= read_file(filename="/proc/modules")
+      LET KallsymsModules <= SELECT Module AS ModuleName
+        FROM split_records(
+          filenames="/proc/kallsyms",
+          regex="(?m)^\\S+\\s+\\S\\s+\\S+\\s*\\[([^\\]]+)\\]\\s*$",
+          columns=["Module"])
+      SELECT ModuleName
+      FROM KallsymsModules
+      WHERE ModuleName =~ ModuleFilterRegex
+        AND NOT ModulesText =~ ("(^|\\s)" + ModuleName + "(\\s|$)")
+      GROUP BY ModuleName
+
+  - name: ModulePersistenceConfigs
+    description: |
+      Configuration files that auto-load kernel modules at boot - a common
+      rootkit persistence vector (T1547-style autostart for T1014 payloads).
+    query: |
+      SELECT OSPath, Line
+      FROM foreach(
+        row={ SELECT OSPath
+          FROM glob(globs=["/etc/modules", "/etc/modules-load.d/*", "/etc/modprobe.d/*", "/etc/rc.local"]) },
+        query={ SELECT OSPath, Line
+          FROM split_records(filenames=OSPath, regex="\\n", columns=["Line"])
+          WHERE Line =~ PersistenceFilterRegex
+            AND NOT Line =~ "^\\s*(#|$)" })
+
+  - name: KmodFiles
+    description: |
+      On-disk kernel module binaries (.ko and compressed variants) under
+      /lib/modules with sizes, timestamps and MD5/SHA256 hashes.
+    query: |
+      LET KmodRows <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=KmodFilesGlob)
+        WHERE OSPath =~ KmodFileFilterRegex
+      SELECT OSPath, Size, Mtime,
+             hash(path=OSPath, hashselect="MD5,SHA256") AS Hash,
+             if(condition=UploadKmodFiles, then=upload(file=OSPath)) AS Upload
+      FROM KmodRows
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Hash
+    type: hash
