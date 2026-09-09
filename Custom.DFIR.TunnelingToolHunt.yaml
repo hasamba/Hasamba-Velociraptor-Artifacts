@@ -1,0 +1,130 @@
+name: Custom.DFIR.TunnelingToolHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for evidence of port forwarding and tunneling activity (MITRE ATT&CK T1572 -
+  Protocol Tunneling) on Windows and Linux hosts.
+
+  Detects known tunneling tools (chisel, socat, plink, ngrok, frp) in four places:
+  1. Live processes - process name, executable path or command line matching tool
+     names or tunneling flags (-R/-L/-D with an IP, socks, --proxy, tunnel).
+  2. Live network connections opened by those suspect processes.
+  3. Tool binaries dropped in common staging locations (Downloads, Desktop, Temp,
+     ProgramData, /tmp, /usr/local/bin, /opt), hashed with MD5/SHA256 for IOC
+     correlation.
+  4. Windows Run/RunOnce autostart keys persisting these tools across reboots.
+
+  Cross-platform: sources that do not apply to the current OS simply return no rows.
+
+reference:
+  - https://attack.mitre.org/techniques/T1572/
+  - https://github.com/jpillora/chisel
+
+type: CLIENT
+
+parameters:
+  - name: ToolRegex
+    type: regex
+    description: Case-insensitive regex matched against process names, binary names and command lines.
+    default: '(?i)chisel|socat|plink|ngrok|frpc|frps'
+
+  - name: TunnelArgRegex
+    type: regex
+    description: Command-line indicators of tunneling even when the binary is renamed.
+    default: '(?i)-[RLD]\s*\d{1,3}(\.\d{1,3}){3}|socks5?[ :]|--proxy|tunnel'
+
+  - name: ToolGlob
+    type: globs
+    description: Common staging locations for dropped tunneling binaries.
+    default: |
+      C:/Users/*/Downloads/**
+      C:/Users/*/Desktop/*
+      C:/Users/*/AppData/Local/Temp/**
+      C:/Users/Public/*
+      C:/Windows/Temp/**
+      C:/ProgramData/**
+      C:/Temp/**
+      /tmp/**
+      /var/tmp/**
+      /dev/shm/*
+      /usr/local/bin/*
+      /opt/*
+      /home/*/**
+      /root/*
+      /srv/*
+
+sources:
+  - name: TunnelingProcesses
+    description: Running processes whose name, exe path or command line matches tunneling tool indicators.
+    query: |
+      LET ProcList = SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime,
+             if(condition=Exe,
+                then=hash(path=Exe, hashselect="MD5,SHA256"),
+                else=dict(MD5="", SHA256="")) AS HashData
+        FROM pslist()
+        WHERE Name =~ ToolRegex
+           OR Exe =~ ToolRegex
+           OR CommandLine =~ ToolRegex
+           OR CommandLine =~ TunnelArgRegex
+      SELECT Pid, Ppid, Name AS ProcessName, Exe, CommandLine, Username,
+             CreateTime, HashData.MD5 AS MD5, HashData.SHA256 AS SHA256
+      FROM ProcList
+
+  - name: TunnelingConnections
+    description: Active network connections owned by the suspect tunneling processes.
+    query: |
+      LET Suspects <= SELECT Pid AS SuspectPid, Name AS SuspectName,
+             CommandLine AS SuspectCommandLine
+        FROM pslist()
+        WHERE Name =~ ToolRegex
+           OR Exe =~ ToolRegex
+           OR CommandLine =~ ToolRegex
+           OR CommandLine =~ TunnelArgRegex
+      SELECT SuspectPid, SuspectName AS ProcessName,
+             SuspectCommandLine AS ProcessCommandLine, Status,
+             Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+             Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+      FROM foreach(row=Suspects, query={
+        SELECT Status, Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+               Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Pid = SuspectPid
+      })
+
+  - name: ToolBinariesOnDisk
+    description: Dropped tunneling tool binaries in common staging locations, hashed for IOC correlation.
+    query: |
+      LET FileHits = SELECT OSPath, Size, Mtime, Btime,
+             if(condition=Size > 0,
+                then=hash(path=OSPath, hashselect="MD5,SHA256"),
+                else=dict(MD5="", SHA256="")) AS HashInfo
+        FROM glob(globs=ToolGlob)
+        WHERE OSPath.Basename =~ ToolRegex
+      SELECT OSPath, Size, Mtime, Btime,
+             HashInfo.MD5 AS MD5, HashInfo.SHA256 AS SHA256
+      FROM FileHits
+
+  - name: PersistenceRunKeys
+    description: Windows Run/RunOnce autostart entries referencing tunneling tools.
+    query: |
+      LET RunKeys = SELECT OSPath, Mtime,
+             read_file(filename=OSPath, accessor="registry") AS Value
+        FROM glob(globs=["HKEY_USERS/*/Software/Microsoft/Windows/CurrentVersion/Run/*",
+                         "HKEY_USERS/*/Software/Microsoft/Windows/CurrentVersion/RunOnce/*"],
+                  accessor="registry")
+      SELECT OSPath, Mtime, Value
+      FROM RunKeys
+      WHERE Value =~ ToolRegex OR OSPath.Basename =~ ToolRegex
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: MD5
+    type: md5
+  - name: SHA256
+    type: sha256
