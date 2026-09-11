@@ -1,0 +1,157 @@
+name: Custom.DFIR.PythonPackagesRecentChanges
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for recently installed or modified Python/pip packages in site-packages
+  across Windows, Linux and macOS.
+
+  Dependency and development-tool compromise (T1195.001) is commonly executed
+  by publishing backdoored or typosquatted PyPI packages (dependency
+  confusion), or by tampering with packages already installed on disk. This
+  artifact enumerates every installed package by locating *.dist-info
+  directories under known site-packages roots (system interpreters, pip
+  --user installs, venvs, conda distributions), builds an install timeline,
+  and flags packages whose install metadata changed inside the lookback
+  window. A second source hashes .py/.pth files modified inside the window
+  (tamper detection), and a third source surfaces .pth auto-import hooks,
+  which execute automatically at interpreter startup and are a classic
+  code-execution persistence vector.
+
+  Cross-platform: safe to run on any client; platform-inapplicable globs
+  simply return no rows.
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+  - https://pip.pypa.io/en/stable/reference/records/
+
+type: CLIENT
+
+parameters:
+  - name: TimeAgoDays
+    type: int
+    default: "30"
+    description: Lookback window (days) for package installs and file modifications.
+
+  - name: TargetGlob
+    type: glob
+    description: One glob per line, matching *.dist-info directories of installed packages.
+    default: |
+      C:/Program Files/Python*/Lib/site-packages/*.dist-info
+      C:/Program Files (x86)/Python*/Lib/site-packages/*.dist-info
+      C:/Python*/Lib/site-packages/*.dist-info
+      C:/Users/*/AppData/Local/Programs/Python/*/Lib/site-packages/*.dist-info
+      C:/Users/*/AppData/Roaming/Python/*/site-packages/*.dist-info
+      C:/ProgramData/{anaconda3,miniconda3,miniforge3,mambaforge}/Lib/site-packages/*.dist-info
+      C:/Users/*/{anaconda3,miniconda3,miniforge3,mambaforge}/Lib/site-packages/*.dist-info
+      /usr/lib/python*/*-packages/*.dist-info
+      /usr/local/lib/python*/*-packages/*.dist-info
+      /opt/**/lib/python*/*-packages/*.dist-info
+      /home/*/venv/lib/python*/*-packages/*.dist-info
+      /home/*/.venv/lib/python*/*-packages/*.dist-info
+      /home/*/*/venv/lib/python*/*-packages/*.dist-info
+      /home/*/*/.venv/lib/python*/*-packages/*.dist-info
+      /root/venv/lib/python*/*-packages/*.dist-info
+      /root/.venv/lib/python*/*-packages/*.dist-info
+      /Library/Python/*/site-packages/*.dist-info
+      /Users/*/Library/Python/*/lib/python/site-packages/*.dist-info
+      /opt/homebrew/lib/python*/*-packages/*.dist-info
+      /Library/Frameworks/Python.framework/Versions/*/lib/python*/*-packages/*.dist-info
+
+  - name: FileGlob
+    type: glob
+    description: One glob per line, matching .py/.pth files under site-packages roots.
+    default: |
+      C:/Program Files/Python*/Lib/site-packages/**/*.{py,pth}
+      C:/Program Files (x86)/Python*/Lib/site-packages/**/*.{py,pth}
+      C:/Python*/Lib/site-packages/**/*.{py,pth}
+      C:/Users/*/AppData/Local/Programs/Python/*/Lib/site-packages/**/*.{py,pth}
+      C:/Users/*/AppData/Roaming/Python/*/site-packages/**/*.{py,pth}
+      C:/ProgramData/{anaconda3,miniconda3,miniforge3,mambaforge}/Lib/site-packages/**/*.{py,pth}
+      C:/Users/*/{anaconda3,miniconda3,miniforge3,mambaforge}/Lib/site-packages/**/*.{py,pth}
+      /usr/lib/python*/*-packages/**/*.{py,pth}
+      /usr/local/lib/python*/*-packages/**/*.{py,pth}
+      /opt/**/lib/python*/*-packages/**/*.{py,pth}
+      /home/*/venv/lib/python*/*-packages/**/*.{py,pth}
+      /home/*/.venv/lib/python*/*-packages/**/*.{py,pth}
+      /home/*/*/venv/lib/python*/*-packages/**/*.{py,pth}
+      /home/*/*/.venv/lib/python*/*-packages/**/*.{py,pth}
+      /root/venv/lib/python*/*-packages/**/*.{py,pth}
+      /root/.venv/lib/python*/*-packages/**/*.{py,pth}
+      /Library/Python/*/site-packages/**/*.{py,pth}
+      /Users/*/Library/Python/*/lib/python/site-packages/**/*.{py,pth}
+      /opt/homebrew/lib/python*/*-packages/**/*.{py,pth}
+      /Library/Frameworks/Python.framework/Versions/*/lib/python*/*-packages/**/*.{py,pth}
+
+  - name: FileRegex
+    type: regex
+    default: '.'
+    description: Only report files whose full path matches this regex.
+
+  - name: PthImportRegex
+    type: regex
+    default: '(?i)^import\s'
+    description: Flag .pth lines matching this regex (auto-executed at interpreter startup).
+
+  - name: UploadFiles
+    type: bool
+    default: false
+    description: Upload matched files for evidence collection.
+
+sources:
+  - name: RecentPackages
+    description: Packages installed or modified inside the lookback window, with metadata hash.
+    query: |
+      LET Cutoff <= timestamp(epoch=now() - TimeAgoDays * 86400)
+      LET DistDirs <= SELECT OSPath AS DistInfoPath, Mtime AS DirMtime, Btime AS DirBtime
+            FROM glob(globs=TargetGlob)
+      SELECT
+        parse_string_with_regex(
+          string=basename(path=DistInfoPath),
+          regex="^(?P<Name>.+)-(?P<Version>[0-9][^-]*)(-(?P<Build>[^-]+))?\\.dist-info$") AS Package,
+        dirname(path=DistInfoPath) AS SiteRoot,
+        DistInfoPath,
+        DirMtime AS ChangedWhen,
+        DirBtime AS CreatedWhen,
+        { SELECT Mtime AS MetadataWhen,
+                 hash(path=OSPath, hashselect="SHA256").SHA256 AS MetadataSha256
+          FROM glob(globs=DistInfoPath + "/METADATA") } AS MetadataInfo
+      FROM DistDirs
+      WHERE DirMtime > Cutoff OR DirBtime > Cutoff
+
+  - name: RecentFiles
+    description: Python files modified inside the lookback window, with hashes and optional upload.
+    query: |
+      LET Cutoff <= timestamp(epoch=now() - TimeAgoDays * 86400)
+      SELECT OSPath, Size, Mtime AS Modified, Btime AS Created,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes,
+        if(condition=UploadFiles, then=upload(file=OSPath)) AS Upload
+      FROM glob(globs=FileGlob)
+      WHERE (Mtime > Cutoff OR Btime > Cutoff) AND OSPath =~ FileRegex
+
+  - name: PthImportHooks
+    description: .pth auto-import hooks under site-packages (execute on every interpreter start).
+    query: |
+      LET PthFiles <= SELECT OSPath AS Path, Mtime AS Modified
+            FROM glob(globs=FileGlob)
+            WHERE OSPath =~ "\\.pth$"
+      SELECT Path, Modified, Line AS ImportLine
+      FROM foreach(
+        row=PthFiles,
+        query={ SELECT Path, Modified, Line AS ImportLine
+                FROM split_records(filenames=Path, regex="\n", columns=["Line"])
+                WHERE Line =~ PthImportRegex })
+
+column_types:
+  - name: ChangedWhen
+    type: timestamp
+  - name: CreatedWhen
+    type: timestamp
+  - name: MetadataWhen
+    type: timestamp
+  - name: Modified
+    type: timestamp
+  - name: Created
+    type: timestamp
+  - name: Size
+    type: NB
+  - name: Upload
+    type: upload
