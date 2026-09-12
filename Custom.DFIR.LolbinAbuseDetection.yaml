@@ -1,0 +1,110 @@
+name: Custom.DFIR.LolbinAbuseDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects abuse of Living-Off-the-Land binaries (mshta.exe, regsvr32.exe, certutil.exe)
+  across live processes and Windows event logs.
+
+  LOLBins are signed Microsoft binaries trusted by default and commonly abused to execute
+  scripts, download payloads, or bypass application control (MITRE ATT&CK T1218). This
+  artifact flags:
+    - mshta.exe executing script: / vbscript: / javascript: payloads or remote .hta content
+    - regsvr32.exe loading scrobj.dll or registering remote /i: URLs (squiblydoo)
+    - certutil.exe performing -urlcache / -verifyctl downloads or -decode / -decodehex staging
+
+  Sources correlate live process listings, Sysmon EID 1 process-creation events, and
+  Security EID 4688 events. The Security EID 4688 source requires "Audit Process Creation"
+  with "Include command line in process creation events" enabled; without it, no command
+  lines are logged and that source stays empty.
+
+reference:
+  - https://attack.mitre.org/techniques/T1218/
+
+type: CLIENT
+
+parameters:
+  - name: ProcessNameRegex
+    type: regex
+    description: Match the LOLBin process name or full image path.
+    default: '(?i)(mshta|regsvr32|certutil)\.exe'
+
+  - name: SuspiciousCmdRegex
+    type: regex
+    description: Suspicious command-line indicators for the target LOLBins.
+    default: '(?i)(script:|vbscript:|javascript:|https?://|scrobj\.dll|urlcache|verifyctl|-decode|-decodehex|\.hta)'
+
+sources:
+  - name: LiveProcesses
+    description: |
+      Currently running LOLBin processes whose command lines look suspicious.
+    query: |
+      LET TargetProcs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username
+        FROM pslist()
+        WHERE Name =~ ProcessNameRegex
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+             hash(path=Exe, hashselect="SHA256").SHA256 AS ExeSHA256
+      FROM TargetProcs
+      WHERE CommandLine =~ SuspiciousCmdRegex
+
+  - name: SysmonProcessCreation
+    description: |
+      Sysmon EID 1 process-creation events for the target LOLBins with suspicious
+      command lines. Requires Sysmon to be installed; empty otherwise.
+    query: |
+      LET SysmonLogs <= SELECT OSPath FROM glob(
+        globs="C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon*.evtx")
+      SELECT EventTime, EventID, User, Image, CommandLine, ParentImage, Hashes
+      FROM foreach(
+        row=SysmonLogs,
+        query={
+          SELECT System.TimeCreated.SystemTime AS EventTime,
+                 System.EventID.Value AS EventID,
+                 EventData.User AS User,
+                 EventData.Image AS Image,
+                 EventData.CommandLine AS CommandLine,
+                 EventData.ParentImage AS ParentImage,
+                 EventData.Hashes AS Hashes
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+            AND EventData.Image =~ ProcessNameRegex
+            AND EventData.CommandLine =~ SuspiciousCmdRegex
+        })
+
+  - name: SecurityEvent4688
+    description: |
+      Security EID 4688 process-creation events for the target LOLBins with suspicious
+      command lines. Requires process-creation command-line auditing.
+    query: |
+      LET SecurityLogs <= SELECT OSPath FROM glob(
+        globs="C:/Windows/System32/winevt/Logs/Security.evtx")
+      SELECT EventTime, SubjectUserName, SubjectDomainName, NewProcessName,
+             CommandLine, ParentProcessName
+      FROM foreach(
+        row=SecurityLogs,
+        query={
+          SELECT System.TimeCreated.SystemTime AS EventTime,
+                 EventData.SubjectUserName AS SubjectUserName,
+                 EventData.SubjectDomainName AS SubjectDomainName,
+                 EventData.NewProcessName AS NewProcessName,
+                 EventData.CommandLine AS CommandLine,
+                 EventData.ParentProcessName AS ParentProcessName
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4688
+            AND EventData.NewProcessName =~ ProcessNameRegex
+            AND EventData.CommandLine =~ SuspiciousCmdRegex
+        })
+
+column_types:
+  - name: Exe
+    type: path
+  - name: Image
+    type: path
+  - name: ParentImage
+    type: path
+  - name: NewProcessName
+    type: path
+  - name: ParentProcessName
+    type: path
+  - name: ExeSHA256
+    type: SHA256
+  - name: EventTime
+    type: timestamp
