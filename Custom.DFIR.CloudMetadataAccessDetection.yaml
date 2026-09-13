@@ -1,0 +1,102 @@
+name: Custom.DFIR.CloudMetadataAccessDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects access to the cloud instance metadata service (169.254.169.254
+  and the AWS IPv6 endpoint fd00:ec2::254) from the live endpoint.
+
+  Cloud metadata endpoints (AWS EC2 IMDS, Azure IMDS, GCP metadata server)
+  hand short-lived instance role credentials to anything that asks. Post-
+  exploitation tooling queries IMDS from a compromised workload to harvest
+  role credentials, and SSRF chains routinely pivot through it
+  (T1552.005 - Unsecured Credentials: Cloud Instance Metadata API).
+
+  Source "MetadataConnections" snapshots current TCP connections to the
+  metadata addresses via netstat() and enriches each with the owning
+  process from pslist(). Script interpreters and common LOLBins are
+  flagged as SUSPICIOUS; every other process is REVIEW.
+
+  Source "MetadataInCommandLine" surfaces running processes whose command
+  line references the metadata address even after the connection closed.
+
+  Cross-platform: Windows, Linux and macOS.
+
+reference:
+  - https://attack.mitre.org/techniques/T1552.005/
+
+type: CLIENT
+
+parameters:
+  - name: MetadataAddressRegex
+    type: regex
+    default: '^169\.254\.169\.254$|^fd00:ec2::254$'
+  - name: SuspiciousProcessRegex
+    type: regex
+    default: '(?i)(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|pythonw?|perl|ruby|php|node|curl|wget|ncat|netcat|socat|ssh|openssl|nc)'
+  - name: ExcludeProcessRegex
+    type: regex
+    default: '^$'
+
+sources:
+  - name: MetadataConnections
+    description: |
+      Live TCP connections to the cloud metadata address, enriched with
+      the owning process. Suspicious interpreters and LOLBins flagged.
+    query: |
+      LET procs <= SELECT Pid, Name, Ppid, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+
+      LET hits = SELECT * FROM foreach(
+        row={
+          SELECT Pid AS ConnPid, Status AS ConnStatus,
+                 Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+                 Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+          FROM netstat()
+          WHERE Raddr.IP =~ MetadataAddressRegex
+        },
+        query={
+          SELECT ConnPid, ConnStatus, LocalIP, LocalPort, RemoteIP, RemotePort,
+                 {
+                   SELECT Name AS ProcessName, Ppid AS ParentPid, Exe AS ExePath,
+                          CommandLine AS ProcCommandLine, Username AS ProcUsername,
+                          CreateTime AS ProcessStartTime
+                   FROM procs
+                   WHERE Pid = ConnPid
+                   LIMIT 1
+                 } AS ProcInfo
+          FROM scope()
+        }
+      )
+
+      SELECT ConnPid,
+             ProcInfo.ProcessName AS ProcessName,
+             ProcInfo.ParentPid AS ParentPid,
+             ProcInfo.ExePath AS ExePath,
+             ProcInfo.ProcCommandLine AS CommandLine,
+             ProcInfo.ProcUsername AS Username,
+             ProcInfo.ProcessStartTime AS ProcessStartTime,
+             RemoteIP, RemotePort, LocalIP, LocalPort, ConnStatus,
+             if(condition=ProcInfo.ProcessName =~ SuspiciousProcessRegex,
+                then="SUSPICIOUS",
+                else="REVIEW") AS Assessment
+      FROM hits
+      WHERE NOT ProcInfo.ProcessName =~ ExcludeProcessRegex
+
+  - name: MetadataInCommandLine
+    description: |
+      Running processes whose command line references the metadata
+      address - catches access patterns even after the connection closed.
+    query: |
+      SELECT Pid AS ProcessPid, Name AS ProcessName, Ppid AS ParentPid,
+             Exe AS ExePath, CommandLine,
+             CreateTime AS ProcessStartTime
+      FROM pslist()
+      WHERE CommandLine =~ MetadataAddressRegex
+        AND NOT Name =~ ExcludeProcessRegex
+
+column_types:
+  - name: ProcessStartTime
+    type: timestamp
+  - name: CommandLine
+    type: nobreak
+  - name: ExePath
+    type: nobreak
