@@ -1,0 +1,129 @@
+name: Custom.DFIR.WindowsKerberoastingTGS4769Detect
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects Kerberoasting (MITRE ATT&CK T1558.003) via Windows Security Event ID 4769 TGS requests using RC4-HMAC encryption.
+
+  Kerberoasting tooling (Rubeus, Impacket GetUserSPNs) requests service tickets with
+  legacy RC4-HMAC (0x17) encryption so the service account ticket hash can be cracked
+  offline. This artifact parses the Windows Security.evtx log for Event ID 4769,
+  filters for RC4-encrypted TGS requests carrying the classic kerberoasting ticket
+  options issued by non-machine accounts, lists the individual suspicious requests,
+  and aggregates suspicious TGS counts per source IP to flag burst behavior against
+  many service accounts. Run on Domain Controllers or endpoints forwarding Security
+  event logs.
+
+reference:
+  - https://attack.mitre.org/techniques/T1558.003/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityLogGlob
+    type: glob
+    description: Glob for the Windows Security event log.
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+
+  - name: LookbackHours
+    type: int64
+    description: Only consider TGS requests newer than this many hours.
+    default: "24"
+
+  - name: TicketEncryptionRegex
+    type: regex
+    description: TicketEncryptionType values considered kerberoasting indicators (0x17 = RC4-HMAC).
+    default: "0x17"
+
+  - name: TicketOptionsRegex
+    type: regex
+    description: TicketOptions value used by classic kerberoasting tools.
+    default: "0x40810000"
+
+  - name: StatusRegex
+    type: regex
+    description: Only successful ticket grants (Status 0x0).
+    default: "0x0"
+
+  - name: ExcludeAccountsRegex
+    type: regex
+    description: Accounts to ignore - machine accounts ending in $, krbtgt, kadmin, kds.
+    default: '(?i)(\$$|krbtgt|kadmin|kds)'
+
+  - name: FilterRegex
+    type: regex
+    description: Only include events whose ServiceName matches this regex.
+    default: "."
+
+  - name: MinTGSRequests
+    type: int64
+    description: Flag a source IP once it issues at least this many suspicious TGS requests.
+    default: "10"
+
+sources:
+  - name: KerberoastingSuspects
+    description: Individual suspicious TGS requests (RC4 encrypted, non-machine requester).
+    query: |
+      LET TGS = SELECT
+          timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+          EventData.TargetUserName AS RequestingAccount,
+          EventData.TargetDomainName AS RequestingDomain,
+          EventData.ServiceName AS ServiceName,
+          EventData.ServiceSid AS ServiceSid,
+          EventData.ServiceType AS ServiceType,
+          EventData.TicketOptions AS TicketOptions,
+          EventData.TicketEncryptionType AS TicketEncryptionType,
+          EventData.Status AS Status,
+          EventData.IpAddress AS SourceIP,
+          EventData.IpPort AS SourcePort
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=SecurityLogGlob) },
+          query={ SELECT * FROM parse_evtx(filename=OSPath)
+                  WHERE System.EventID.Value = 4769 })
+
+      SELECT EventTime, RequestingAccount, RequestingDomain, ServiceName,
+             ServiceType, TicketOptions, TicketEncryptionType, Status,
+             SourceIP, SourcePort
+      FROM TGS
+      WHERE TicketEncryptionType =~ TicketEncryptionRegex
+        AND TicketOptions =~ TicketOptionsRegex
+        AND Status =~ StatusRegex
+        AND NOT RequestingAccount =~ ExcludeAccountsRegex
+        AND NOT ServiceName =~ ExcludeAccountsRegex
+        AND ServiceName =~ FilterRegex
+        AND EventTime > timestamp(epoch=now() - LookbackHours * 3600)
+
+  - name: SourceAggregation
+    description: Source IPs issuing at least MinTGSRequests suspicious TGS requests.
+    query: |
+      LET TGS = SELECT
+          timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+          EventData.TargetUserName AS RequestingAccount,
+          EventData.ServiceName AS ServiceName,
+          EventData.TicketOptions AS TicketOptions,
+          EventData.TicketEncryptionType AS TicketEncryptionType,
+          EventData.Status AS Status,
+          EventData.IpAddress AS SourceIP
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=SecurityLogGlob) },
+          query={ SELECT * FROM parse_evtx(filename=OSPath)
+                  WHERE System.EventID.Value = 4769 })
+
+      LET Suspects = SELECT SourceIP, ServiceName
+        FROM TGS
+        WHERE TicketEncryptionType =~ TicketEncryptionRegex
+          AND TicketOptions =~ TicketOptionsRegex
+          AND Status =~ StatusRegex
+          AND NOT RequestingAccount =~ ExcludeAccountsRegex
+          AND NOT ServiceName =~ ExcludeAccountsRegex
+          AND ServiceName =~ FilterRegex
+          AND EventTime > timestamp(epoch=now() - LookbackHours * 3600)
+
+      LET Agg <= SELECT SourceIP, count(items=ServiceName) AS TGSRequests
+        FROM Suspects GROUP BY SourceIP
+
+      SELECT SourceIP, TGSRequests
+      FROM Agg
+      WHERE TGSRequests >= MinTGSRequests
+
+column_types:
+  - name: EventTime
+    type: timestamp
