@@ -1,0 +1,133 @@
+name: Custom.DFIR.TorExitNodeAndC2RangeConnections
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects live processes communicating with TOR exit nodes or known C2 IP ranges.
+
+  Cross-platform (Windows/macOS/Linux): correlates active TCP/UDP connections
+  from netstat() with owning-process metadata from pslist(), then matches each
+  remote IP against TOR exit-node CIDR ranges and a configurable list of known
+  C2/malicious infrastructure ranges. TOR routing (MITRE ATT&CK T1090.003 -
+  Proxy: Multi-hop Proxy) is commonly used to hide C2 and exfiltration origins.
+  Each match carries process name, command line, executable path, SHA256 and
+  the full connection tuple for immediate triage. Refresh TorExitCIDRs from
+  the current TOR bulk exit list and update C2IPCIDRs from your threat-intel
+  feed for best coverage.
+
+reference:
+  - https://attack.mitre.org/techniques/T1090.003/
+
+type: CLIENT
+
+parameters:
+  - name: TorExitCIDRs
+    type: string
+    description: |
+      Comma-separated CIDR ranges commonly used by TOR exit nodes.
+      Refresh from https://check.torproject.org/torbulkexitlist as needed.
+    default: "185.220.100.0/22,171.25.193.0/24,199.249.230.0/24,162.247.74.0/24"
+
+  - name: C2IPCIDRs
+    type: string
+    description: |
+      Comma-separated CIDR ranges of known C2 / malicious infrastructure.
+      Replace with ranges from your own threat-intel feed.
+    default: "5.188.206.0/24,45.146.164.0/24"
+
+  - name: ProcessFilterRegex
+    type: regex
+    description: Only report connections whose owning process name matches this regex.
+    default: "."
+
+  - name: ExcludeLocalRegex
+    type: regex
+    description: |
+      Skip remote IPs matching this regex (loopback, RFC1918, link-local,
+      unspecified and IPv6 local addresses).
+    default: "^(127\\.|10\\.|192\\.168\\.|169\\.254\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|0\\.0\\.0\\.0$|::1$|fe[89ab]:|f[cd][0-9a-f]{2}:)"
+
+sources:
+  - name: TorExitMatches
+    description: Live connections to TOR exit node ranges with owning process details.
+    query: |
+      LET TorRangeList <= SELECT CIDR
+        FROM foreach(
+          row={ SELECT split(string=TorExitCIDRs, sep=",") AS CIDR FROM scope() },
+          query={ SELECT CIDR FROM scope() })
+        WHERE CIDR
+
+      LET Connections <= SELECT Pid, Status AS ConnectionStatus,
+        Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+        Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Raddr.IP AND NOT Raddr.IP =~ ExcludeLocalRegex
+
+      SELECT now() AS ScanTime, Pid,
+        ProcInfo[0].Name AS ProcessName,
+        ProcInfo[0].Exe AS ExePath,
+        ProcInfo[0].CommandLine AS CommandLine,
+        ProcInfo[0].Username AS Username,
+        if(condition=ProcInfo[0].Exe,
+           then=hash(path=ProcInfo[0].Exe, hashselect="SHA256").SHA256) AS SHA256,
+        RemoteIP, RemotePort, LocalIP, LocalPort,
+        ConnectionStatus, MatchedCIDR
+      FROM foreach(
+        row=Connections,
+        query={
+          SELECT *, { SELECT Name, Exe, CommandLine, Username FROM pslist(pid=Pid) } AS ProcInfo
+          FROM foreach(
+            row=TorRangeList,
+            query={
+              SELECT Pid, RemoteIP, RemotePort, LocalIP, LocalPort,
+                ConnectionStatus, CIDR AS MatchedCIDR
+              FROM scope()
+              WHERE cidr_contains(ip=RemoteIP, ranges=CIDR)
+            })
+        })
+      WHERE ProcInfo[0].Name =~ ProcessFilterRegex OR len(list=ProcInfo) = 0
+
+  - name: C2RangeMatches
+    description: Live connections to known C2 IP ranges with owning process details.
+    query: |
+      LET C2RangeList <= SELECT CIDR
+        FROM foreach(
+          row={ SELECT split(string=C2IPCIDRs, sep=",") AS CIDR FROM scope() },
+          query={ SELECT CIDR FROM scope() })
+        WHERE CIDR
+
+      LET Connections <= SELECT Pid, Status AS ConnectionStatus,
+        Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+        Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Raddr.IP AND NOT Raddr.IP =~ ExcludeLocalRegex
+
+      SELECT now() AS ScanTime, Pid,
+        ProcInfo[0].Name AS ProcessName,
+        ProcInfo[0].Exe AS ExePath,
+        ProcInfo[0].CommandLine AS CommandLine,
+        ProcInfo[0].Username AS Username,
+        if(condition=ProcInfo[0].Exe,
+           then=hash(path=ProcInfo[0].Exe, hashselect="SHA256").SHA256) AS SHA256,
+        RemoteIP, RemotePort, LocalIP, LocalPort,
+        ConnectionStatus, MatchedCIDR
+      FROM foreach(
+        row=Connections,
+        query={
+          SELECT *, { SELECT Name, Exe, CommandLine, Username FROM pslist(pid=Pid) } AS ProcInfo
+          FROM foreach(
+            row=C2RangeList,
+            query={
+              SELECT Pid, RemoteIP, RemotePort, LocalIP, LocalPort,
+                ConnectionStatus, CIDR AS MatchedCIDR
+              FROM scope()
+              WHERE cidr_contains(ip=RemoteIP, ranges=CIDR)
+            })
+        })
+      WHERE ProcInfo[0].Name =~ ProcessFilterRegex OR len(list=ProcInfo) = 0
+
+column_types:
+  - name: ScanTime
+    type: timestamp
+  - name: ExePath
+    type: path
+  - name: SHA256
+    type: hash
