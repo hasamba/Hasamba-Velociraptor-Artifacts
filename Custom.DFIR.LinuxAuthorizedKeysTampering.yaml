@@ -1,0 +1,282 @@
+name: Custom.DFIR.LinuxAuthorizedKeysTampering
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects SSH authorized_keys tampering across all user home directories on Linux.
+
+  MITRE ATT&CK T1098.004 (SSH Authorized Keys): an attacker with a foothold appends
+  or replaces entries in a user's ~/.ssh/authorized_keys to gain durable, passwordless
+  access that survives reboots and password changes. This artifact inventories every
+  authorized_keys file under /home/*/.ssh and /root/.ssh, hashes each file, and flags
+  forensic indicators of tampering: recent modification, weak group/other write
+  permissions, unusually large or emptied files, birth-time recorded after modification
+  time (possible timestomping), risky per-key options such as command= or environment=
+  (forced-command backdoors), unknown key types, malformed key data, and identical key
+  data reused across multiple accounts (lateral persistence). A separate source reviews
+  sshd_config directives that can redirect authorized-key checking to
+  attacker-controlled paths.
+
+reference:
+  - https://attack.mitre.org/techniques/T1098.004/
+  - https://man.openbsd.org/sshd.8
+  - https://man.openbsd.org/sshd_config.5
+
+type: CLIENT
+
+parameters:
+  - name: HomeSshGlob
+    type: glob
+    default: "/home/*/.ssh/authorized_keys*"
+    description: Glob for authorized_keys files under all /home user directories.
+  - name: RootSshGlob
+    type: glob
+    default: "/root/.ssh/authorized_keys*"
+    description: Glob for root authorized_keys files.
+  - name: SshdConfigGlob
+    type: glob
+    default: "/etc/ssh/sshd_config"
+    description: Main sshd_config file.
+  - name: SshdDropinGlob
+    type: glob
+    default: "/etc/ssh/sshd_config.d/*.conf"
+    description: sshd_config drop-in files.
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Only report files whose path matches this regex.
+  - name: KeyTypeRegex
+    type: regex
+    default: '^(sk-)?(ssh-(rsa|dss)|ecdsa-sha2-nistp(256|384|521)|ssh-ed25519)(-cert-v01)?(@openssh[.]com)?($|\s)'
+    description: Recognized SSH public key types.
+  - name: OptionsRegex
+    type: regex
+    default: '^(restrict|no-|[a-z-]+=)'
+    description: Matches lines that start with authorized_keys options.
+  - name: SuspiciousOptionRegex
+    type: regex
+    default: '(?i)(command=|environment=|from=|permitopen=|permitlisten=|tunnel=|principals=)'
+    description: Risky authorized_keys options commonly used for backdoors.
+  - name: SuspiciousCommentRegex
+    type: regex
+    default: '(?i)(temp|test|backup|admin|root|svc|service|ansible|jenkins|deploy|github|gitlab|azure|gcp|aws|corp|vpn)'
+    description: Suspicious key comments.
+  - name: SshdConfigRegex
+    type: regex
+    default: '(?i)^\s*(AuthorizedKeysFile|AuthorizedKeysCommand|AuthorizedPrincipalsFile|TrustedUserCAKeys|PubkeyAuthentication|PermitRootLogin)\b'
+    description: sshd_config directives relevant to key-based access.
+  - name: LargeFileThreshold
+    type: int
+    default: 10240
+    description: authorized_keys files larger than this many bytes are flagged.
+  - name: RecentDays
+    type: int
+    default: 7
+    description: Flag files modified within this many days.
+  - name: MaxKeyLength
+    type: int
+    default: 131072
+    description: Maximum bytes read from each authorized_keys file.
+  - name: UploadFiles
+    type: bool
+    default: false
+    description: Upload matching authorized_keys files to the server.
+
+sources:
+  - name: AuthorizedKeysInventory
+    description: File-level inventory of authorized_keys files with hashes, timestamps, permissions and tamper flags.
+    query: |
+      LET KeyFiles <= SELECT OSPath, Size, Mode, Uid, Gid, Mtime, Ctime, Btime, IsDir
+        FROM glob(globs=[HomeSshGlob, RootSshGlob])
+        WHERE NOT IsDir AND OSPath =~ FilterRegex
+
+      LET Enriched <= SELECT *,
+          read_file(filename=OSPath, length=MaxKeyLength) AS Content,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash
+        FROM KeyFiles
+
+      LET InventoryResults <= SELECT
+          OSPath,
+          Size,
+          Mode,
+          Uid,
+          Gid,
+          Mtime,
+          Ctime,
+          Btime,
+          FileHash.MD5 AS MD5,
+          FileHash.SHA256 AS SHA256,
+          if(condition=OSPath =~ "^/root/",
+             then="root",
+             else=if(condition=OSPath =~ "^/home/",
+                     then=regex_replace(source=OSPath, re="/home/([^/]+)/.+", replace="$1"),
+                     else="NON_STANDARD_HOME")) AS Owner,
+          if(condition=Size = 0,
+             then="EMPTY_FILE",
+             else=if(condition=Size > LargeFileThreshold,
+                     then="UNUSUALLY_LARGE",
+                     else="OK")) AS SizeFlag,
+          if(condition=now().Unix - Mtime.Unix < RecentDays * 86400,
+             then="RECENTLY_MODIFIED",
+             else="OK") AS RecencyFlag,
+          if(condition=Mode =~ "(?i)....w....$|.......w.$",
+             then="WEAK_PERMISSIONS",
+             else="OK") AS PermFlag,
+          if(condition=Btime AND Btime.Unix > Mtime.Unix + 60,
+             then="TIMESTOMP_SUSPECTED_MTIME_BEFORE_BTIME",
+             else="OK") AS TimestompFlag,
+          if(condition=Content =~ SuspiciousOptionRegex,
+             then="RISKY_OPTIONS_IN_FILE",
+             else="OK") AS ContentFlag
+        FROM Enriched
+
+      SELECT * FROM if(
+        condition=UploadFiles,
+        then={ SELECT *, upload(file=OSPath) AS Upload FROM InventoryResults },
+        else={ SELECT * FROM InventoryResults })
+
+  - name: KeyEntryAnalysis
+    description: Per-line analysis of every authorized_keys entry with key type, key data, comment and risk flags.
+    query: |
+      LET KeyFiles <= SELECT OSPath, IsDir
+        FROM glob(globs=[HomeSshGlob, RootSshGlob])
+        WHERE NOT IsDir AND OSPath =~ FilterRegex
+
+      LET ParsedLines <= SELECT
+          KeyFiles.OSPath AS OSPath,
+          Line,
+          LineNumber
+        FROM foreach(
+          row=KeyFiles,
+          query={
+            SELECT Line, LineNumber
+            FROM split_records(
+              filenames=KeyFiles.OSPath,
+              regex="\n",
+              columns=["Line"])
+          })
+
+      LET CleanLines <= SELECT OSPath, LineNumber,
+          regex_replace(source=Line, re="^\\s+", replace="") AS CleanLine
+        FROM ParsedLines
+        WHERE Line =~ "\\S" AND NOT Line =~ "^\\s*#"
+
+      LET Tokenized <= SELECT OSPath, LineNumber, CleanLine,
+          split(string=CleanLine, sep="\\s+") AS Tokens,
+          len(list=split(string=CleanLine, sep="\\s+")) AS NTokens
+        FROM CleanLines
+
+      LET Classified <= SELECT OSPath, LineNumber, CleanLine, Tokens, NTokens,
+          if(condition=CleanLine =~ KeyTypeRegex,
+             then="DIRECT",
+             else=if(condition=CleanLine =~ OptionsRegex,
+                     then="OPTIONS_FIRST",
+                     else="UNPARSEABLE")) AS LineFormat,
+          if(condition=CleanLine =~ KeyTypeRegex,
+             then=Tokens[0],
+             else=if(condition=CleanLine =~ OptionsRegex AND NTokens > 1,
+                     then=Tokens[1],
+                     else="")) AS KeyType,
+          if(condition=CleanLine =~ KeyTypeRegex AND NTokens > 1,
+             then=Tokens[1],
+             else=if(condition=CleanLine =~ OptionsRegex AND NTokens > 2,
+                     then=Tokens[2],
+                     else="")) AS KeyData,
+          Tokens[-1] AS KeyComment
+        FROM Tokenized
+
+      SELECT OSPath, LineNumber, CleanLine, LineFormat, KeyType, KeyData, KeyComment,
+          if(condition=CleanLine =~ SuspiciousOptionRegex,
+             then="RISKY_OPTIONS",
+             else="") AS OptionsFlag,
+          if(condition=KeyComment =~ SuspiciousCommentRegex,
+             then="SUSPICIOUS_COMMENT",
+             else="") AS CommentFlag,
+          if(condition=KeyData AND NOT KeyData =~ "^[A-Za-z0-9+/]+={0,2}$",
+             then="MALFORMED_KEY_DATA",
+             else="") AS MalformedFlag,
+          if(condition=NOT KeyType AND LineFormat != "UNPARSEABLE",
+             then="MISSING_KEY_TYPE",
+             else="") AS TypeFlag
+        FROM Classified
+
+  - name: DuplicateKeyReport
+    description: Identical key data reused across multiple authorized_keys files, a lateral persistence indicator.
+    query: |
+      LET KeyFiles <= SELECT OSPath, IsDir
+        FROM glob(globs=[HomeSshGlob, RootSshGlob])
+        WHERE NOT IsDir AND OSPath =~ FilterRegex
+
+      LET ParsedLines <= SELECT
+          KeyFiles.OSPath AS OSPath,
+          Line,
+          LineNumber
+        FROM foreach(
+          row=KeyFiles,
+          query={
+            SELECT Line, LineNumber
+            FROM split_records(
+              filenames=KeyFiles.OSPath,
+              regex="\n",
+              columns=["Line"])
+          })
+
+      LET CleanLines <= SELECT OSPath, LineNumber,
+          regex_replace(source=Line, re="^\\s+", replace="") AS CleanLine
+        FROM ParsedLines
+        WHERE Line =~ "\\S" AND NOT Line =~ "^\\s*#"
+
+      LET Tokenized <= SELECT OSPath, CleanLine,
+          split(string=CleanLine, sep="\\s+") AS Tokens,
+          len(list=split(string=CleanLine, sep="\\s+")) AS NTokens
+        FROM CleanLines
+
+      LET KeyDataPerLine <= SELECT OSPath, CleanLine,
+          if(condition=CleanLine =~ KeyTypeRegex AND NTokens > 1,
+             then=Tokens[1],
+             else=if(condition=CleanLine =~ OptionsRegex AND NTokens > 2,
+                     then=Tokens[2],
+                     else="")) AS KeyData
+        FROM Tokenized
+
+      LET KeyCounts <= SELECT KeyData, count() AS TimesSeen
+        FROM KeyDataPerLine
+        WHERE KeyData
+        GROUP BY KeyData
+
+      SELECT KeyData, TimesSeen
+        FROM KeyCounts
+        WHERE TimesSeen > 1
+
+  - name: SshdConfigReview
+    description: sshd_config directives that control where authorized keys are loaded from.
+    query: |
+      LET ConfigFiles <= SELECT OSPath, IsDir
+        FROM glob(globs=[SshdConfigGlob, SshdDropinGlob])
+        WHERE NOT IsDir
+
+      SELECT ConfigFiles.OSPath AS OSPath, Line, LineNumber
+        FROM foreach(
+          row=ConfigFiles,
+          query={
+            SELECT Line, LineNumber
+            FROM split_records(
+              filenames=ConfigFiles.OSPath,
+              regex="\n",
+              columns=["Line"])
+          })
+        WHERE Line =~ SshdConfigRegex
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: LineNumber
+    type: int
+  - name: MD5
+    type: string
+  - name: SHA256
+    type: string
