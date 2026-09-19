@@ -1,0 +1,101 @@
+name: Custom.DFIR.LongRunningProcessOutboundHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for suspicious outbound connections from long-running processes.
+
+  Adversaries exfiltrating data over an existing command-and-control channel
+  (MITRE ATT&CK T1041 - Exfiltration Over C2 Channel) often operate through
+  legitimate, long-lived processes (service hosts, browsers, system
+  utilities) hijacked via process injection or DLL side-loading. This
+  artifact correlates live sockets from netstat() with process metadata from
+  pslist() and keeps established connections to external (non-private,
+  non-link-local) remote addresses made by processes that have been running
+  longer than MinAgeHours - a strong signal for beaconing or quiet
+  exfiltration from a process that should not be talking outbound.
+
+  Cross-platform: works on Windows, Linux and macOS clients. Results are
+  ordered by process creation time so the longest-lived talking processes
+  surface first.
+
+reference:
+  - https://attack.mitre.org/techniques/T1041/
+
+type: CLIENT
+
+parameters:
+  - name: MinAgeHours
+    type: int64
+    description: Only report processes running at least this many hours.
+    default: 24
+  - name: ProcessNameRegex
+    type: regex
+    description: Include only processes whose name matches this regex.
+    default: '.'
+  - name: ProcessNameExcludeRegex
+    type: regex
+    description: Exclude processes whose name matches this regex.
+    default: '^$'
+  - name: ConnectionStatusRegex
+    type: regex
+    description: Socket states to include.
+    default: 'ESTABLISHED'
+  - name: RemoteIPExcludeRegex
+    type: regex
+    description: Exclude remote IPs matching this regex (defaults to private, loopback and link-local ranges).
+    default: '^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1|f[cd]|fe[89ab])'
+  - name: RemotePortRegex
+    type: regex
+    description: Include only connections whose remote port matches this regex.
+    default: '.'
+
+sources:
+  - name: Results
+    description: |
+      Long-running processes with established outbound connections to
+      external addresses, oldest process first.
+    query: |
+      LET ProcInfo <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+        WHERE Name =~ ProcessNameRegex AND NOT Name =~ ProcessNameExcludeRegex
+
+      SELECT
+        Pid,
+        Name AS ProcessName,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime,
+        (now() - CreateTime) / 3600000 AS AgeHours,
+        LocalIP,
+        LocalPort,
+        RemoteIP,
+        RemotePort,
+        Status
+      FROM foreach(
+        row={
+          SELECT Pid AS NetPid,
+                 Laddr.IP AS LocalIP,
+                 Laddr.Port AS LocalPort,
+                 Raddr.IP AS RemoteIP,
+                 Raddr.Port AS RemotePort,
+                 Status
+          FROM netstat()
+          WHERE Status =~ ConnectionStatusRegex
+            AND NOT Raddr.IP =~ RemoteIPExcludeRegex
+            AND format(format='%v', args=[Raddr.Port]) =~ RemotePortRegex
+        },
+        query={
+          SELECT Pid, Name, Exe, CommandLine, Username, CreateTime, NetPid,
+                 LocalIP, LocalPort, RemoteIP, RemotePort, Status
+          FROM ProcInfo
+          WHERE Pid = NetPid
+            AND (now() - CreateTime) / 3600000 >= MinAgeHours
+        }
+      )
+      ORDER BY CreateTime
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: path
