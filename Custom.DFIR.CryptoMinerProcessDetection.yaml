@@ -1,0 +1,104 @@
+name: Custom.DFIR.CryptoMinerProcessDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects cryptocurrency miner activity through two complementary signals
+  (MITRE ATT&CK T1496 - Resource Hijacking).
+
+  1. MinerProcesses: known miner process-name signatures and mining-pool
+     indicators in command lines (xmrig, cpuminer, ethminer, nanominer,
+     stratum+tcp pools, --donate-level flags, kdevtmpfsi/kinsing droppers).
+  2. HighCPUProcesses: a live two-sample CPU measurement - pslist() is
+     snapshotted, the agent waits SampleWindowSeconds, then snapshots again;
+     any process that consumed more than CPUThresholdPercent of one CPU core
+     during the window is reported, highest consumer first. A short live
+     sample catches miners even when names and command lines are masqueraded.
+
+  Cross-platform: works on Windows, Linux and macOS clients. The
+  velociraptor agent itself and common benign system workers are excluded to
+  avoid self-flagging and noise.
+
+reference:
+  - https://attack.mitre.org/techniques/T1496/
+
+type: CLIENT
+
+parameters:
+  - name: ProcessNameRegex
+    type: regex
+    description: Process-name signatures of known miners and miner droppers.
+    default: '(?i)(xmrig|cpuminer|minerd|minergate|ethminer|cgminer|bfgminer|nanominer|gminer|nbminer|lolminer|srbminer|trexminer|phoenixminer|teamredminer|wildrig|rigel|bzminer|miniz|bminer|claymore|ewbf|dstm|mining|monerod|kdevtmpfsi|kinsing|dbused|sysupdate|sysguard)'
+  - name: CmdlinePoolRegex
+    type: regex
+    description: Mining-pool and miner-configuration indicators inside command lines.
+    default: '(?i)(stratum\+tcp|stratum\+ssl|stratum://|--donate-level|--cpu-max-threads-hint|--randomx|--pool|nicehash|nanopool|f2pool|minexmr|supportxmr|pool\.minergate|hashvault|miningpoolhub|xmr\.pool)'
+  - name: CPUThresholdPercent
+    type: int64
+    description: Report processes consuming at least this percentage of one CPU core during the sampling window.
+    default: 80
+  - name: SampleWindowSeconds
+    type: int64
+    description: Length of the live CPU sampling window in seconds.
+    default: 5
+  - name: ExcludeProcessRegex
+    type: regex
+    description: Benign processes excluded from all results (agent self-match, system workers).
+    default: '(?i)(velociraptor|kworker|kthreadd|ksoftirqd|migration|rcu_|systemd|dbus-daemon|agetty|udevd|sshd|cron)'
+
+sources:
+  - name: MinerProcesses
+    description: |
+      Processes whose name matches known miner signatures or whose command
+      line contains mining-pool indicators, with cumulative CPU time and
+      resident memory for triage.
+    query: |
+      SELECT Pid, Ppid, Name AS ProcessName, Exe, CommandLine, Username, Cwd,
+             CreateTime AS ProcessStartTime,
+             Times.user + Times.system AS TotalCPUTimeSeconds,
+             MemoryInfo.rss / 1048576 AS RSS_MB,
+             if(condition=CommandLine =~ CmdlinePoolRegex,
+                then="Mining pool signature in command line",
+                else="Miner name signature match") AS MatchReason
+      FROM pslist()
+      WHERE (Name =~ ProcessNameRegex OR CommandLine =~ CmdlinePoolRegex)
+        AND NOT Name =~ ExcludeProcessRegex
+
+  - name: HighCPUProcesses
+    description: |
+      Live CPU sampling: two pslist() snapshots SampleWindowSeconds apart;
+      processes that consumed more than CPUThresholdPercent of one core
+      during the window, highest consumer first.
+    query: |
+      LET First <= SELECT Pid AS FPid, Times.user + Times.system AS CPUStart
+        FROM pslist()
+      LET _ <= SELECT sleep(time=SampleWindowSeconds) AS Slept FROM scope()
+      SELECT Pid, Ppid, Name AS ProcessName, Exe, CommandLine, Username, Cwd,
+             CreateTime AS ProcessStartTime, CPUEnd, CPUStart,
+             CPUEnd - CPUStart AS CPUSecondsInWindow,
+             100 * (CPUEnd - CPUStart) / SampleWindowSeconds AS CPUPercent
+      FROM foreach(
+        row={
+          SELECT Pid, Ppid, Name, Exe, CommandLine, Username, Cwd, CreateTime,
+                 Times.user + Times.system AS CPUEnd
+          FROM pslist()
+          WHERE NOT Name =~ ExcludeProcessRegex
+        },
+        query={
+          SELECT Pid, Ppid, Name AS ProcessName, Exe, CommandLine, Username, Cwd,
+                 CreateTime AS ProcessStartTime, CPUEnd, CPUStart,
+                 CPUEnd - CPUStart AS CPUSecondsInWindow,
+                 100 * (CPUEnd - CPUStart) / SampleWindowSeconds AS CPUPercent
+          FROM First
+          WHERE FPid = Pid
+            AND SampleWindowSeconds > 0
+            AND 100 * (CPUEnd - CPUStart) / SampleWindowSeconds >= CPUThresholdPercent
+        }
+      )
+      ORDER BY CPUPercent DESC
+
+column_types:
+  - name: ProcessStartTime
+    type: timestamp
+  - name: Exe
+    type: path
+  - name: Cwd
+    type: path
