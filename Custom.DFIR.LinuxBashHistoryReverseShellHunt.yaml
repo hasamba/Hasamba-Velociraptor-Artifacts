@@ -1,0 +1,76 @@
+name: Custom.DFIR.LinuxBashHistoryReverseShellHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for reverse shell command patterns in user shell history files.
+
+  When a Linux endpoint is compromised, the attacker's reverse shell one-liner
+  often remains in the affected user's .bash_history. This artifact globs
+  shell history files for all users (including root), splits each file into
+  lines and flags lines matching a configurable reverse shell regex:
+  /dev/tcp and /dev/udp redirects (bash -i >& /dev/tcp/IP/PORT), awk
+  /inet/tcp/ clients, zsh ztcp net module usage, netcat/ncat -e handlers,
+  socat EXEC/SYSTEM helpers, mkfifo + nc pipelines and python/perl/php/ruby
+  socket one-liners. Hits are enriched with the owning user, history file
+  metadata and SHA256 so the analyst can triage affected accounts, correlate
+  suspicious timestamps and spot cleared or rotated histories in the
+  inventory source. MITRE ATT&CK T1059.004 (Unix Shell).
+
+reference:
+  - https://attack.mitre.org/techniques/T1059.004/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    description: Comma separated globs for shell history files across all users.
+    default: /home/*/.bash_history,/root/.bash_history,/home/*/.bash_history-*
+  - name: FilterRegex
+    type: regex
+    description: Regex applied to every history line; matches are reverse shell candidates.
+    default: >-
+      (?i)(\b(bash|zsh|sh)\s+-i\s+>&|/dev/(tcp|udp)/|/inet/tcp/|zsh/net/tcp|\bnc[\w.-]*\s+.*-e\s|socat\s+.*(EXEC|SYSTEM)|mkfifo\s+.*\bnc(at)?\b|python3?\s+-c\s+['"].{0,500}import\s+socket|perl\s+-e\s+['"].{0,500}use\s+Socket|php\s+-r\s+['"].{0,500}fsockopen|ruby\s+-rsocket\s+-e\s+['"].{0,500}TCPSocket)
+
+sources:
+  - name: ReverseShellMatches
+    description: Individual history lines matching reverse shell patterns.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime AS HistoryMtime
+        FROM glob(globs=TargetGlob)
+      LET Hits <= SELECT * FROM foreach(
+        row=Files,
+        query={
+          SELECT OSPath,
+                 parse_string_with_regex(
+                   regex="(?P<User>[^/]+)/\\.bash_history",
+                   string=str(str=OSPath)).User AS Username,
+                 HistoryMtime,
+                 Line
+          FROM split_records(filenames=OSPath, regex="\\n", columns=["Line"])
+          WHERE Line =~ FilterRegex
+        })
+      SELECT Username,
+             OSPath AS HistoryFile,
+             HistoryMtime,
+             Line AS MatchedCommand
+      FROM Hits
+
+  - name: HistoryFileInventory
+    description: All discovered history files with size, mtime and SHA256 for tamper triage.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=TargetGlob)
+      SELECT OSPath AS HistoryFile,
+             parse_string_with_regex(
+               regex="(?P<User>[^/]+)/\\.bash_history",
+               string=str(str=OSPath)).User AS Username,
+             Size,
+             Mtime AS LastModified,
+             hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256
+      FROM Files
+
+column_types:
+  - name: HistoryMtime
+    type: timestamp
+  - name: LastModified
+    type: timestamp
