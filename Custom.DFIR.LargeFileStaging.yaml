@@ -1,106 +1,118 @@
 name: Custom.DFIR.LargeFileStaging
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detects large files staged in temporary and user directories that may indicate
-  collection and staging activity prior to exfiltration (MITRE ATT&CK T1074.001).
+  Detects large files staged in temporary and user-writable directories,
+  a common precursor to exfiltration (MITRE ATT&CK T1074.001 - Local Data
+  Staging). Adversaries frequently collect documents, archives, and disk
+  images into temp/user folders before compressing and exfiltrating them.
 
-  Adversaries often collect and stage large files in temp directories, user
-  profiles, or other writable locations before compressing and exfiltrating them.
-  This artifact scans common staging paths for files exceeding a size threshold,
-  flags recently modified files, and computes hashes for identification.
+  The artifact enumerates files above a configurable size threshold in
+  temp, downloads, desktop, and documents locations, filters them by
+  filename regex, restricts results to recently modified files to surface
+  fresh staging activity, and hashes every hit (MD5 + SHA256). Windows is
+  the primary platform; Unix globs are included so the artifact runs
+  cross-platform - globs for paths that do not exist on a given OS simply
+  return no rows.
 
+  Triage guidance: large recent archives or disc images inside Temp
+  directories, especially with staging-like names, justify immediate
+  follow-up with collection tooling and network telemetry review.
 reference:
-  - https://attack.mitre.org/techniques/T1074/001/
-
+  - https://attack.mitre.org/techniques/T1074.001/
 type: CLIENT
 
 parameters:
-  - name: MinSizeMB
+  - name: TargetGlobs
+    type: glob
+    default: |
+      [
+        "C:/Users/*/Downloads/**",
+        "C:/Users/*/Desktop/**",
+        "C:/Users/*/Documents/**",
+        "C:/Users/*/AppData/Local/Temp/**",
+        "C:/Users/*/AppData/Roaming/**",
+        "C:/Windows/Temp/**",
+        "C:/ProgramData/Temp/**",
+        "/tmp/**",
+        "/var/tmp/**",
+        "/home/*/Downloads/**",
+        "/home/*/Desktop/**",
+        "/home/*/Documents/**"
+      ]
+  - name: SizeThresholdBytes
     type: int
-    default: 50
-    description: Minimum file size in MB to flag as staged
-  - name: RecentDays
+    default: "104857600"
+  - name: AgeFilterDays
     type: int
-    default: 7
-    description: Only show files modified within this many days
-  - name: TempGlob
-    type: glob
-    default: "C:/Windows/Temp/**"
-    description: Windows system temp directory glob
-  - name: UserTempGlob
-    type: glob
-    default: "C:/Users/*/AppData/Local/Temp/**"
-    description: Per-user temp directory glob
-  - name: UserProfileGlob
-    type: glob
-    default: "C:/Users/*/Downloads/**"
-    description: User Downloads directory glob
-  - name: StagingRegex
+    default: "7"
+  - name: FilterRegex
     type: regex
-    default: "(?i)\\.(zip|rar|7z|tar|gz|iso|img|vhd|dmp|csv|pst|ost|db|sqlite)$"
-    description: Regex to match suspicious staging file extensions
+    default: "."
+  - name: ExcludeRegex
+    type: regex
+    default: |
+      (?i)(/Cache/|/Code Cache/|/GPUCache/|/node_modules/|/\.venv/|/\.git/|/Crashpad/|/D3DSCache/)
 
 sources:
-  - name: TempDirStaging
-    description: Scans Windows system and user temp directories for large staged files
+  - name: StagedFiles
+    description: |
+      Large recent files in temp and user directories with MD5/SHA256 hashes.
     query: |
-      LET MinBytes = MinSizeMB * 1024 * 1024
-      LET Cutoff = timestamp(epoch=now() - RecentDays * 86400)
+      LET CandidateFiles = SELECT OSPath, Size, Mtime, Btime
+        FROM glob(globs=TargetGlobs)
+        WHERE Size > SizeThresholdBytes
+          AND OSPath =~ FilterRegex
+          AND if(condition=ExcludeRegex,
+                 then= NOT (OSPath =~ ExcludeRegex),
+                 else= TRUE)
+          AND Mtime > timestamp(epoch=now() - AgeFilterDays * 86400)
 
-      LET TempFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
-        FROM glob(globs=TempGlob)
-        WHERE NOT IsDir AND Size > MinBytes
-
-      LET UserTempFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
-        FROM glob(globs=UserTempGlob)
-        WHERE NOT IsDir AND Size > MinBytes
-
-      LET AllTempFiles <= SELECT * FROM chain(
-        a={ SELECT * FROM TempFiles },
-        b={ SELECT * FROM UserTempFiles }
-      )
+      LET HashedFiles = SELECT *,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+        FROM CandidateFiles
 
       SELECT
-        OSPath,
-        Size,
-        Mtime,
-        Atime,
-        Ctime,
-        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
-      FROM AllTempFiles
-      WHERE Mtime > Cutoff
-      ORDER BY Size DESC
+        OSPath AS Path,
+        Size AS SizeBytes,
+        Mtime AS Modified,
+        Btime AS Created,
+        Hashes.MD5 AS MD5,
+        Hashes.SHA256 AS SHA256,
+        if(condition=Path =~ "(?i)temp|tmp", then="temp_dir",
+           else=if(condition=Path =~ "(?i)downloads", then="downloads",
+             else=if(condition=Path =~ "(?i)desktop", then="desktop",
+               else="user_dir"))) AS LocationHint
+      FROM HashedFiles
+      ORDER BY SizeBytes DESC
 
-  - name: UserDownloadsStaging
-    description: Scans user Downloads directories for large archived files matching staging patterns
+  - name: StagingSummary
+    description: |
+      Aggregate staging activity per parent directory to spot collection folders.
     query: |
-      LET MinBytes = MinSizeMB * 1024 * 1024
-      LET Cutoff = timestamp(epoch=now() - RecentDays * 86400)
+      LET CandidateFiles = SELECT OSPath, Size, Mtime, Btime
+        FROM glob(globs=TargetGlobs)
+        WHERE Size > SizeThresholdBytes
+          AND OSPath =~ FilterRegex
+          AND if(condition=ExcludeRegex,
+                 then= NOT (OSPath =~ ExcludeRegex),
+                 else= TRUE)
+          AND Mtime > timestamp(epoch=now() - AgeFilterDays * 86400)
 
-      LET DownloadFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime
-        FROM glob(globs=UserProfileGlob)
-        WHERE NOT IsDir AND Size > MinBytes
-
-      SELECT
-        OSPath,
-        Size,
-        Mtime,
-        Atime,
-        Ctime,
-        OSPath =~ StagingRegex AS MatchesStagingPattern,
-        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
-      FROM DownloadFiles
-      WHERE Mtime > Cutoff
-      ORDER BY Size DESC
+      SELECT dirname(path=OSPath) AS ParentDirectory,
+             count() AS FileCount,
+             sum(item=Size) AS TotalSizeBytes
+      FROM CandidateFiles
+      GROUP BY ParentDirectory
+      ORDER BY TotalSizeBytes DESC
 
 column_types:
-  - name: OSPath
+  - name: Path
     type: path
-  - name: Mtime
+  - name: Modified
     type: timestamp
-  - name: Atime
+  - name: Created
     type: timestamp
-  - name: Ctime
-    type: timestamp
-  - name: Size
-    type: number
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
