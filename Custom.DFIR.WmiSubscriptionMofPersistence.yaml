@@ -1,0 +1,110 @@
+name: Custom.DFIR.WmiSubscriptionMofPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects WMI permanent event subscription persistence (MITRE ATT&CK T1546.003)
+  through the artifacts it leaves on disk and in the registry.
+
+  Adversaries establish persistence by compiling attacker-supplied MOF files that
+  register a __EventFilter, bind it to a CommandLineEventConsumer or
+  ActiveScriptEventConsumer through a __FilterToConsumerBinding in the
+  ROOT/subscription namespace, so arbitrary code executes whenever the filter's
+  query fires. The WMI repository is rebuilt from MOF files and the WBEM
+  AutoRecover mechanism, so this artifact hunts MOF files whose content registers
+  subscriptions, inspects the WBEM CIMOM registry values (AutoRecover MOF lists)
+  that drive repository rebuilds, and correlates
+  Microsoft-Windows-WMI-Activity/Operational events (5857/5860/5861) showing
+  event consumers actually executing.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.003/
+  - https://learn.microsoft.com/en-us/windows/win32/wmisdk/permanent-subscriptions
+
+type: CLIENT
+
+parameters:
+  - name: MofGlob
+    type: glob
+    default: C:/Windows/**/*.mof
+    description: Primary MOF hunt glob (covers System32/wbem and AutoRecover).
+
+  - name: ExtraMofGlob
+    type: glob
+    default: C:/ProgramData/**/*.mof
+    description: Additional MOF hunt glob for attacker staging directories.
+
+  - name: MofSuspiciousRegex
+    type: regex
+    default: (?i)root.?subscription|__EventFilter|CommandLineEventConsumer|ActiveScriptEventConsumer|__FilterToConsumerBinding
+    description: Flags MOF content registering WMI event subscriptions.
+
+  - name: RegistryValueRegex
+    type: regex
+    default: (?i).
+    description: Filter on WBEM CIMOM registry value data (MOF auto-recover entries).
+
+  - name: EvtxGlob
+    type: glob
+    default: C:/Windows/System32/winevt/Logs/Microsoft-Windows-WMI-Activity%4*.evtx
+    description: WMI-Activity event logs.
+
+  - name: EvtxEventIdRegex
+    type: regex
+    default: 5857|5860|5861
+    description: WMI-Activity event IDs of interest.
+
+sources:
+  - name: MofFiles
+    description: |
+      Scans MOF files for __EventFilter, consumer class, and
+      __FilterToConsumerBinding definitions, and produces a content preview
+      with hashes for triage.
+    query: |
+      LET MofCandidates <= SELECT OSPath, Size,
+              timestamp(epoch=Mtime) AS Mtime,
+              hash(path=OSPath, hashselect="MD5,SHA256") AS Hash,
+              read_file(filename=OSPath, length=1048576) AS Content
+          FROM glob(globs=[MofGlob, ExtraMofGlob])
+         WHERE Size > 0 AND Size < 5242880
+      SELECT OSPath, Size, Mtime, Hash,
+             substr(str=Content, start=0, end=2048) AS ContentPreview
+        FROM MofCandidates
+       WHERE Content =~ MofSuspiciousRegex
+
+  - name: CimomAutoRecover
+    description: |
+      Enumerates HKLM SOFTWARE/Microsoft/WBEM/CIMOM registry values (including
+      the AutoRecover MOF lists) that rebuild the WMI repository on demand.
+    query: |
+      LET CimomValues <= SELECT OSPath,
+              format(format="%v", args=[Data.value]) AS ValueData,
+              format(format="%v", args=[Data.type]) AS ValueType,
+              timestamp(epoch=Mtime) AS ModTime
+          FROM glob(globs=["HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/*",
+                           "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/WBEM/CIMOM/**/*"],
+                    accessor="registry")
+      SELECT OSPath, ValueData, ValueType, ModTime
+        FROM CimomValues
+       WHERE ValueData =~ RegistryValueRegex
+             OR OSPath =~ "(?i)autorecover"
+
+  - name: WmiActivityEvents
+    description: |
+      Correlates Microsoft-Windows-WMI-Activity/Operational events showing
+      event consumers starting and executing.
+    query: |
+      LET EvtxFiles <= SELECT OSPath FROM glob(globs=EvtxGlob)
+      SELECT timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+             format(format="%v", args=[System.EventID.Value]) AS EventIDText,
+             System.Computer AS Computer,
+             EventData AS EventData
+        FROM foreach(row=EvtxFiles,
+                     query={ SELECT * FROM parse_evtx(filename=OSPath) })
+       WHERE EventIDText =~ EvtxEventIdRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: ModTime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
