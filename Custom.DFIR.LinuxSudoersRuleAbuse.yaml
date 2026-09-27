@@ -1,0 +1,109 @@
+name: Custom.DFIR.LinuxSudoersRuleAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for sudo rule abuse and unauthorized NOPASSWD grants on Linux (MITRE ATT&CK T1548.003 - Sudo and Sudo Caching).
+
+  Enumerates /etc/sudoers and every drop-in under /etc/sudoers.d, extracting lines that grant passwordless sudo, over-broad run-as targets, wildcard/shell grants, and suspicious Defaults (e.g. !authenticate). File-level metadata (mode, timestamps, SHA256) exposes tampering with sudoers files, and an auth-log source surfaces sudo COMMAND usage, denied commands, and "not in the sudoers" escalation attempts when plain-text auth logs are present.
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.003/
+
+type: CLIENT
+
+parameters:
+  - name: SudoersGlob
+    type: glob
+    description: Main sudoers file to inspect
+    default: /etc/sudoers
+
+  - name: SudoersDGlob
+    type: glob
+    description: Sudoers drop-in directory glob to inspect
+    default: /etc/sudoers.d/*
+
+  - name: SudoRuleRegex
+    type: regex
+    description: Suspicious sudoers line patterns (NOPASSWD, broad ALL grants, shells, risky utilities)
+    default: '(?i)(NOPASSWD|NOEXEC|NOSETENV|SETENV|\(\s*ALL\s*[:!,]|\(\s*ALL\s*\)|ALL\s*=\s*ALL|Defaults[^#\n]*!\s*(authenticate|requiretty)|/bin/(ba|z|k|da)?sh\s|/\*|\sALL$|^\s*\*\s|\s(vi|vim|nano|find|awk|sed|perl|python3?|less|more|man|env|tee|tar|scp|chmod|chown|passwd|su|bash)\s)'
+
+  - name: SudoersFilterRegex
+    type: regex
+    description: Only report sudoers files whose path matches this regex
+    default: "."
+
+  - name: CommentRegex
+    type: regex
+    description: Lines matching this regex are ignored as comments or blanks
+    default: '^\s*#|^\s*$'
+
+  - name: IncludeAuthLogs
+    type: bool
+    description: Also parse plain-text auth logs for sudo activity
+    default: "Y"
+
+  - name: AuthLogGlob
+    type: glob
+    description: Primary auth log file to inspect
+    default: /var/log/auth.log
+
+  - name: SudoLogRegex
+    type: regex
+    description: Sudo activity patterns to match in auth logs
+    default: '(?i)(sudo\[[0-9]+\]|COMMAND=|command not allowed|not in the sudoers|authentication failure|incorrect password attempts)'
+
+sources:
+  - name: SudoersSuspiciousRules
+    description: Individual suspicious rule lines found in sudoers files
+    query: |
+      LET Files = SELECT OSPath, Size, Mtime, Mode
+        FROM glob(globs=[SudoersGlob, SudoersDGlob])
+      SELECT OSPath AS SudoersFile,
+             Mode,
+             Mtime AS ModifiedTime,
+             Line AS SuspiciousRule
+      FROM foreach(
+        row=Files,
+        query={
+          SELECT OSPath, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ SudoRuleRegex
+            AND NOT Line =~ CommentRegex
+        })
+      WHERE OSPath =~ SudoersFilterRegex
+
+  - name: SudoersFileInfo
+    description: Per-file sudoers metadata, hash and timestamp evidence
+    query: |
+      SELECT OSPath AS SudoersFile,
+             Size,
+             Mode,
+             Mtime AS ModifiedTime,
+             Ctime AS ChangedTime,
+             hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256
+      FROM glob(globs=[SudoersGlob, SudoersDGlob])
+      WHERE OSPath =~ SudoersFilterRegex
+
+  - name: RecentSudoActivity
+    description: Sudo command usage and denied/escalation attempts from auth logs
+    query: |
+      SELECT OSPath AS LogFile, Line AS SudoEvent
+      FROM foreach(
+        row={ SELECT OSPath
+              FROM glob(globs=[AuthLogGlob,
+                               "/var/log/auth.log.1",
+                               "/var/log/secure",
+                               "/var/log/secure.1",
+                               "/var/log/sudo.log"])
+              WHERE IncludeAuthLogs },
+        query={
+          SELECT OSPath, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE Line =~ SudoLogRegex
+        })
+      LIMIT 1000
+
+column_types:
+  - name: ModifiedTime
+    type: timestamp
+  - name: ChangedTime
+    type: timestamp
