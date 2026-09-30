@@ -1,0 +1,93 @@
+name: Custom.DFIR.PowerShellEncodedCommandHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for PowerShell encoded command execution (-EncodedCommand / -enc / -ec) artifacts
+  in Windows PowerShell Script Block Logging (Event ID 4104,
+  Microsoft-Windows-PowerShell/Operational).
+
+  Threat actors routinely launch PowerShell with a Base64-encoded command line
+  (powershell -nop -w hidden -EncodedCommand <base64>). Even when parent process
+  telemetry (Sysmon 1 / Security 4688) is not captured, Script Block Logging records
+  the raw -EncodedCommand invocation, allowing recovery of the Base64 payload without
+  the original process context.
+
+  This artifact scans the PowerShell Operational event log, filters script block text
+  for encoded-command switches with a configurable regex, extracts the Base64 token,
+  decodes it (payload is typically UTF-16LE), and emits both forms plus the SHA256 of
+  the scanned event log for integrity. Large script blocks are split across multiple
+  4104 messages; fragments are keyed by ScriptBlockId for reassembly.
+
+reference:
+  - https://attack.mitre.org/techniques/T1059.001/
+  - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_logging_windows
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-PowerShell*.evtx"
+  - name: EncodedSwitchRegex
+    type: regex
+    default: '(?i)-enc(odedcommand)?\b|-ec\b'
+  - name: Base64TokenRegex
+    type: regex
+    default: '(?i)-enc(?:odedcommand)?\s+"?(?P<Encoded>[A-Za-z0-9+/=]{8,})'
+  - name: ContentFilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: EncodedCommandHits
+    description: Event 4104 script blocks containing an encoded-command switch, with recovered Base64 token and decoded payload.
+    query: |
+      LET evtx_files <= SELECT OSPath FROM glob(globs=TargetGlob)
+
+      SELECT EventTime, Computer, RecordID, HostProcessPath, ScriptBlockId,
+        MessageNumber, MessageTotal, EvtxPath, ScriptBlockText,
+        EncodedToken, DecodedCommand, DecodedRaw, LogFileSHA256
+      FROM foreach(
+        row=evtx_files,
+        query={
+          SELECT OSPath AS EvtxPath,
+            timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+            System.Computer AS Computer,
+            System.EventRecordID AS RecordID,
+            EventData.Path AS HostProcessPath,
+            EventData.ScriptBlockId AS ScriptBlockId,
+            EventData.MessageNumber AS MessageNumber,
+            EventData.MessageTotal AS MessageTotal,
+            EventData.ScriptBlockText AS ScriptBlockText,
+            hash(path=OSPath, hashselect='SHA256').SHA256 AS LogFileSHA256,
+            parse_string_with_regex(
+              string=EventData.ScriptBlockText,
+              regex=Base64TokenRegex).Encoded AS EncodedToken,
+            if(condition=parse_string_with_regex(
+                 string=EventData.ScriptBlockText,
+                 regex=Base64TokenRegex).Encoded,
+               then=utf16(string=base64decode(string=parse_string_with_regex(
+                 string=EventData.ScriptBlockText,
+                 regex=Base64TokenRegex).Encoded)),
+               else=NULL) AS DecodedCommand,
+            if(condition=parse_string_with_regex(
+                 string=EventData.ScriptBlockText,
+                 regex=Base64TokenRegex).Encoded,
+               then=base64decode(string=parse_string_with_regex(
+                 string=EventData.ScriptBlockText,
+                 regex=Base64TokenRegex).Encoded),
+               else=NULL) AS DecodedRaw
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4104
+            AND EventData.ScriptBlockText =~ EncodedSwitchRegex
+            AND EventData.ScriptBlockText =~ ContentFilterRegex
+        })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: HostProcessPath
+    type: path
+  - name: EvtxPath
+    type: path
+  - name: LogFileSHA256
+    type: hash
