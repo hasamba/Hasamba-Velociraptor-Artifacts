@@ -1,12 +1,20 @@
 name: Custom.DFIR.ShadowCopyDeletionDetection
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detects shadow copy deletion commands via wmic and vssadmin in process logs.
-  
-  Adversaries may delete volume shadow copies to prevent recovery of encrypted files,
-  commonly observed in ransomware operations (MITRE ATT&CK T1490 - Inhibit System Recovery).
-  This artifact monitors process creation events for known destructive commands targeting
-  VSS snapshots and shadow storage.
+  Detect shadow copy deletion commands (vssadmin delete shadows, wmic
+  shadowcopy delete, Win32_ShadowCopy removal) in Windows process logs.
+
+  Inhibit System Recovery (T1490) is a hallmark ransomware pre-encryption
+  step. Attackers wipe Volume Shadow Copies using native tooling:
+    - vssadmin delete shadows /all /quiet
+    - wmic shadowcopy delete (classic WMIC process invocation)
+    - PowerShell Get-WmiObject Win32_ShadowCopy piped to Remove-WmiObject
+  This artifact hunts that evidence in Windows process creation telemetry:
+  Sysmon EventID 1 (Microsoft-Windows-Sysmon/Operational) and the Windows
+  Security EventID 4688 (process auditing). Events are only surfaced when
+  the process command line matches the FilterRegex signature. Note: 4688
+  only carries CommandLine when "Audit Process Creation" with command line
+  logging is enabled on the endpoint; Sysmon is the preferred sensor.
 
 reference:
   - https://attack.mitre.org/techniques/T1490/
@@ -14,100 +22,88 @@ reference:
 type: CLIENT
 
 parameters:
-  - name: ProcessRegex
+  - name: TargetGlob
+    type: glob
+    description: Glob for the event log files to examine.
+    default: C:/Windows/System32/winevt/Logs/*.evtx
+
+  - name: LogFilterRegex
     type: regex
-    default: "(?i)(vssadmin\\.exe.*delete|wmic\\.exe.*shadowcopy.*delete|wmic\\.exe.*shadowcopy.*set.*context|vssadmin\\.exe.*delete shadows|vssadmin\\.exe.*resize shadowstorage)"
-  - name: UploadLogs
-    type: bool
-    default: "false"
-    description: Upload full EVTX files for offline analysis.
+    description: Only examine event logs whose path matches this regex.
+    default: '(?i)Sysmon|Security'
+
+  - name: FilterRegex
+    type: regex
+    description: Match process command lines indicating shadow copy deletion.
+    default: '(?i)vssadmin\s+delete\s+shadow|wmic\s+.*shadowcopy\s+delete|Win32_ShadowCopy.*(Remove-WmiObject|Remove-CimInstance|\$\.Delete)'
 
 sources:
-  - name: ProcessEvents
-    description: |
-      Scans Security EVTX for process creation events (Event ID 4688) matching
-      shadow copy deletion command patterns.
+  - name: SysmonProcessCreation
+    description: Sysmon EventID 1 process creations matching the shadow deletion signature.
     query: |
-      LET SecurityLogs <= SELECT OSPath FROM glob(
-        globs="C:/Windows/System32/winevt/Logs/Security.evtx")
+      LET SysmonPaths <= SELECT OSPath, Mtime
+        FROM glob(globs=TargetGlob)
+        WHERE OSPath =~ LogFilterRegex AND OSPath =~ "Sysmon"
 
-      LET ParsedEvents <= SELECT * FROM foreach(
-        row=SecurityLogs,
+      LET SysmonEvents <= SELECT * FROM foreach(
+        row=SysmonPaths,
         query={
-          SELECT
-            System.TimeCreated.SystemTime AS EventTime,
-            System.EventID.Value AS EventID,
-            EventData.SubjectUserName AS SubjectUserName,
-            EventData.SubjectDomainName AS SubjectDomainName,
-            EventData.NewProcessName AS NewProcessName,
-            EventData.CommandLine AS CommandLine,
-            EventData.ParentProcessName AS ParentProcessName,
-            OSPath AS EvtxPath
+          SELECT timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+                 System.Computer AS Hostname,
+                 OSPath AS LogPath,
+                 EventData.Image AS Image,
+                 EventData.CommandLine AS CommandLine,
+                 EventData.ParentImage AS ParentImage,
+                 EventData.ParentCommandLine AS ParentCommandLine,
+                 EventData.User AS User,
+                 EventData.Hashes AS Hashes
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 1
+        })
+
+      SELECT EventTime, Hostname, Image, CommandLine,
+             ParentImage, ParentCommandLine, User, Hashes, LogPath
+      FROM SysmonEvents
+      WHERE CommandLine =~ FilterRegex
+
+  - name: Security4688ProcessCreation
+    description: Security EventID 4688 process creations matching the shadow deletion signature.
+    query: |
+      LET SecPaths <= SELECT OSPath, Mtime
+        FROM glob(globs=TargetGlob)
+        WHERE OSPath =~ LogFilterRegex AND OSPath =~ "Security"
+
+      LET SecEvents <= SELECT * FROM foreach(
+        row=SecPaths,
+        query={
+          SELECT timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+                 System.Computer AS Hostname,
+                 OSPath AS LogPath,
+                 EventData.NewProcessName AS ProcessPath,
+                 EventData.CommandLine AS CommandLine,
+                 EventData.SubjectDomainName AS UserDomain,
+                 EventData.SubjectUserName AS User
           FROM parse_evtx(filename=OSPath)
           WHERE System.EventID.Value = 4688
-            AND EventData.CommandLine =~ ProcessRegex
         })
 
-      SELECT * FROM if(
-        condition=UploadLogs,
-        then={
-          SELECT *,
-            upload(file=EvtxPath) AS EvtxUpload
-          FROM ParsedEvents
-        },
-        else={
-          SELECT * FROM ParsedEvents
-        })
-
-  - name: CommandLineAudit
-    description: |
-      Scans PowerShell operational log and Terminal Services log for additional
-      shadow copy deletion commands including WMI-based and PowerShell variants.
-    query: |
-      LET EvtxGlobs <= SELECT OSPath FROM glob(
-        globs=[
-          "C:/Windows/System32/winevt/Logs/Microsoft-Windows-PowerShell%4Operational.evtx",
-          "C:/Windows/System32/winevt/Logs/Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx"
-        ])
-
-      LET ParsedAll <= SELECT * FROM foreach(
-        row=EvtxGlobs,
-        query={
-          SELECT
-            System.TimeCreated.SystemTime AS EventTime,
-            System.EventID.Value AS EventID,
-            EventData AS EventData,
-            Message AS Message,
-            OSPath AS EvtxPath
-          FROM parse_evtx(filename=OSPath)
-          WHERE Message =~ ProcessRegex
-             OR (EventData.CommandLine =~ ProcessRegex)
-        })
-
-      SELECT * FROM ParsedAll
-
-  - name: LiveProcessCheck
-    description: |
-      Checks currently running processes for active shadow copy deletion commands.
-      Catches in-progress attacks that haven't yet completed.
-    query: |
-      SELECT
-        Pid,
-        Ppid,
-        Name,
-        Exe,
-        CommandLine,
-        Username,
-        timestamp(epoch=CreateTime) AS CreateTime
-      FROM pslist()
-      WHERE CommandLine =~ ProcessRegex
+      SELECT EventTime, Hostname, ProcessPath, CommandLine,
+             UserDomain, User, LogPath
+      FROM SecEvents
+      WHERE CommandLine =~ FilterRegex
 
 column_types:
   - name: EventTime
     type: timestamp
-  - name: CreateTime
-    type: timestamp
-  - name: EvtxPath
+  - name: LogPath
     type: path
-  - name: EvtxUpload
+  - name: OSPath
     type: path
+  - name: Image
+    type: path
+  - name: ProcessPath
+    type: path
+  - name: ParentImage
+    type: path
+  - name: Hashes
+    type: long
