@@ -1,0 +1,153 @@
+name: Custom.DFIR.LinuxPasswdShadowTampering
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for suspicious modifications to /etc/passwd and /etc/shadow on Linux
+  endpoints, covering MITRE ATT&CK T1136.001 (Create Account: Local Account).
+
+  Attackers with root access often bypass useradd/usermod and edit /etc/passwd
+  or /etc/shadow directly to plant backdoor accounts, clone root privileges
+  (UID 0) or create passwordless logins. This artifact inventories the live
+  files and their common backups (/etc/passwd-, /etc/shadow-) with sizes,
+  timestamps and SHA256 hashes for baseline comparison, then parses every
+  account row and flags:
+
+  - UID 0 accounts other than root (direct privilege escalation)
+  - Passwordless accounts (empty password hash field in /etc/shadow)
+  - Password hashes embedded directly in /etc/passwd
+  - NIS/legacy "+" entries
+  - Accounts whose shadow lastchg falls within RecentDays (fresh account setup)
+  - Accounts with interactive login shells (tunable via regex)
+  - Files modified within the last RecentDays
+
+  Triage order: compare FileInventory hashes/mtimes against your known-good
+  baseline, then review flagged rows in PasswdAccounts and ShadowAccounts.
+
+reference:
+  - https://attack.mitre.org/techniques/T1136.001/
+
+type: CLIENT
+
+parameters:
+  - name: TargetFiles
+    type: glob
+    default: |
+      /etc/passwd
+      /etc/passwd-
+      /etc/shadow
+      /etc/shadow-
+
+  - name: InteractiveShellRegex
+    type: regex
+    default: "(^|/)(ba|z|k|a|da)?sh$"
+
+  - name: RecentDays
+    type: int
+    default: "14"
+
+  - name: UserFilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: FileInventory
+    description: |
+      Target file metadata, SHA256 hashes, content preview and
+      recent-modification flags. Compare against your known-good baseline.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Ctime, Btime FROM glob(globs=TargetFiles, accessor="file")
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Ctime,
+             Btime,
+             hash(path=OSPath, accessor="file", hashselect="SHA256").SHA256 AS SHA256,
+             read_file(filename=OSPath, accessor="file", length=131072) AS Content,
+             if(condition=Mtime > timestamp(epoch=now() - 86400 * RecentDays),
+                then="RECENTLY MODIFIED - review against baseline",
+                else="") AS RecentFlag
+      FROM Files
+
+  - name: PasswdAccounts
+    description: |
+      Parsed /etc/passwd* entries with flags for UID 0 non-root accounts,
+      embedded password hashes, NIS "+" entries and interactive shells.
+    query: |
+      LET Files <= SELECT OSPath FROM glob(globs=TargetFiles, accessor="file") WHERE OSPath =~ "passwd"
+      LET PwdRaw = SELECT OSPath, Line FROM foreach(row=Files, query={
+          SELECT OSPath, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+      })
+      LET PwdParsed = SELECT OSPath, Line,
+             parse_string_with_regex(
+               string=Line,
+               regex="^(?P<User>[^:]+):(?P<Pass>[^:]*):(?P<Uid>[0-9]+):(?P<Gid>[0-9]+):(?P<Gecos>[^:]*):(?P<Home>[^:]*):(?P<Shell>[^\\r\\n]*)$") AS Fields
+      FROM PwdRaw
+      SELECT OSPath,
+             Line,
+             Fields.User AS User,
+             Fields.Uid AS Uid,
+             Fields.Gid AS Gid,
+             Fields.Gecos AS Gecos,
+             Fields.Home AS Home,
+             Fields.Shell AS Shell,
+             if(condition=Fields.Uid = "0" AND NOT Fields.User =~ "^root$",
+                then="UID 0 NON-ROOT ACCOUNT",
+                else=NULL) AS UidZeroFlag,
+             if(condition=Fields.Pass =~ "^\\$1\\$|^\\$5\\$|^\\$6\\$|^\\$y\\$|^\\$2",
+                then="PASSWORD HASH EMBEDDED IN passwd",
+                else=NULL) AS EmbeddedHashFlag,
+             if(condition=Line =~ "^\\+",
+                then="NIS/legacy + entry",
+                else=NULL) AS NisFlag,
+             if(condition=Fields.Shell =~ InteractiveShellRegex,
+                then="INTERACTIVE SHELL",
+                else=NULL) AS InteractiveShellFlag
+      FROM PwdParsed
+      WHERE Fields.User AND Fields.User =~ UserFilterRegex
+
+  - name: ShadowAccounts
+    description: |
+      Parsed /etc/shadow* entries with flags for passwordless accounts and
+      accounts whose password (lastchg) was set within RecentDays.
+    query: |
+      LET Files <= SELECT OSPath FROM glob(globs=TargetFiles, accessor="file") WHERE OSPath =~ "shadow"
+      LET ShRaw = SELECT OSPath, Line FROM foreach(row=Files, query={
+          SELECT OSPath, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+      })
+      LET ShParsed = SELECT OSPath, Line,
+             parse_string_with_regex(
+               string=Line,
+               regex="^(?P<User>[^:]+):(?P<Hash>[^:]*):(?P<LastChange>[^:]*):(?P<Min>[^:]*):(?P<Max>[^:]*):(?P<Warn>[^:]*):(?P<Inactive>[^:]*):(?P<Expire>[^:]*):(?P<Flag>[^\\r\\n]*)$") AS Fields
+      FROM ShRaw
+      SELECT OSPath,
+             Line,
+             Fields.User AS User,
+             Fields.Hash AS Hash,
+             Fields.LastChange AS LastChange,
+             Fields.Inactive AS Inactive,
+             Fields.Expire AS Expire,
+             if(condition=Fields.Hash = "",
+                then="EMPTY PASSWORD HASH (PASSWORDLESS LOGIN)",
+                else=NULL) AS PasswordlessFlag,
+             if(condition=Fields.LastChange =~ "^[0-9]+$" AND
+                atoi(string=Fields.LastChange) > now() / 86400 - RecentDays,
+                then="PASSWORD/ACCOUNT SET RECENTLY (within RecentDays)",
+                else=NULL) AS RecentChgFlag,
+             if(condition=Line =~ "^\\+",
+                then="NIS/legacy + entry",
+                else=NULL) AS NisFlag
+      FROM ShParsed
+      WHERE Fields.User AND Fields.User =~ UserFilterRegex
+
+column_types:
+  - name: OSPath
+    type: OSPath
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: SHA256
+    type: hash
