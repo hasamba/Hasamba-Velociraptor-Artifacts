@@ -1,0 +1,142 @@
+name: Custom.DFIR.WebshellDocumentRootHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for webshells planted in web server document roots on Linux
+  endpoints (MITRE ATT&CK T1505.003: Server Software Component: Web Shell).
+
+  Attackers who compromise a web application drop files that execute
+  attacker-controlled commands over HTTP. The files are usually small
+  PHP/JSP/ASP/ASPX scripts named innocuously or left with known shell
+  names, and the payload is typically obfuscated (base64/gz/rot13 eval
+  chains, preg_replace /e, request-parameter driven command execution).
+
+  This artifact walks common Linux web roots (Apache/Nginx defaults,
+  /srv, XAMPP, public_html), selects script-like and backup files, and
+  scans their contents for command-execution and de-obfuscation
+  signatures. Files whose names look like known webshells (c99, wso,
+  b374k and friends) are flagged even when the content is obfuscated
+  beyond the content regexes.
+
+  Two triage views:
+
+  - WebshellHits: content/ filename signature matches with size, mtime,
+    MD5+SHA256 and the matched regex fragments as evidence. Set
+    UploadEvidences=Y to also upload the matched files to the server.
+  - RecentDocrootFiles: every non-excluded file under the web roots
+    modified within RecentDays - the classic "what landed recently"
+    list for catching fully obfuscated shells that evade content
+    signatures.
+
+  Triage order: review ContentFlag hits first, then RecentDocrootFiles
+  entries flagged SCRIPT/TEXT FILE, and compare mtimes/hashes against
+  your known-good baseline (deploy tarball hashes, CI artifacts).
+
+reference:
+  - https://attack.mitre.org/techniques/T1505.003/
+  - https://www.acunetix.com/blog/articles/introduction-web-shells/
+  - https://www.netspi.com/blog/technical/web-penetration-testing/finding-evasive-php-webshells-with-regex/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: |
+      /var/www/**/*
+      /usr/share/nginx/html/**/*
+      /usr/local/nginx/html/**/*
+      /usr/local/apache2/htdocs/**/*
+      /opt/lampp/htdocs/**/*
+      /srv/**/*
+      /app/public/**/*
+      /home/*/public_html/**/*
+
+  - name: ScanExtensionsFilter
+    type: regex
+    default: '(?i)\.(php[0-9]?|phps|phtml|phar|inc|asp|aspx|ascx|ashx|asmx|config|jsp|jspx|jspa|jws|jhtml|pl|cgi|py|rb|sh|lua|shtml|htm|html|htaccess|htpasswd|user\.ini|ini|env|txt|bak|old|swp|swo|save|dist)$'
+
+  - name: FilenameRegex
+    type: regex
+    default: '(?i)^(c99|r57|wso|b374k|phpspy|antichat|filesman|sh3ll|shell|webshell|backdoor|cmdshell|alfa.?shell|spy|hack|root)[._a-z0-9-]*\.(php[0-9]?|phtml|asp|aspx|jsp|jspx|py|pl|cgi|txt)$'
+
+  - name: WebshellRegex
+    type: regex
+    default: '(?i)(?P<Hit>eval\s*\(\s*(?:base64_decode|gzinflate|gzuncompress|str_rot13|convert_uudecode|assert|file_get_contents)\s*\(|assert\s*\(\s*\$|(?:system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE|SERVER)|base64_decode\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)|eval\s*\(\s*\$_?(?:GET|POST|REQUEST)|preg_replace\s*\(\s*[^,)]{0,200}\/e[\x27\x22]?\s*,|\$_(?:GET|POST|REQUEST|COOKIE)\s*\[\s*[\x27\x22]?cmd|c99shell|r57shell|wso\.php|b374k|phpspy|antichat|filesman|webshell|runtime\.getruntime\s*\(\s*\)\s*\.exec|scripting\.filesystemobject|eval\s*\(\s*request\.|__import__\s*\(\s*[\x27\x22](?:os|subprocess)|os\.system\s*\(\s*[\x27\x22]?request|subprocess\.[a-z]+s?\s*\(\s*request)'
+
+  - name: ExcludeFilter
+    type: regex
+    default: '(?i)/(vendor|node_modules|caches?|logs?|tmp|temp|sessions?|tests?|fixtures?|\.git|\.svn|\.hg|\.idea)(/|$)'
+
+  - name: RecentDays
+    type: int
+    default: "7"
+
+  - name: MaxFileSize
+    type: int64
+    default: "500000"
+
+  - name: UploadEvidences
+    type: bool
+    default: "N"
+
+sources:
+  - name: WebshellHits
+    description: |
+      Files under the web roots whose content matches webshell
+      signatures or whose name looks like a known shell, with the
+      matched fragments, MD5/SHA256 and optional evidence upload.
+    query: |
+      LET Files <= SELECT OSPath, Name, Size, Mtime
+          FROM glob(globs=TargetGlob, accessor="file")
+          WHERE NOT IsDir AND
+                (OSPath =~ ScanExtensionsFilter OR Name =~ FilenameRegex) AND
+                NOT OSPath =~ ExcludeFilter
+      LET Scannable <= SELECT OSPath, Name, Size, Mtime
+          FROM Files
+          WHERE Size > 0 AND Size < atoi(string=MaxFileSize)
+      LET Hits <= SELECT OSPath, Name, Size, Mtime,
+             read_file(filename=OSPath, accessor="file", length=atoi(string=MaxFileSize)) AS Content
+          FROM Scannable
+          WHERE Content =~ WebshellRegex OR Name =~ FilenameRegex
+
+      SELECT OSPath,
+             Name,
+             Size,
+             Mtime,
+             if(condition=Content =~ WebshellRegex,
+                then="CONTENT SIGNATURE MATCH",
+                else=NULL) AS ContentFlag,
+             if(condition=Name =~ FilenameRegex,
+                then="SUSPICIOUS FILENAME",
+                else=NULL) AS FilenameFlag,
+             parse_string_with_regex(string=Content, regex=WebshellRegex) AS MatchedPatterns,
+             hash(path=OSPath, hashselect=["MD5","SHA256"]).MD5 AS MD5,
+             hash(path=OSPath, hashselect=["MD5","SHA256"]).SHA256 AS SHA256,
+             if(condition=UploadEvidences,
+                then=upload(file=OSPath, accessor="file"),
+                else=NULL) AS Upload
+      FROM Hits
+
+  - name: RecentDocrootFiles
+    description: |
+      Non-excluded files under the web roots modified within RecentDays,
+      flagged when script/text-like for baseline comparison when the
+      content signatures miss a fully obfuscated shell.
+    query: |
+      SELECT OSPath, Name, Size, Mtime,
+             if(condition=OSPath =~ ScanExtensionsFilter,
+                then="SCRIPT/TEXT FILE",
+                else=NULL) AS ScriptLikeFlag
+      FROM glob(globs=TargetGlob, accessor="file")
+      WHERE NOT IsDir AND NOT OSPath =~ ExcludeFilter AND
+            Mtime > timestamp(epoch=now() - 86400 * atoi(string=RecentDays))
+
+column_types:
+  - name: OSPath
+    type: OSPath
+  - name: Mtime
+    type: timestamp
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
