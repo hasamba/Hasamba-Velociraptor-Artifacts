@@ -1,0 +1,142 @@
+name: Custom.DFIR.PortForwardingTunnelToolsDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for evidence of protocol tunneling / port forwarding tools
+  (chisel, socat, plink, ngrok) consistent with MITRE ATT&CK T1572
+  (Protocol Tunneling).
+
+  Detection layers:
+   - RunningProcesses (cross-platform): live processes whose name or
+     command line matches the tunnel tool regex.
+   - ActiveTunnelConnections (cross-platform): netstat connections owned
+     by tunnel process PIDs, capturing live listeners and remote relays.
+   - ToolBinariesOnDisk (cross-platform): targeted globs over common
+     staging locations (Downloads, Public, Windows Temp, C:/Temp,
+     PerfLogs, ProgramData top levels, .ngrok2 profile dirs, /tmp, /opt,
+     /usr/local/bin, /home) with SHA256/MD5 hashes and optional triage
+     upload of hits.
+   - WindowsAutorunsRegistry (Windows): Run/RunOnce values whose name or
+     full registry path references tunnel tools.
+   - NetshPortProxy (Windows): any entries under the PortProxy service
+     registry tree - netsh portproxy forwarding is a classic T1572
+     indicator; presence of any mapping is reported by design.
+   - ProcessCreationEvents (Windows): Security 4688 / Sysmon EID 1
+     process creations whose CommandLine, Image, NewProcessName or
+     ParentCommandLine mention tunnel tools (historical executions).
+   - PersistenceConfigs (cross-platform): systemd units, cron, rc.local,
+     autostart, launchd plists and ngrok YAML configs whose content
+     references tunnel tools.
+
+  Note: process, connection, binary and config sources run on any
+  platform. Registry, portproxy and EVTX sources apply to Windows
+  clients and silently return no rows on other platforms.
+
+reference:
+  - https://attack.mitre.org/techniques/T1572/
+  - https://github.com/jpillora/chisel
+
+type: CLIENT
+
+parameters:
+  - name: FilterRegex
+    type: regex
+    description: Case-insensitive regex matched against process names, command lines, file names, registry value names and config/script contents.
+    default: "(?i)(chisel|socat|plink|ngrok)"
+
+  - name: UploadBinaries
+    type: bool
+    description: If true, upload tunnel tool binaries found on disk as triage evidence.
+    default: false
+
+sources:
+  - name: RunningProcesses
+    description: Live processes whose name or command line matches the tunnel tool regex.
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+      FROM pslist()
+      WHERE Name =~ FilterRegex OR CommandLine =~ FilterRegex
+
+  - name: ActiveTunnelConnections
+    description: Live TCP/UDP connections owned by tunnel processes (listeners and relay endpoints).
+    query: |
+      LET TunnelPids <= SELECT Pid AS TunnelPid FROM pslist() WHERE Name =~ FilterRegex OR CommandLine =~ FilterRegex
+      SELECT Pid, Status, Laddr.IP AS LocalAddress, Laddr.Port AS LocalPort, Raddr.IP AS RemoteAddress, Raddr.Port AS RemotePort
+      FROM foreach(row=TunnelPids, query={
+        SELECT Pid, Status, Laddr.IP AS LocalAddress, Laddr.Port AS LocalPort, Raddr.IP AS RemoteAddress, Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Pid = TunnelPid
+      })
+
+  - name: ToolBinariesOnDisk
+    description: Tunnel tool executables in common staging directories, hashed; optional upload.
+    query: |
+      LET Hits <= SELECT OSPath, Name, Size, Mtime AS Modified FROM glob(globs=["C:/Users/*/Downloads/**", "C:/Users/Public/**", "C:/Users/*/.ngrok2/*", "C:/Windows/Temp/**", "C:/Temp/**", "C:/PerfLogs/**", "C:/ProgramData/*", "C:/ProgramData/*/*", "/tmp/**", "/opt/**", "/usr/local/bin/*", "/home/*/**"]) WHERE NOT IsDir AND Name =~ FilterRegex
+      SELECT OSPath, Name, Size, Modified, hash(path=OSPath, hashselect="SHA256,MD5") AS Hash,
+             if(condition=UploadBinaries, then=upload(file=OSPath)) AS Upload
+      FROM Hits
+
+  - name: WindowsAutorunsRegistry
+    description: Run/RunOnce registry values whose name or full path references tunnel tools.
+    query: |
+      SELECT OSPath AS ValuePath, Name, Mtime AS Modified FROM glob(globs=["HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*", "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*", "HKEY_LOCAL_MACHINE/SOFTWARE/WOW6432Node/Microsoft/Windows/CurrentVersion/Run/*", "HKEY_USERS/*/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*", "HKEY_USERS/*/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*"], accessor="registry") WHERE Name =~ FilterRegex OR OSPath =~ FilterRegex
+
+  - name: NetshPortProxy
+    description: Any entries under the PortProxy registry tree indicate netsh portproxy forwarding (classic T1572 setup).
+    query: |
+      SELECT OSPath AS RegistryKey, Name, Mtime AS Modified
+      FROM glob(globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/PortProxy/**", accessor="registry")
+
+  - name: ProcessCreationEvents
+    description: Security 4688 and Sysmon EID 1 process creation events referencing tunnel tools.
+    query: |
+      LET EventLogs <= SELECT OSPath FROM glob(globs=["C:/Windows/System32/winevt/Logs/Security*.evtx", "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon*Operational*.evtx"])
+      SELECT SystemTime AS EventTime, EventID, Computer, Image, CommandLine, NewProcessName, ParentCommandLine, User, OSPath AS EventLogPath
+      FROM foreach(row=EventLogs, query={
+        SELECT OSPath,
+               System.TimeCreated.SystemTime AS SystemTime,
+               System.EventID.Value AS EventID,
+               System.Computer AS Computer,
+               EventData.Image AS Image,
+               EventData.CommandLine AS CommandLine,
+               EventData.NewProcessName AS NewProcessName,
+               EventData.ParentCommandLine AS ParentCommandLine,
+               EventData.User AS User
+        FROM parse_evtx(filename=OSPath)
+        WHERE System.EventID.Value IN (1, 4688)
+          AND (EventData.CommandLine =~ FilterRegex
+               OR EventData.NewProcessName =~ FilterRegex
+               OR EventData.Image =~ FilterRegex
+               OR EventData.ParentCommandLine =~ FilterRegex)
+      })
+
+  - name: PersistenceConfigs
+    description: systemd units, cron, rc.local, autostart, launchd plists and ngrok YAML configs whose content references tunnel tools.
+    query: |
+      LET ConfigFiles <= SELECT OSPath FROM glob(globs=["/etc/systemd/system/**", "/usr/lib/systemd/system/**", "/etc/init.d/*", "/etc/cron.d/*", "/etc/cron.hourly/*", "/etc/cron.daily/*", "/var/spool/cron/*", "/var/spool/cron/crontabs/*", "/etc/rc.local", "/etc/rc.d/**", "/home/*/.config/autostart/*.desktop", "/home/*/.config/ngrok/*.yml", "/Library/LaunchAgents/*", "/Library/LaunchDaemons/*", "C:/Users/*/.config/ngrok/*.yml", "C:/Users/*/.ngrok2/*.yml"]) WHERE NOT IsDir
+      SELECT OSPath, Content
+      FROM foreach(row=ConfigFiles, query={
+        SELECT OSPath, read_file(filename=OSPath, length=65536) AS Content FROM scope()
+      })
+      WHERE Content =~ FilterRegex
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Modified
+    type: timestamp
+  - name: SystemTime
+    type: timestamp
+  - name: EventTime
+    type: timestamp
+  - name: OSPath
+    type: os_path
+  - name: ValuePath
+    type: os_path
+  - name: RegistryKey
+    type: os_path
+  - name: EventLogPath
+    type: os_path
+  - name: Hash
+    type: hash
+  - name: Upload
+    type: compressed_url
