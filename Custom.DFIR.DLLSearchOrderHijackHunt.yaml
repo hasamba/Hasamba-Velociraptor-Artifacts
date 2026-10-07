@@ -1,0 +1,170 @@
+name: Custom.DFIR.DLLSearchOrderHijackHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for evidence of DLL search order hijacking (MITRE ATT&CK T1574.001 -
+  DLL Side-Loading) on Windows endpoints by examining Temp directories and
+  the PATH environment variable.
+
+  Background: Windows resolves DLLs referenced by name (without a full
+  path) through a fixed search order. Applications launched from, or with
+  a current working directory inside, user-writable locations (Temp
+  folders, PATH directories) can be tricked into loading an
+  attacker-planted DLL that shadows a legitimate system library name.
+
+  Detection layers:
+   - TempDLLs: all DLLs present in user, SYSTEM-profile and service temp
+     folders, hashed, with a flag when the file name matches a library
+     commonly targeted for hijacking (version.dll, winmm.dll, dwmapi.dll,
+     api-ms-win-* proxies, etc). A DLL named after a core system library
+     sitting in a Temp folder is a strong hijack drop indicator.
+   - PathDirAnalysis: expands the system and per-user PATH entries
+     (HKLM Session Manager Environment + HKU <SID> Environment), checks
+     whether every PATH directory actually exists and flags directories
+     rooted under user-writable locations. A missing or user-writable
+     PATH directory is a ready-made hijack location.
+   - PATHDirectoryDLLHits: within PATH directories (optionally excluding
+     authoritative system folders), finds DLLs whose names match common
+     hijack targets - candidate shadowing libraries positioned earlier in
+     the search order than the legitimate copy.
+   - SafeDllSearchModeCheck: reads the SafeDllSearchMode value. REG_DWORD
+     0 disables the safe ordering (current directory searched before
+     system32) which materially widens hijack opportunities; a missing
+     value or 1 means the default safe order is in effect.
+
+  Note: TempGlob covers Windows Temp, per-user Temp, the SYSTEM profile
+  Temp and service profile Temp locations. Registry-based PATH analysis
+  covers all loaded user hives. Globs for paths that do not exist return
+  no rows silently.
+
+reference:
+  - https://attack.mitre.org/techniques/T1574.001/
+  - https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
+
+type: CLIENT
+
+parameters:
+  - name: TempGlob
+    type: glob
+    description: Newline-separated glob patterns for DLLs inside Temp-style directories.
+    default: |
+      C:/Windows/Temp/**/*.dll
+      C:/Windows/System32/config/systemprofile/AppData/Local/Temp/**/*.dll
+      C:/Windows/ServiceProfiles/*/AppData/Local/Temp/**/*.dll
+      C:/Users/*/AppData/Local/Temp/**/*.dll
+      C:/Temp/**/*.dll
+
+  - name: HijackDLLRegex
+    type: regex
+    description: DLL file names commonly targeted for search order hijacking.
+    default: '(?i)^((version|winmm|dwmapi|uxtheme|profapi|shell32|shcore|shlwapi|comctl32|propsys|mscoree|oleaut32|oledlg|dbghelp|cryptbase|sspicli|urlmon|iertutil|ntwdblib|winsqlite3|sqlite3|msvcp|msvcr|vcruntime|wintrust|d3d9|d3d11|dxgi|opengl32|userenv|iphlpapi|dnsapi|secur32|wtsapi32)[0-9_]*|api-ms-win-[^/]*|ext-ms-[^/]*)\.dll$'
+
+  - name: UserWritableRootRegex
+    type: regex
+    description: PATH directories rooted under user-writable locations.
+    default: '^(?i)(C:/Users|C:/ProgramData|C:/Temp|C:/Windows/Temp|/tmp|/Users|/home)'
+
+  - name: StandardDirRegex
+    type: regex
+    description: Authoritative system library folders excluded from the PATHDirectoryDLLHits source when ExcludeStandardDirs is true.
+    default: '^(?i)C:/Windows/(System32|SysWOW64|WinSxS|Microsoft\.NET|systemprofile)'
+
+  - name: ExcludeStandardDirs
+    type: bool
+    description: Skip DLL matches inside standard authoritative system folders in PATHDirectoryDLLHits.
+    default: true
+
+sources:
+  - name: TempDLLs
+    description: DLLs found in Temp folders, hashed, flagged when the name matches common hijack targets.
+    query: |
+      LET TempDLLs <= SELECT OSPath, Name, Size, Mtime AS Modified, Btime AS Created
+        FROM glob(globs=split(string=strip(string=TempGlob, prefix="\n "), sep="\n"))
+        WHERE NOT IsDir AND Size > 0
+
+      SELECT OSPath, Name,
+             Name =~ HijackDLLRegex AS NameHijackCandidate,
+             Size, Modified, Created,
+             hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+             hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256
+      FROM TempDLLs
+      ORDER BY NameHijackCandidate DESC
+      LIMIT 2000
+
+  - name: PathDirAnalysis
+    description: Every PATH directory from system and per-user environment, with existence and user-writability checks.
+    query: |
+      LET EnvPathValues <= SELECT OSPath AS RegistryPath,
+          read_file(filename=OSPath, accessor="registry") AS PathValue
+        FROM glob(globs=[
+            "HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Control/Session Manager/Environment/Path",
+            "HKEY_USERS/*/Environment/Path"],
+          accessor="registry")
+        WHERE PathValue
+
+      LET PathDirs <= SELECT RegistryPath, _dir AS RawEntry,
+          strip(string=join(array=split(string=expand(path=_dir), sep="\\"), sep="/"), prefix="/") AS Directory
+        FROM foreach(row=EnvPathValues, query={
+          SELECT RegistryPath, _value AS _dir
+          FROM foreach(row=split(string=PathValue, sep=";"))
+        })
+        WHERE _dir
+
+      LET DirProbed <= SELECT RegistryPath, RawEntry, Directory,
+          { SELECT "Yes" AS Hit FROM glob(globs=Directory) LIMIT 1 } AS Probe
+        FROM PathDirs
+
+      SELECT RegistryPath, RawEntry, Directory,
+             if(condition=len(list=Probe) > 0, then="Yes", else="No") AS DirExists,
+             if(condition=Directory =~ UserWritableRootRegex, then="Yes", else="No") AS UserWritable
+      FROM DirProbed
+
+  - name: PATHDirectoryDLLHits
+    description: DLLs inside PATH directories whose names match common hijack targets (shadowing candidates).
+    query: |
+      LET EnvPathValues <= SELECT OSPath AS RegistryPath,
+          read_file(filename=OSPath, accessor="registry") AS PathValue
+        FROM glob(globs=[
+            "HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Control/Session Manager/Environment/Path",
+            "HKEY_USERS/*/Environment/Path"],
+          accessor="registry")
+        WHERE PathValue
+
+      LET PathDirs <= SELECT RegistryPath, _dir AS RawEntry,
+          strip(string=join(array=split(string=expand(path=_dir), sep="\\"), sep="/"), prefix="/") AS Directory
+        FROM foreach(row=EnvPathValues, query={
+          SELECT RegistryPath, _value AS _dir
+          FROM foreach(row=split(string=PathValue, sep=";"))
+        })
+        WHERE _dir
+
+      SELECT RegistryPath, Directory, Name, OSPath, Size,
+             Mtime AS Modified, Btime AS Created
+      FROM foreach(row=PathDirs, query={
+        SELECT RegistryPath, Directory, Name, OSPath, Size, Mtime, Btime
+        FROM glob(globs=Directory + "/*.dll")
+        WHERE NOT IsDir AND Name =~ HijackDLLRegex AND
+              if(condition=ExcludeStandardDirs,
+                 then=NOT (Directory =~ StandardDirRegex),
+                 else=true)
+      })
+      LIMIT 500
+
+  - name: SafeDllSearchModeCheck
+    description: Reports the SafeDllSearchMode configuration value when present.
+    query: |
+      SELECT OSPath AS RegistryKey,
+             read_file(filename=OSPath, accessor="registry") AS SafeDllSearchMode
+      FROM glob(globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Control/Session Manager/SafeDllSearchMode",
+                accessor="registry")
+
+column_types:
+  - name: OSPath
+    type: os_path
+  - name: RegistryPath
+    type: os_path
+  - name: RegistryKey
+    type: os_path
+  - name: Modified
+    type: timestamp
+  - name: Created
+    type: timestamp
