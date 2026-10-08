@@ -1,0 +1,174 @@
+name: Custom.DFIR.OfficeMacroTrustAndRecentDocs
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Identifies evidence of Office macro content being enabled on Windows endpoints
+  via registry TrustRecords and Office RecentDocs keys.
+
+  TrustRecords - When a user enables content or macros in an Office document,
+  the application writes a trust record under
+  Software\Microsoft\Office\<version>\<App>\Security\TrustRecords. The value
+  name is the full document path (sometimes prefixed with ~!) and the value
+  data is a REG_BINARY trust record that commonly starts with or contains a
+  RAW1/RAW2 marker. An entry naming a macro-enabled document is strong evidence
+  that the user allowed macro execution for that specific file.
+
+  RecentDocs - The Office\..\App\RecentDocs keys record documents opened by
+  each application. Value names carry the document name while REG_BINARY value
+  data embeds the full opening path as UTF-16LE terminated by NUL bytes. The
+  value data is decoded and both the raw value name and the decoded full path
+  are reported, enabling a per-document macro-use timeline.
+
+  The artifact enumerates all loaded user hives (HKEY_USERS/*) across Office
+  versions for Access, Excel, PowerPoint, Publisher, Visio and Word. A third
+  source inventories macro-capable documents present on disk (optionally hashed
+  and uploaded) to correlate which documents exist on the endpoint.
+
+reference:
+  - https://attack.mitre.org/techniques/T1137.001/
+
+type: CLIENT
+
+parameters:
+  - name: DocPathRegex
+    type: regex
+    default: '(?i)\.(docm|dotm|doc|dot|xlm|xlsb|xlsm|xltm|xls|xlt|pptm|ppsm|potm|ppt|pot|pps|ppam|xlam)$'
+
+  - name: TrustRegistryGlob
+    type: glob
+    default: 'HKEY_USERS/*/SOFTWARE/Microsoft/Office/*/{Access,Excel,PowerPoint,Publisher,Visio,Word}/Security/TrustRecords/*'
+
+  - name: RecentDocsRegistryGlob
+    type: glob
+    default: 'HKEY_USERS/*/SOFTWARE/Microsoft/Office/*/{Access,Excel,PowerPoint,Publisher,Visio,Word}/RecentDocs/**'
+
+  - name: DocsOnDiskGlob
+    type: glob
+    default: 'C:/Users/**/*.{doc,dot,docm,dotm,xls,xlt,xlm,xlsb,xlsm,xltm,ppt,pot,pps,pptm,potm,ppsm,ppam,xlam}'
+
+  - name: IncludeAllDocs
+    type: bool
+    default: "N"
+
+  - name: HashFiles
+    type: bool
+    default: "N"
+
+  - name: UploadEvidence
+    type: bool
+    default: "N"
+
+sources:
+  - name: TrustRecords
+    description: Documents for which the user enabled content/macros, per Office TrustRecords registry entries.
+    query: |
+      LET TrustData = SELECT
+          OSPath,
+          OSPath.Basename AS ValueName,
+          Mtime AS LastWrite,
+          read_file(filename=OSPath, accessor="registry", length=2048) AS Data
+        FROM glob(globs=TrustRegistryGlob, accessor="registry")
+        WHERE IncludeAllDocs OR OSPath.Basename =~ DocPathRegex
+
+      SELECT
+        LastWrite AS LastWrite,
+        format(format="%v", args=[OSPath]) AS RegistryPath,
+        regex_replace(
+          source=format(format="%v", args=[OSPath]),
+          re="^(?i).*?Office[\\\\/]+([0-9.]+)[\\\\/]+[A-Za-z]+[\\\\/]+(?:Security|RecentDocs).*$",
+          replace="${1}") AS OfficeVersion,
+        regex_replace(
+          source=format(format="%v", args=[OSPath]),
+          re="^(?i).*?Office[\\\\/]+[0-9.]+[\\\\/]+([A-Za-z]+)[\\\\/]+(?:Security|RecentDocs).*$",
+          replace="${1}") AS OfficeApp,
+        ValueName AS TrustRecordValue,
+        regex_replace(source=ValueName, re="^~!", replace="") AS DocPath,
+        if(condition=Data =~ "RAW[12]",
+           then=regex_replace(source=Data, re="(?is).*?(RAW[12]).*", replace="${1}"),
+           else="") AS TrustMarker,
+        if(condition=UploadEvidence,
+           then=upload(file=OSPath, accessor="registry")) AS DataUpload
+      FROM TrustData
+
+  - name: RecentDocs
+    description: Documents recently opened in Office apps, with the full path decoded from RecentDocs registry values.
+    query: |
+      LET RecentLeaves = SELECT
+          OSPath,
+          OSPath.Basename AS ValueName,
+          Mtime AS LastWrite
+        FROM glob(globs=RecentDocsRegistryGlob, accessor="registry")
+        WHERE NOT OSPath.Basename =~ "(?i)recentdocs$"
+
+      LET RecentData = SELECT
+          *,
+          read_file(filename=OSPath, accessor="registry", length=4096) AS Data
+        FROM RecentLeaves
+
+      LET RecentBlobs = SELECT
+          *,
+          utf16(string=Data) AS DecodedBlob,
+          split(string=utf16(string=Data), sep="\x00") AS PathParts
+        FROM RecentData
+
+      SELECT
+        LastWrite AS LastWrite,
+        format(format="%v", args=[OSPath]) AS RegistryPath,
+        regex_replace(
+          source=format(format="%v", args=[OSPath]),
+          re="^(?i).*?Office[\\\\/]+([0-9.]+)[\\\\/]+[A-Za-z]+[\\\\/]+(?:Security|RecentDocs).*$",
+          replace="${1}") AS OfficeVersion,
+        regex_replace(
+          source=format(format="%v", args=[OSPath]),
+          re="^(?i).*?Office[\\\\/]+[0-9.]+[\\\\/]+([A-Za-z]+)[\\\\/]+(?:Security|RecentDocs).*$",
+          replace="${1}") AS OfficeApp,
+        ValueName AS RecentDocsValue,
+        if(condition=PathParts[0] =~ "^[A-Za-z]:|^\\\\",
+           then=PathParts[0],
+           else=if(condition=len(list=PathParts) > 1,
+                   then=PathParts[1],
+                   else="")) AS DocPathDecoded,
+        if(condition=UploadEvidence,
+           then=upload(file=OSPath, accessor="registry")) AS DataUpload
+      FROM RecentBlobs
+      WHERE IncludeAllDocs OR ValueName =~ DocPathRegex OR DocPathDecoded =~ DocPathRegex
+
+  - name: MacroDocsOnDisk
+    description: Macro-capable documents present on disk, optionally hashed and uploaded for correlation.
+    query: |
+      LET DiskDocs <= SELECT
+          OSPath,
+          Size,
+          Mtime AS LastWrite
+        FROM glob(globs=DocsOnDiskGlob)
+        WHERE IncludeAllDocs OR OSPath =~ DocPathRegex
+
+      LET DiskHashed = SELECT
+          *,
+          hash(path=OSPath, hashselect="SHA256") AS HashInfo
+        FROM DiskDocs
+
+      SELECT
+        OSPath AS OSPath,
+        Size AS Size,
+        LastWrite AS LastWrite,
+        if(condition=HashFiles, then=HashInfo.SHA256) AS SHA256,
+        if(condition=UploadEvidence, then=upload(file=OSPath)) AS DocUpload
+      FROM if(condition=HashFiles, then=DiskHashed, else=DiskDocs)
+
+column_types:
+  - name: LastWrite
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: RegistryPath
+    type: path
+  - name: TrustRecordValue
+    type: path
+  - name: DocPath
+    type: path
+  - name: RecentDocsValue
+    type: path
+  - name: DocPathDecoded
+    type: path
+  - name: SHA256
+    type: hash
