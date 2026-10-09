@@ -1,10 +1,27 @@
 name: Custom.DFIR.LinuxCronPersistence
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Finds evidence of cron-based persistence on Linux.
-  
-  This artifact scans system-wide crontabs (/etc/crontab, /etc/cron.d/*) and user-specific crontabs (/var/spool/cron/crontabs/*) 
-  to identify scheduled tasks that may be used for persistence.
+  Hunt for cron-based persistence on Linux endpoints, covering MITRE
+  ATT&CK T1053.003 (Scheduled Task/Job: Cron).
+
+  Attackers with root or any user access commonly add entries to
+  /etc/crontab, drop files under /etc/cron.d, plant per-user spool
+  crontabs or interval scripts (cron.hourly .. cron.yearly) to re-run
+  malware at a fixed schedule or on every boot. This artifact
+  inventories every live cron configuration file (size, timestamps,
+  SHA256, content preview) for known-good baseline comparison, parses
+  crontab entries and flags:
+
+  - @reboot entries, which re-arm the implant at every boot (ScheduleSpec)
+  - Commands matching dropper/C2 patterns (curl/wget, base64, /dev/tcp,
+    reverse-shell interpreters, /tmp paths, crypto miners)
+  - PATH environment overrides pointing to /tmp or relative paths
+    (PATH hijack during trusted cron execution)
+  - Files modified within RecentDays (fresh persistence)
+  - Active (non-comment) lines inside interval scripts
+
+  Triage order: FileInventory baseline first, CrontabEntries flags next,
+  then IntervalScriptLines for scripts dispatched by run-parts.
 
 reference:
   - https://attack.mitre.org/techniques/T1053.003/
@@ -12,44 +29,164 @@ reference:
 type: CLIENT
 
 parameters:
-  - name: TargetGlobs
-    type: csv
+  - name: TargetGlob
+    type: glob
     default: |
-      Glob
       /etc/crontab
-      /etc/cron.d/**/*
-      /etc/cron.hourly/**/*
-      /etc/cron.daily/**/*
-      /etc/cron.weekly/**/*
-      /etc/cron.monthly/**/*
-      /var/spool/cron/crontabs/**/*
-      /var/spool/cron/atjobs/*
-      /var/spool/cron/atspool/*
-  - name: FilterRegex
+      /etc/cron.d/*
+      /etc/cron.allow
+      /etc/cron.deny
+      /etc/anacrontab
+      /etc/cron.daily/*
+      /etc/cron.hourly/*
+      /etc/cron.weekly/*
+      /etc/cron.monthly/*
+      /etc/cron.yearly/*
+      /var/spool/cron/*
+      /var/spool/cron/crontabs/*
+      /var/spool/anacron/*
+      /var/at/tabs/*
+
+  - name: EntryFilterRegex
     type: regex
-    default: .
+    default: "."
+
+  - name: SuspiciousCommandRegex
+    type: regex
+    default: "(curl|wget|/dev/tcp|ncat|/tmp/|base64|python[[:blank:]]+-c|perl[[:blank:]]+-e|bash[[:blank:]]+-i|stratum|xmr|killall|nohup)"
+
+  - name: RecentDays
+    type: int
+    default: "14"
 
 sources:
-  - name: CronFiles
-    description: Metadata of identified cron files.
+  - name: FileInventory
+    description: |
+      Metadata, SHA256 and content preview for every cron configuration
+      file. Empty files and broken links are skipped for hashing.
     query: |
-      LET Files <= SELECT OSPath, Size, Mtime, Ctime, Mode FROM glob(globs=TargetGlobs.Glob)
-      SELECT OSPath, Size, Mtime, Ctime, Mode FROM Files WHERE OSPath =~ FilterRegex
+      LET Files <= SELECT OSPath, Size, Mtime, Ctime, Btime, IsDir
+        FROM glob(globs=TargetGlob, accessor="file")
+        WHERE NOT IsDir AND Size > 0
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Ctime,
+             Btime,
+             if(condition=OSPath =~ "/var/spool/anacron/", then="Anacron timestamp file",
+                else=if(condition=OSPath =~ "/var/spool/", then="User crontab (spool)",
+                    else=if(condition=OSPath =~ "/var/at/tabs/", then="OpenBSD user crontab",
+                        else=if(condition=OSPath =~ "/etc/cron\\.d/", then="System drop-in (cron.d)",
+                            else=if(condition=OSPath =~ "/etc/cron\\.(hourly|daily|weekly|monthly|yearly)/", then="Interval script (run-parts)",
+                                else=if(condition=OSPath =~ "cron\\.(allow|deny)$", then="Access policy (allow/deny)",
+                                    else="System crontab")))))) AS FileKind,
+             hash(path=OSPath, accessor="file", hashselect="SHA256").SHA256 AS SHA256,
+             read_file(filename=OSPath, accessor="file", length=131072) AS Content,
+             if(condition=Mtime > timestamp(epoch=now() - 86400 * RecentDays),
+                then="MODIFIED WITHIN RecentDays - review against baseline", else="") AS RecentFlag
+      FROM Files
 
-  - name: CronContent
-    description: Individual lines from cron files, excluding comments.
+  - name: CrontabEntries
+    description: |
+      Parsed entries from /etc/crontab, /etc/cron.d drop-ins and user
+      spool crontabs: cron user, full command, @reboot/special
+      schedules, PATH hijack flags and suspicious command hits.
     query: |
-      LET Files <= SELECT OSPath FROM glob(globs=TargetGlobs.Glob)
-      SELECT * FROM foreach(
-        row=Files,
-        query={
-           SELECT OSPath, Line FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
-           WHERE NOT Line =~ "^\\s*#" AND Line =~ FilterRegex AND Line =~ "\\S"
-        }
-      )
+      LET Files <= SELECT OSPath, Mtime, Size, IsDir
+        FROM glob(globs=TargetGlob, accessor="file")
+        WHERE NOT IsDir AND Size > 0
+      LET Crontabs <= SELECT OSPath, Mtime FROM Files
+        WHERE OSPath =~ "/etc/(crontab|cron\\.d/)|/var/spool/cron|/var/at/tabs"
+          AND NOT OSPath =~ "anacron"
+          AND NOT OSPath =~ "cron\\.(allow|deny)$"
+      LET Parsed = SELECT OSPath, Mtime, Line FROM foreach(row=Crontabs, query={
+          SELECT OSPath, Mtime, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE NOT Line =~ "^[[:blank:]]*$" AND NOT Line =~ "^[[:blank:]]*#"
+      })
+      LET Shaped = SELECT *,
+             parse_string_with_regex(string=Line, regex="^(?P<Min>[^[:blank:]]+)[[:blank:]]+(?P<Hour>[^[:blank:]]+)[[:blank:]]+(?P<Dom>[^[:blank:]]+)[[:blank:]]+(?P<Mon>[^[:blank:]]+)[[:blank:]]+(?P<Dow>[^[:blank:]]+)[[:blank:]]+(?P<User>[^[:blank:]]+)[[:blank:]]+(?P<Command>[^\\r]*)$") AS SysFields,
+             parse_string_with_regex(string=Line, regex="^(?P<Min>[^[:blank:]]+)[[:blank:]]+(?P<Hour>[^[:blank:]]+)[[:blank:]]+(?P<Dom>[^[:blank:]]+)[[:blank:]]+(?P<Mon>[^[:blank:]]+)[[:blank:]]+(?P<Dow>[^[:blank:]]+)[[:blank:]]+(?P<Command>[^\\r]*)$") AS UserFields,
+             parse_string_with_regex(string=Line, regex="^(?P<Var>[A-Za-z_][A-Za-z0-9_]*)[[:blank:]]*=[[:blank:]]*(?P<Val>[^\\r]*)$") AS EnvFields,
+             parse_string_with_regex(string=Line, regex="^@(?P<Spec>[A-Za-z0-9_]+)[[:blank:]]+(?P<User>[^[:blank:]]+)[[:blank:]]+(?P<Command>[^\\r]*)$") AS SysBoot,
+             parse_string_with_regex(string=Line, regex="^@(?P<Spec>[A-Za-z0-9_]+)[[:blank:]]+(?P<Command>[^\\r]*)$") AS UserBoot
+      FROM Parsed
+      LET Reshaped = SELECT *,
+             if(condition=Line =~ "^@",
+                then=if(condition=OSPath =~ "^/var/(spool|at/tabs)/", then=UserBoot.Command, else=SysBoot.Command),
+                else=if(condition=EnvFields, then=NULL,
+                        else=if(condition=OSPath =~ "^/var/(spool|at/tabs)/", then=UserFields.Command, else=SysFields.Command))) AS Cmd,
+             if(condition=Line =~ "^@",
+                then=if(condition=OSPath =~ "^/var/(spool|at/tabs)/", then=NULL, else=SysBoot.User),
+                else=if(condition=EnvFields, then=NULL,
+                        else=if(condition=OSPath =~ "^/var/(spool|at/tabs)/",
+                                then=parse_string_with_regex(string=OSPath, regex="(?P<Cuser>[^/]+)$").Cuser,
+                                else=SysFields.User))) AS CronUser,
+             if(condition=Line =~ "^@",
+                then=if(condition=OSPath =~ "^/var/(spool|at/tabs)/", then=UserBoot.Spec, else=SysBoot.Spec),
+                else=NULL) AS ScheduleSpec,
+             if(condition=EnvFields AND EnvFields.Var = "PATH" AND
+                (EnvFields.Val =~ "/tmp|^[[:blank:]]*\\.([/:]|$)"),
+                then="UNTRUSTED PATH OVERRIDE: " + EnvFields.Val, else=NULL) AS PathHijackFlag
+      FROM Shaped
+      SELECT OSPath AS CrontabPath,
+             if(condition=OSPath =~ "/var/spool/cron/crontabs/", then="Debian/Ubuntu user crontab",
+                else=if(condition=OSPath =~ "/var/spool/cron/", then="RHEL/SUSE user crontab",
+                    else=if(condition=OSPath =~ "/var/at/tabs/", then="OpenBSD user crontab",
+                        else=if(condition=OSPath =~ "/etc/cron\\.d/", then="System drop-in (cron.d)",
+                            else="System crontab (/etc/crontab)")))) AS CrontabKind,
+             Mtime AS FileMtime,
+             CronUser,
+             Line,
+             Cmd AS Command,
+             ScheduleSpec,
+             if(condition=Line =~ "^@reboot", then="RUNS AT EVERY BOOT (@reboot)", else=NULL) AS BootFlag,
+             PathHijackFlag,
+             if(condition=Cmd AND Cmd =~ SuspiciousCommandRegex,
+                then="SUSPICIOUS COMMAND - manual review", else=NULL) AS SuspiciousCommandFlag,
+             if(condition=Mtime > timestamp(epoch=now() - 86400 * RecentDays),
+                then="CRON FILE MODIFIED WITHIN RecentDays", else=NULL) AS RecentFileFlag
+      FROM Reshaped
+      WHERE (Cmd OR PathHijackFlag) AND Line =~ EntryFilterRegex
+
+  - name: IntervalScriptLines
+    description: |
+      Active (non-comment) lines from scripts dispatched by run-parts
+      via /etc/cron.hourly .. cron.yearly, with suspicious-pattern and
+      recent-modification flags.
+    query: |
+      LET Files <= SELECT OSPath, Mtime, Size, IsDir
+        FROM glob(globs=TargetGlob, accessor="file")
+        WHERE NOT IsDir AND Size > 0
+          AND OSPath =~ "/etc/cron\\.(hourly|daily|weekly|monthly|yearly)/"
+      LET Parsed = SELECT OSPath, Mtime, Line FROM foreach(row=Files, query={
+          SELECT OSPath, Mtime, Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE NOT Line =~ "^[[:blank:]]*$" AND NOT Line =~ "^[[:blank:]]*#"
+      })
+      SELECT OSPath AS ScriptPath,
+             Mtime AS ScriptMtime,
+             if(condition=Line =~ "^#!", then="shebang", else="script line") AS LineType,
+             Line,
+             if(condition=Line AND Line =~ SuspiciousCommandRegex,
+                then="SUSPICIOUS LINE - manual review", else=NULL) AS SuspiciousLineFlag,
+             if(condition=Mtime > timestamp(epoch=now() - 86400 * RecentDays),
+                then="SCRIPT MODIFIED WITHIN RecentDays", else=NULL) AS RecentScriptFlag
+      FROM Parsed
+      WHERE Line =~ EntryFilterRegex
 
 column_types:
+  - name: OSPath
+    type: OSPath
   - name: Mtime
     type: timestamp
   - name: Ctime
     type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: FileMtime
+    type: timestamp
+  - name: ScriptMtime
+    type: timestamp
+  - name: SHA256
+    type: hash
