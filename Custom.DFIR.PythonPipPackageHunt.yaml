@@ -1,0 +1,169 @@
+name: Custom.DFIR.PythonPipPackageHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for recently installed or modified Python/pip packages in site-packages.
+
+  Enumerates installed Python distributions by parsing *.dist-info/METADATA and
+  *.egg-info/PKG-INFO files across the standard site-packages / dist-packages
+  locations on Linux, Windows and macOS (cross-platform). Produces two views:
+
+  1. RecentPackages - packages whose install metadata mtime falls inside the
+     recency window (SinceDays), matching attacker-dropped packages, poisoned
+     mirrors, or tooling the analyst has never seen before. This covers the
+     supply-chain compromise pattern where an implant is delivered as a pip
+     package (T1195.001 family).
+  2. ModifiedFiles - code/config-bearing files (py/pyc/pyd/so/pth/dll/...)
+     under site-packages trees written or modified inside the recency window,
+     revealing post-install tampering, trojaned modules, or .pth persistence.
+
+  Caveat: pip install timestamps come from the metadata file mtime; wheels can
+  preserve build-time timestamps, so treat InstallTime as an earliest-marker
+  approximation and correlate with package manager logs (dpkg, pip logs).
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+
+type: CLIENT
+
+parameters:
+  - name: SinceDays
+    type: int
+    default: "30"
+    description: Recency window in days for installs and file modifications.
+  - name: PackageFilterRegex
+    type: regex
+    default: "."
+    description: Include only packages whose Name matches this regex.
+  - name: FileFilterRegex
+    type: regex
+    default: "(?i)\\.(py|pyc|pyd|pyo|so|dylib|dll|exe|bat|cmd|ps1|pth|sh)$"
+    description: For ModifiedFiles, include only files matching this regex.
+  - name: HashFiles
+    type: bool
+    default: "Y"
+    description: SHA256-hash ModifiedFiles candidates smaller than 100MB.
+
+sources:
+  - name: RecentPackages
+    description: |
+      Packages installed or updated within the last SinceDays, approximated
+      from *.dist-info/METADATA and *.egg-info/PKG-INFO file mtimes.
+    query: |
+      LET PkgRows <= SELECT OSPath, Size, Mtime,
+             parse_string_with_regex(
+               string=read_file(filename=OSPath, length=65536),
+               regex=["[\r\n]Name: *(?P<Name>[^\r\n]+)",
+                      "[\r\n]Version: *(?P<Version>[^\r\n]+)"]) AS Meta
+           FROM glob(globs=[
+               "/usr/lib/python*/site-packages/*.dist-info/METADATA",
+               "/usr/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "/usr/lib/python*/dist-packages/*.dist-info/METADATA",
+               "/usr/lib/python*/dist-packages/*.egg-info/PKG-INFO",
+               "/usr/local/lib/python*/site-packages/*.dist-info/METADATA",
+               "/usr/local/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "/usr/local/lib/python*/dist-packages/*.dist-info/METADATA",
+               "/usr/local/lib/python*/dist-packages/*.egg-info/PKG-INFO",
+               "/home/*/.local/lib/python*/site-packages/*.dist-info/METADATA",
+               "/home/*/.local/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "/root/.local/lib/python*/site-packages/*.dist-info/METADATA",
+               "/root/.local/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "/opt/conda/lib/python*/site-packages/*.dist-info/METADATA",
+               "/opt/conda/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "/opt/*/lib/python3*/site-packages/*.dist-info/METADATA",
+               "/opt/*/lib/python3*/site-packages/*.egg-info/PKG-INFO",
+               "/Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages/*.dist-info/METADATA",
+               "/Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "/Users/*/Library/Python/*/lib/python/site-packages/*.dist-info/METADATA",
+               "/Users/*/Library/Python/*/lib/python/site-packages/*.egg-info/PKG-INFO",
+               "/opt/homebrew/lib/python*/site-packages/*.dist-info/METADATA",
+               "/opt/homebrew/lib/python*/site-packages/*.egg-info/PKG-INFO",
+               "C:/Python*/Lib/site-packages/*.dist-info/METADATA",
+               "C:/Python*/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/Program Files/Python*/Lib/site-packages/*.dist-info/METADATA",
+               "C:/Program Files/Python*/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/Program Files (x86)/Python*/Lib/site-packages/*.dist-info/METADATA",
+               "C:/Program Files (x86)/Python*/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/Users/*/AppData/Local/Programs/Python/*/Lib/site-packages/*.dist-info/METADATA",
+               "C:/Users/*/AppData/Local/Programs/Python/*/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/ProgramData/anaconda3/Lib/site-packages/*.dist-info/METADATA",
+               "C:/ProgramData/anaconda3/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/ProgramData/miniconda3/Lib/site-packages/*.dist-info/METADATA",
+               "C:/ProgramData/miniconda3/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/Users/*/anaconda3/Lib/site-packages/*.dist-info/METADATA",
+               "C:/Users/*/anaconda3/Lib/site-packages/*.egg-info/PKG-INFO",
+               "C:/Users/*/miniconda3/Lib/site-packages/*.dist-info/METADATA",
+               "C:/Users/*/miniconda3/Lib/site-packages/*.egg-info/PKG-INFO"
+           ])
+           WHERE Size < 10000000
+
+      SELECT
+        Meta.Name AS PackageName,
+        Meta.Version AS Version,
+        Mtime AS InstallTime,
+        OSPath.DirName.DirName AS SitePackagesRoot,
+        OSPath.DirName AS InstallInfoDir,
+        OSPath AS MetadataPath
+      FROM PkgRows
+      WHERE Meta.Name
+        AND Meta.Name =~ PackageFilterRegex
+        AND Mtime > now() - 86400 * SinceDays
+      GROUP BY MetadataPath
+
+  - name: ModifiedFiles
+    description: |
+      Code/config files under site-packages trees modified within the last
+      SinceDays - post-install tampering candidates. Optional SHA256 hashing.
+    query: |
+      LET RootPatterns <= SELECT format(format="%v/**", args=[OSPath]) AS Pattern
+           FROM glob(globs=[
+               "/usr/lib/python*/site-packages",
+               "/usr/lib/python*/dist-packages",
+               "/usr/local/lib/python*/site-packages",
+               "/usr/local/lib/python*/dist-packages",
+               "/home/*/.local/lib/python*/site-packages",
+               "/root/.local/lib/python*/site-packages",
+               "/opt/conda/lib/python*/site-packages",
+               "/opt/*/lib/python3*/site-packages",
+               "/Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages",
+               "/Users/*/Library/Python/*/lib/python/site-packages",
+               "/opt/homebrew/lib/python*/site-packages",
+               "C:/Python*/Lib/site-packages",
+               "C:/Program Files/Python*/Lib/site-packages",
+               "C:/Program Files (x86)/Python*/Lib/site-packages",
+               "C:/Users/*/AppData/Local/Programs/Python/*/Lib/site-packages",
+               "C:/ProgramData/anaconda3/Lib/site-packages",
+               "C:/ProgramData/miniconda3/Lib/site-packages",
+               "C:/Users/*/anaconda3/Lib/site-packages",
+               "C:/Users/*/miniconda3/Lib/site-packages"
+           ])
+           WHERE IsDir
+
+      SELECT
+        OSPath AS ModifiedPath,
+        Size,
+        Mtime AS ModifiedTime,
+        if(condition=HashFiles AND Size < 104857600,
+           then=hash(path=OSPath, hashselect="SHA256").SHA256) AS SHA256
+      FROM foreach(row=RootPatterns, query={
+          SELECT OSPath, Size, Mtime FROM glob(globs=Pattern)
+      })
+      WHERE NOT OSPath =~ "(?i)(__pycache__|\\.dist-info|\\.egg-info)"
+        AND OSPath =~ FileFilterRegex
+        AND Mtime > now() - 86400 * SinceDays
+      GROUP BY ModifiedPath
+
+column_types:
+  - name: InstallTime
+    type: timestamp
+  - name: ModifiedTime
+    type: timestamp
+  - name: SitePackagesRoot
+    type: os_path
+  - name: InstallInfoDir
+    type: os_path
+  - name: MetadataPath
+    type: os_path
+  - name: ModifiedPath
+    type: os_path
+  - name: SHA256
+    type: hash
