@@ -1,0 +1,221 @@
+name: Custom.DFIR.PassTheHashTicket4624
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects evidence of Pass-the-Hash (PtH) and Pass-the-Ticket (PtT) lateral
+  movement from Windows Security event log 4624 (successful logon) filtered to
+  network logons (LogonType 3, plus 8 NetworkCleartext and 9 NewCredentials),
+  optionally correlated with Kerberos ticket-granting service requests.
+
+  Forensic context: when a threat actor authenticates over the network using
+  only a stolen NTLM hash (PtH, T1550.002) the resulting 4624 event shows
+  LogonType 3 with LogonProcessName NtLmSsp and AuthenticationPackageName NTLM
+  - no interactive session, frequently against high-value service/admin
+  accounts, often from a single remote IP. Pass-the-Ticket with a harvested
+  Kerberos ticket (T1550.001) yields 4624 LogonType 3 with AuthenticationPackageName
+  Kerberos where the requesting subject differs from the target account, or
+  where TGS requests are issued with weak RC4-HMAC encryption (0x17 / 0x14)
+  typical of ticket-mangling tooling (Rubeus, Mimikatz).
+
+  Views:
+  1. PassTheHashCandidates  - 4624 network logons authenticated by NTLM/NtLmSsp,
+     flagged by high-value account, anonymous logon, and local-vs-remote origin.
+  2. PassTheTicketCandidates - 4624 network logons authenticated by Kerberos
+     with subject/target mismatch or delegation anomalies.
+  3. RC4TicketRequests4769 - TGS requests using RC4-family encryption (0x17/0x14),
+     supporting evidence of ticket abuse.
+  4. NetworkLogonSummary - aggregated network-logon counts per account/source
+     to surface lateral movement patterns.
+
+  Caveats: legitimate NTLM network logons are common (file shares, services);
+  triage by pivoting on the combinations that matter - high-value accounts,
+  unseen source IPs, and accounts with no interactive-logon history on the host.
+
+reference:
+  - https://attack.mitre.org/techniques/T1550.002/
+  - https://attack.mitre.org/techniques/T1550.001/
+
+type: CLIENT
+
+parameters:
+  - name: EventLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security*.evtx"
+    description: Windows Security event logs to parse (include archive rollovers).
+  - name: LogonTypeFilter
+    type: regex
+    default: "^(3|8|9)$"
+    description: EventData LogonType values to include (3=network, 8=cleartext, 9=new credentials).
+  - name: HighValueAccountRegex
+    type: regex
+    default: "(?i)(admin|svc|service|sql|backup|exchange|domain)"
+    description: Flag target accounts matching this high-value regex.
+  - name: TicketEncryptionRegex
+    type: regex
+    default: "0x(14|17)"
+    description: 4769 TicketEncryptionType values considered weak/abused (RC4-HMAC family).
+
+sources:
+  - name: PassTheHashCandidates
+    description: |
+      4624 network logons negotiated with NtLmSsp/NTLM - the classic
+      Pass-the-Hash signature (remote authentication with only an NTLM hash).
+    query: |
+      LET Events <= SELECT
+            timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+            System.Computer AS Computer,
+            System.EventRecordID AS RecordId,
+            EventData.TargetDomainName AS TargetDomainName,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.LogonType AS LogonType,
+            EventData.LogonProcessName AS LogonProcessName,
+            EventData.AuthenticationPackageName AS AuthPackage,
+            EventData.LmPackageName AS LmPackageName,
+            EventData.KeyLength AS KeyLength,
+            EventData.WorkstationName AS WorkstationName,
+            EventData.IpAddress AS IpAddress,
+            EventData.IpPort AS IpPort,
+            EventData.ElevatedToken AS ElevatedToken,
+            EventData.ImpersonationLevel AS ImpersonationLevel,
+            EventData.RestrictedAdminMode AS RestrictedAdminMode,
+            EventData.SubjectUserName AS SubjectUserName,
+            EventData.SubjectDomainName AS SubjectDomainName,
+            EventData.ProcessName AS ProcessName
+          FROM foreach(
+            row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+            query={ SELECT EventData, System
+                    FROM parse_evtx(filename=OSPath)
+                    WHERE System.EventID.Value = 4624 AND
+                          EventData.LogonType =~ LogonTypeFilter AND
+                          (EventData.LogonProcessName =~ "NtLmSsp" OR
+                           EventData.AuthenticationPackageName =~ "NTLM") })
+      SELECT EventTime, Computer, RecordId,
+             TargetDomainName + '\\' + TargetUserName AS Account,
+             LogonType, LogonProcessName, AuthPackage, LmPackageName, KeyLength,
+             if(condition=TargetUserName =~ HighValueAccountRegex,
+                then="HIGH_VALUE", else="") AS AccountFlag,
+             if(condition=TargetUserName =~ "(?i)(ANONYMOUS LOGON|anonymous)",
+                then="ANONYMOUS", else="") AS AnonymousFlag,
+             if(condition=IpAddress =~ "^(-|::1|127\\.0\\.0\\.1)$",
+                then="LOCAL", else="REMOTE") AS Origin,
+             IpAddress, IpPort, WorkstationName,
+             ElevatedToken, ImpersonationLevel, RestrictedAdminMode,
+             SubjectDomainName, SubjectUserName, ProcessName
+      FROM Events
+      ORDER BY EventTime DESC
+      LIMIT 500
+
+  - name: PassTheTicketCandidates
+    description: |
+      4624 network logons authenticated by Kerberos where the requesting
+      subject differs from the target account or delegation is in play -
+      consistent with injected/ticket-based auth (Pass-the-Ticket).
+    query: |
+      LET Events <= SELECT
+            timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+            System.Computer AS Computer,
+            System.EventRecordID AS RecordId,
+            EventData.TargetDomainName AS TargetDomainName,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.LogonType AS LogonType,
+            EventData.LogonProcessName AS LogonProcessName,
+            EventData.AuthenticationPackageName AS AuthPackage,
+            EventData.WorkstationName AS WorkstationName,
+            EventData.IpAddress AS IpAddress,
+            EventData.IpPort AS IpPort,
+            EventData.ElevatedToken AS ElevatedToken,
+            EventData.ImpersonationLevel AS ImpersonationLevel,
+            EventData.SubjectUserName AS SubjectUserName,
+            EventData.SubjectDomainName AS SubjectDomainName,
+            EventData.TransmittedServices AS TransmittedServices,
+            if(condition=EventData.TargetUserName =~ HighValueAccountRegex,
+               then="HIGH_VALUE", else="") AS AccountFlag,
+            if(condition=EventData.SubjectUserName AND
+                 EventData.SubjectUserName != EventData.TargetUserName,
+               then="SUBJECT_DIFFERS", else="") AS SubjectFlag,
+            if(condition=EventData.ImpersonationLevel =~ "1833|SecurityDelegation",
+               then="IMPERSONATION", else="") AS ImpersonationFlag
+          FROM foreach(
+            row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+            query={ SELECT EventData, System
+                    FROM parse_evtx(filename=OSPath)
+                    WHERE System.EventID.Value = 4624 AND
+                          EventData.LogonType =~ LogonTypeFilter AND
+                          EventData.AuthenticationPackageName =~ "Kerberos" })
+      SELECT EventTime, Computer, RecordId,
+             TargetDomainName + '\\' + TargetUserName AS Account,
+             SubjectDomainName + '\\' + SubjectUserName AS Subject,
+             LogonType, LogonProcessName, AuthPackage,
+             SubjectFlag, AccountFlag, ImpersonationFlag,
+             IpAddress, IpPort, WorkstationName,
+             ElevatedToken, ImpersonationLevel, TransmittedServices
+      FROM Events
+      WHERE SubjectFlag != "" OR AccountFlag != "" OR ImpersonationFlag != ""
+      ORDER BY EventTime DESC
+      LIMIT 500
+
+  - name: RC4TicketRequests4769
+    description: |
+      Kerberos service-ticket requests with weak RC4-family encryption,
+      supporting evidence of Pass-the-Ticket / Kerberoasting activity.
+    query: |
+      SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.Computer AS Computer,
+        System.EventRecordID AS RecordId,
+        EventData.TargetUserName AS RequestedBy,
+        EventData.ServiceName AS ServiceName,
+        EventData.TicketOptions AS TicketOptions,
+        EventData.TicketEncryptionType AS TicketEncryptionType,
+        EventData.Status AS Status,
+        if(condition=EventData.Status =~ "0x0", then="GRANTED",
+           else="NO_STATUS_OR_FAILED") AS Outcome,
+        EventData.IpAddress AS IpAddress,
+        EventData.IpPort AS IpPort
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+        query={ SELECT EventData, System
+                FROM parse_evtx(filename=OSPath)
+                WHERE System.EventID.Value = 4769 AND
+                      EventData.TicketEncryptionType =~ TicketEncryptionRegex })
+      ORDER BY EventTime DESC
+      LIMIT 500
+
+  - name: NetworkLogonSummary
+    description: |
+      Aggregated network-logon frequency by account and source to surface
+      lateral-movement patterns (single IP across many accounts = spray/PtH).
+    query: |
+      LET Events <= SELECT
+            timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+            EventData.TargetDomainName AS TargetDomainName,
+            EventData.TargetUserName AS TargetUserName,
+            EventData.LogonType AS LogonType,
+            EventData.AuthenticationPackageName AS AuthPackage,
+            EventData.WorkstationName AS WorkstationName,
+            EventData.IpAddress AS IpAddress,
+            if(condition=EventData.TargetUserName =~ HighValueAccountRegex,
+               then="HIGH_VALUE", else="") AS AccountFlag
+          FROM foreach(
+            row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+            query={ SELECT EventData, System
+                    FROM parse_evtx(filename=OSPath)
+                    WHERE System.EventID.Value = 4624 AND
+                          EventData.LogonType =~ LogonTypeFilter })
+      SELECT count() AS LogonCount,
+             min(item=EventTime) AS FirstSeen,
+             max(item=EventTime) AS LastSeen,
+             TargetDomainName AS Domain,
+             TargetUserName AS Account,
+             AccountFlag, AuthPackage, WorkstationName, IpAddress
+      FROM Events
+      GROUP BY TargetDomainName, TargetUserName, AuthPackage, WorkstationName, IpAddress
+      ORDER BY LogonCount DESC
+      LIMIT 500
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp
