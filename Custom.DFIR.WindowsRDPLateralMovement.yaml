@@ -1,0 +1,105 @@
+name: Custom.DFIR.WindowsRDPLateralMovement
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect RDP lateral movement (T1021.001) using Windows Security Event Log 4624/4648/4778.
+
+  Parses the Windows Security event log and extracts the three event classes that
+  together reveal Remote Desktop Protocol based lateral movement:
+  - 4624 with LogonType 10 (RemoteInteractive) - successful RDP logon, carrying
+    account, source IP/port, workstation and process evidence.
+  - 4648 - logon using explicit credentials - the marker of an RDP session opened
+    with different credentials (mstsc.exe / runas).
+  - 4778 - Window Station session reconnect (RDP reconnect/shadow) carrying
+    ClientName and ClientAddress.
+
+  מטרה: זיהוי תנועה רוחבית ב-RDP דרך יומן האבטחה (4624 LogonType 10 / 4648 / 4778).
+  מה עושה: מפרק את Security.evtx ומוציא טבלה מתואמת עם חשבון, IP מקור, סשן ותהליך.
+  בעיה שפותרה: נראות מלאה על T1021.001 גם ללא Sysmon, כולל חיבור מחדש לסשן RDP.
+
+  Use AccountRegex and SourceIPRegex to focus on sensitive accounts or untrusted
+  source networks.
+
+reference:
+  - https://attack.mitre.org/techniques/T1021.001/
+
+type: CLIENT
+
+parameters:
+  - name: SecurityLogGlob
+    type: glob
+    description: Glob covering the Windows Security event log files.
+    default: "C:/Windows/System32/winevt/Logs/Security*.evtx"
+  - name: AccountRegex
+    type: regex
+    description: Only report events for accounts matching this regex.
+    default: "."
+  - name: SourceIPRegex
+    type: regex
+    description: Only report events whose source address matches this regex.
+    default: "."
+  - name: TimeRangeDays
+    type: int64
+    description: Only report events newer than this many days.
+    default: "30"
+
+sources:
+  - name: RDPLateralMovement
+    description: |
+      Correlated RDP evidence from the Security event log: 4624 RemoteInteractive
+      logons (LogonType 10), 4648 explicit-credential logons and 4778 Window
+      Station session reconnects, enriched with account, source IP and process.
+    query: |
+      LET Cutoff <= timestamp(epoch=now() - TimeRangeDays * 86400)
+
+      LET BaseEvents = SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.Computer AS Computer,
+        System.EventID.Value AS EventID,
+        if(condition=EventData, then=EventData, else=UserData) AS EData
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs=SecurityLogGlob) },
+        query={ SELECT System, EventData, UserData FROM parse_evtx(filename=OSPath) })
+      WHERE System.EventID.Value = 4624
+         OR System.EventID.Value = 4648
+         OR System.EventID.Value = 4778
+
+      LET Enriched = SELECT
+        EventTime,
+        Computer,
+        EventID,
+        if(condition=EventID = 4624, then="T1021.001 RDP RemoteInteractive logon (4624, LogonType 10)",
+           else=if(condition=EventID = 4648, then="T1021.001 Logon using explicit credentials (4648)",
+                   else="T1021.001 RDP session reconnect (4778)")) AS Detection,
+        str(str=EData.LogonType) AS LogonType,
+        if(condition=EventID = 4778, then=EData.AccountDomain, else=EData.TargetDomainName) AS Domain,
+        if(condition=EventID = 4778, then=EData.AccountName, else=EData.TargetUserName) AS UserName,
+        if(condition=EventID = 4778, then=str(str=EData.ClientAddress), else=str(str=EData.IpAddress)) AS SourceIP,
+        if(condition=EventID = 4778, then=str(str=EData.SessionName), else=str(str=EData.IpPort)) AS SourcePortOrSession,
+        if(condition=EventID = 4624, then=str(str=EData.WorkstationName),
+           else=if(condition=EventID = 4778, then=str(str=EData.ClientName),
+                   else=str(str=EData.SubjectUserName))) AS Workstation,
+        if(condition=EventID = 4778, then="-", else=str(str=EData.ProcessName)) AS ProcessName,
+        if(condition=EventID = 4778, then="-", else=str(str=EData.TargetLogonId)) AS TargetLogonId
+      FROM BaseEvents
+
+      SELECT
+        EventTime,
+        Computer,
+        Detection,
+        format(format="%s\\%s", args=[Domain, UserName]) AS Account,
+        SourceIP,
+        SourcePortOrSession AS SourcePort,
+        Workstation,
+        ProcessName,
+        TargetLogonId
+      FROM Enriched
+      WHERE EventTime > Cutoff
+        AND (EventID = 4648 OR EventID = 4778 OR LogonType = "10")
+        AND UserName =~ AccountRegex
+        AND SourceIP =~ SourceIPRegex
+      ORDER BY EventTime DESC
+      LIMIT 5000
+
+column_types:
+  - name: EventTime
+    type: timestamp
