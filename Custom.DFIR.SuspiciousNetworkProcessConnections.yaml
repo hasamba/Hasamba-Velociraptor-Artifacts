@@ -1,0 +1,93 @@
+name: Custom.DFIR.SuspiciousNetworkProcessConnections
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects live processes communicating with TOR exit nodes or known command-and-control IP ranges.
+
+  This cross-platform artifact correlates active network connections with process metadata and
+  filters remote IP addresses against analyst-supplied regular expressions. Supply current TOR
+  exit-node and threat-intelligence patterns before collection. MITRE ATT&CK T1090.003.
+
+reference:
+  - https://attack.mitre.org/techniques/T1090/003/
+
+type: CLIENT
+
+parameters:
+  - name: TorExitNodeRegex
+    description: Regex matching TOR exit-node IP addresses. The default matches nothing.
+    type: regex
+    default: "a^"
+  - name: KnownC2IPRegex
+    description: Regex matching known command-and-control IP addresses or ranges. The default matches nothing.
+    type: regex
+    default: "a^"
+  - name: RemoteIPRegex
+    description: Optional additional remote-IP filter applied before indicator matching.
+    type: regex
+    default: "."
+  - name: ProcessNameRegex
+    description: Regex filter for process names.
+    type: regex
+    default: "."
+  - name: ConnectionStatusRegex
+    description: Regex filter for connection state or status.
+    type: regex
+    default: "."
+
+sources:
+  - name: SuspiciousConnections
+    description: Active network connections whose remote IP matches a TOR or C2 indicator.
+    query: |
+      LET Connections <= SELECT Pid AS ConnectionPid,
+          Status,
+          Laddr.IP AS LocalIP,
+          Laddr.Port AS LocalPort,
+          Raddr.IP AS RemoteIP,
+          Raddr.Port AS RemotePort
+        FROM netstat()
+        WHERE Raddr.IP
+          AND format(format="%v", args=[Raddr.IP]) =~ RemoteIPRegex
+          AND Status =~ ConnectionStatusRegex
+
+      LET Enriched <= SELECT ConnectionPid AS Pid,
+          Name AS ProcessName,
+          Exe AS ProcessPath,
+          CommandLine,
+          Username,
+          Status,
+          LocalIP,
+          LocalPort,
+          RemoteIP,
+          RemotePort
+        FROM foreach(
+          row=Connections,
+          query={
+            SELECT Name, Exe, CommandLine, Username,
+              ConnectionPid, Status, LocalIP, LocalPort,
+              RemoteIP, RemotePort
+            FROM pslist(pid=ConnectionPid)
+          })
+
+      SELECT timestamp(epoch=now()) AS CollectionTime,
+          Pid,
+          ProcessName,
+          ProcessPath,
+          CommandLine,
+          Username,
+          Status,
+          LocalIP,
+          LocalPort,
+          RemoteIP,
+          RemotePort,
+          if(condition=format(format="%v", args=[RemoteIP]) =~ TorExitNodeRegex,
+             then="TOR Exit Node", else="Known C2") AS IndicatorType
+        FROM Enriched
+        WHERE ProcessName =~ ProcessNameRegex
+          AND (format(format="%v", args=[RemoteIP]) =~ TorExitNodeRegex
+            OR format(format="%v", args=[RemoteIP]) =~ KnownC2IPRegex)
+
+column_types:
+  - name: CollectionTime
+    type: timestamp
+  - name: ProcessPath
+    type: path
