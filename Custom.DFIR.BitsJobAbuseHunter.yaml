@@ -1,0 +1,269 @@
+name: Custom.DFIR.BitsJobAbuseHunter
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects abuse of Windows BITS jobs for payload download and persistence (MITRE ATT&CK T1197).
+
+  BITS is a favorite attacker channel (bitsadmin, PowerShell Start-BitsTransfer, custom loaders)
+  because job state is managed by the OS service, traffic blends into Windows Update activity,
+  and queued jobs survive reboots. This artifact combines live state, historical evidence and
+  payload forensics:
+
+  1. ActiveBITSJobs - live enumeration of BITS jobs via Get-BitsTransfer -AllUsers
+  2. SuspiciousProcessActivity - running processes invoking BITS abuse tooling
+  3. BitsClientEvents - job lifecycle timeline from Microsoft-Windows-Bits-Client/Operational
+  4. SuspiciousBITSJobs - events whose remote URL or local path looks like an executable payload,
+     with common Microsoft update destinations whitelisted
+  5. BITSDownloadedFiles - existence verification, hashes and optional upload of downloaded payloads
+  6. BitsQueueStore - BITS job queue database files (the persistence store) with MAC times
+  7. BITSRegistryConfiguration - BITS service and policy registry settings for tampering
+
+reference:
+  - https://attack.mitre.org/techniques/T1197/
+  - https://www.mandiant.com/resources/blog/bits-jobs-and-bitsadmin
+  - https://learn.microsoft.com/en-us/windows/win32/bits/about-bits
+
+type: CLIENT
+
+parameters:
+  - name: BitsEventLogGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Bits-Client%4Operational.evtx"
+    description: Windows glob for the BITS client operational event log.
+  - name: QmgrStoreGlob
+    type: glob
+    default: "C:/ProgramData/Microsoft/Network/Downloader/*.db"
+    description: Glob for BITS queue manager (job store) database files.
+  - name: EventIDRegex
+    type: regex
+    default: "^(3|4|5|9|59|60|61)$"
+    description: Bits-Client event IDs to include in the job lifecycle timeline.
+  - name: EventLogDays
+    type: int
+    default: 30
+    description: How many days back to read BITS event log history.
+  - name: ExecutableFileRegex
+    type: regex
+    default: "\\\\.(exe|dll|vbs|js|jse|wsf|hta|bat|cmd|ps1|psm1|psd1|scr|msi|cpl)([^0-9A-Za-z]|$)"
+    description: File extensions in remote URLs or local paths considered executable payloads.
+  - name: WhitelistRegex
+    type: regex
+    default: "(?i)(windowsupdate|update\\\\.microsoft|download\\\\.windows|go\\\\.microsoft|catalog\\\\.s\\\\.microsoft|delivery\\\\.mp\\\\.microsoft|msedge\\\\.akamai|office|microsoftonline)"
+    description: Trusted download destinations excluded from the suspicious-download heuristic.
+  - name: ProcessRegex
+    type: regex
+    default: "(?i)(bitsadmin|start-bitstransfer|add-bitstransfer|complete-bitstransfer|set-bitstransfer|remove-bitstransfer|get-bitstransfer|qmgr)"
+    description: Process names or command lines indicating BITS tooling and cmdlet use.
+  - name: RegistryRegex
+    type: regex
+    default: "."
+    description: Filter on registry entry names under BITS service and policy keys.
+  - name: UploadPayloads
+    type: bool
+    default: false
+    description: When true, upload discovered payload files to the Velociraptor server.
+
+sources:
+  - name: ActiveBITSJobs
+    description: Live BITS job enumeration from the endpoint (Get-BitsTransfer -AllUsers).
+    query: |
+      LET BitsJobRaw <= SELECT Stdout AS RawOutput
+        FROM execve(argv=[
+          "powershell.exe", "-NoProfile", "-Command",
+          "$r = Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Select-Object JobId,DisplayName,TransferType,Priority,OwnerAccount,JobState,CreationTime,BytesTotal,BytesTransferred; if (-not $r) { '[]' } else { $r | ConvertTo-Json -Compress -Depth 4 }"
+        ])
+
+      LET ParsedJobs <= SELECT * FROM parse_json_array(data=RawOutput)
+
+      SELECT
+        JobId,
+        DisplayName,
+        TransferType,
+        Priority,
+        OwnerAccount,
+        JobState,
+        timestamp(epoch=CreationTime) AS CreationTime,
+        BytesTotal,
+        BytesTransferred
+      FROM ParsedJobs
+
+  - name: SuspiciousProcessActivity
+    description: Running processes whose name or command line indicates BITS abuse tooling.
+    query: |
+      LET ProcRows <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM ProcRows
+      WHERE Name =~ ProcessRegex OR CommandLine =~ ProcessRegex
+
+  - name: BitsClientEvents
+    description: BITS job lifecycle timeline (creation, transfer, errors) from the operational event log.
+    query: |
+      LET EventLogFiles <= SELECT OSPath FROM glob(globs=BitsEventLogGlob)
+
+      LET TimeBoundary <= now() - 86400 * EventLogDays
+
+      SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.EventID.Value AS EventID,
+        System.Computer AS Computer,
+        get(item=EventData, field="jobTitle") AS JobTitle,
+        get(item=EventData, field="jobId") AS JobId,
+        get(item=EventData, field="jobOwner") AS JobOwner,
+        get(item=EventData, field="url") AS URL,
+        get(item=EventData, field="remoteName") AS RemoteName,
+        get(item=EventData, field="fileName") AS LocalPath,
+        get(item=EventData, field="processPath") AS ProcessPath,
+        get(item=EventData, field="bytesTotal") AS BytesTotal,
+        get(item=EventData, field="bytesTransferred") AS BytesTransferred
+      FROM foreach(
+        row=EventLogFiles,
+        query={ SELECT * FROM parse_evtx(filename=OSPath) })
+      WHERE timestamp(epoch=System.TimeCreated.SystemTime) > TimeBoundary
+        AND format(format="%v", args=[System.EventID.Value]) =~ EventIDRegex
+      ORDER BY EventTime DESC
+
+  - name: SuspiciousBITSJobs
+    description: BITS events with executable-looking remote URLs or local paths, minus whitelisted destinations.
+    query: |
+      LET BitsLogFiles2 <= SELECT OSPath FROM glob(globs=BitsEventLogGlob)
+
+      LET TimeBoundary2 <= now() - 86400 * EventLogDays
+
+      SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.EventID.Value AS EventID,
+        System.Computer AS Computer,
+        get(item=EventData, field="jobTitle") AS JobTitle,
+        get(item=EventData, field="jobId") AS JobId,
+        get(item=EventData, field="jobOwner") AS JobOwner,
+        get(item=EventData, field="url") AS URL,
+        get(item=EventData, field="remoteName") AS RemoteName,
+        get(item=EventData, field="fileName") AS LocalPath,
+        get(item=EventData, field="bytesTransferred") AS BytesTransferred,
+        format(format="%v", args=[EventData]) AS RawEventData
+      FROM foreach(
+        row=BitsLogFiles2,
+        query={ SELECT * FROM parse_evtx(filename=OSPath) })
+      WHERE timestamp(epoch=System.TimeCreated.SystemTime) > TimeBoundary2
+        AND (URL =~ ExecutableFileRegex
+             OR RemoteName =~ ExecutableFileRegex
+             OR LocalPath =~ ExecutableFileRegex
+             OR RawEventData =~ ExecutableFileRegex)
+        AND NOT (URL =~ WhitelistRegex OR RemoteName =~ WhitelistRegex)
+      ORDER BY EventTime DESC
+
+  - name: BITSDownloadedFiles
+    description: Verifies, hashes and optionally uploads the local payload files of suspicious BITS downloads.
+    query: |
+      LET BitsLogFiles3 <= SELECT OSPath FROM glob(globs=BitsEventLogGlob)
+
+      LET TimeBoundary3 <= now() - 86400 * EventLogDays
+
+      LET SuspiciousPaths <= SELECT
+          get(item=EventData, field="jobId") AS JobId,
+          get(item=EventData, field="fileName") AS LocalPath
+        FROM foreach(
+          row=BitsLogFiles3,
+          query={ SELECT * FROM parse_evtx(filename=OSPath) })
+        WHERE timestamp(epoch=System.TimeCreated.SystemTime) > TimeBoundary3
+          AND get(item=EventData, field="fileName")
+          AND get(item=EventData, field="fileName") =~ ExecutableFileRegex
+          AND NOT (get(item=EventData, field="url") =~ WhitelistRegex
+                   OR get(item=EventData, field="remoteName") =~ WhitelistRegex)
+
+      LET ForwardPaths <= SELECT JobId, LocalPath,
+          regex_replace(source=LocalPath, re="\\\\", replace="/") AS ForwardPath
+        FROM SuspiciousPaths
+
+      LET FoundFiles <= SELECT JobId, LocalPath, OSPath AS PayloadPath, Size, Mtime
+        FROM foreach(
+          row=ForwardPaths,
+          query={ SELECT JobId, LocalPath, OSPath, Size, Mtime FROM glob(globs=ForwardPath) })
+
+      LET HashedFiles <= SELECT JobId, LocalPath, PayloadPath, Size, Mtime,
+          hash(path=PayloadPath, hashselect="MD5,SHA256") AS Hashes
+        FROM FoundFiles
+
+      SELECT
+        JobId,
+        LocalPath,
+        PayloadPath,
+        Size,
+        Mtime,
+        Hashes.MD5 AS MD5,
+        Hashes.SHA256 AS SHA256,
+        if(condition=UploadPayloads,
+           then=upload(file=PayloadPath),
+           else=NULL) AS UploadedFile
+      FROM HashedFiles
+
+  - name: BitsQueueStore
+    description: BITS queue manager database files (job persistence store) with metadata.
+    query: |
+      LET QueueFiles <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime
+        FROM glob(globs=QmgrStoreGlob)
+
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Atime,
+        Ctime,
+        Btime
+      FROM QueueFiles
+
+  - name: BITSRegistryConfiguration
+    description: BITS service and policy registry entries for configuration tampering.
+    query: |
+      LET RegRows <= SELECT OSPath, Name, Data, Mtime FROM glob(
+        globs=[
+          "HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Services/BITS/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Policies/Microsoft/Windows/BITS/**"
+        ],
+        accessor="registry")
+
+      SELECT
+        OSPath,
+        Name,
+        Data,
+        Mtime
+      FROM RegRows
+      WHERE Name =~ RegistryRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: CreationTime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: LocalPath
+    type: path
+  - name: PayloadPath
+    type: path
+  - name: ProcessPath
+    type: path
+  - name: Exe
+    type: path
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
