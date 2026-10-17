@@ -1,14 +1,16 @@
 name: Custom.DFIR.SysmonNamedPipeHunt
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Hunts named pipe artifacts from Sysmon Event ID 17 (Pipe Created) and
-  Event ID 18 (Pipe Connected) in the Sysmon operational event log.
+  Hunts named pipe artifacts exposed by Sysmon Event ID 17 (Pipe Created) and
+  Event ID 18 (Pipe Connected) on Windows endpoints.
 
-  Named pipes are a common IPC channel abused for process execution,
-  credential relaying and lateral movement (e.g. Cobalt Strike default
-  pipes such as MSSE-*, postex pipes, or PsExec svcctl-style pipes).
-  This artifact surfaces pipe names, creating/connecting process images
-  and users so analysts can spot anomalous or malware-typical pipe names.
+  Named pipes are a common channel for adversary IPC abuse: C2 beaconing over
+  private pipes, PSExec-style lateral movement through the svcctl/msrpc pipes,
+  privileged pipe impersonation, and credential-dumping tooling touching pipe
+  endpoints. This artifact parses the Sysmon operational event log (plus any
+  rotated Sysmon log archives), keeps only pipe create/connect records, and
+  filters them by pipe name and owning image with regex parameters. Maps to
+  MITRE ATT&CK T1559.001 Inter-Process Communication abuse.
 
 reference:
   - https://attack.mitre.org/techniques/T1559.001/
@@ -18,87 +20,54 @@ type: CLIENT
 parameters:
   - name: SysmonLogGlob
     type: glob
-    description: Glob pointing at the Sysmon operational EVTX log(s).
-    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
-  - name: EventIDRegex
-    type: regex
-    description: Sysmon Event IDs to include (17 = Pipe Created, 18 = Pipe Connected).
-    default: "^(17|18)$"
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4*.evtx"
+    description: Where to find Sysmon operational event logs (includes rotated archives).
+
   - name: PipeNameRegex
     type: regex
-    description: Filter pipe names by this regex.
     default: "."
-  - name: ImageRegex
+    description: Regex filtering pipe names, e.g. "msrpc|svcctl|isapi".
+
+  - name: ImagePathRegex
     type: regex
-    description: Filter the creating/connecting process image by this regex.
     default: "."
+    description: Regex filtering the image that created or connected the pipe.
+
+  - name: DaysLookback
+    type: int
+    default: 7
+    description: Only keep events newer than this many days.
 
 sources:
   - name: PipeEvents
-    description: |
-      Sysmon EID 17/18 pipe events, filtered by EventIDRegex, PipeNameRegex and ImageRegex.
+    description: Sysmon pipe creation/connection records filtered by regex and lookback
     query: |
-      LET SysmonLogs <= SELECT OSPath FROM glob(globs=SysmonLogGlob)
+      LET LookbackTime <= timestamp(epoch=now() - DaysLookback * 86400)
+      LET LogFiles <= SELECT OSPath FROM glob(globs=SysmonLogGlob)
       SELECT
-        EventTime,
-        EventID,
-        EventType,
-        Computer,
-        PipeName,
-        Image,
-        User,
-        LogPath
-      FROM foreach(
-        row=SysmonLogs,
-        query={
-          SELECT
-            timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
-            System.EventID.Value AS EventID,
-            EventData.EventType AS EventType,
-            System.Computer AS Computer,
-            EventData.PipeName AS PipeName,
-            EventData.Image AS Image,
-            EventData.User AS User,
-            OSPath AS LogPath
-          FROM parse_evtx(filename=OSPath)
-        })
-      WHERE EventID =~ EventIDRegex
-        AND PipeName =~ PipeNameRegex
-        AND if(condition=Image, then=Image =~ ImageRegex, else=TRUE)
-
-  - name: PipeSummary
-    description: |
-      Pipes aggregated by name with event counts and first/last seen timestamps.
-    query: |
-      LET SysmonLogs <= SELECT OSPath FROM glob(globs=SysmonLogGlob)
-      SELECT
-        PipeName,
-        count() AS TotalEvents,
-        min(item=EventTime) AS FirstSeen,
-        max(item=EventTime) AS LastSeen
-      FROM foreach(
-        row=SysmonLogs,
-        query={
-          SELECT
-            timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
-            System.EventID.Value AS EventID,
-            EventData.PipeName AS PipeName,
-            EventData.Image AS Image,
-            EventData.User AS User
-          FROM parse_evtx(filename=OSPath)
-        })
-      WHERE EventID =~ EventIDRegex
-        AND PipeName =~ PipeNameRegex
-        AND if(condition=Image, then=Image =~ ImageRegex, else=TRUE)
-      GROUP BY PipeName
-      ORDER BY TotalEvents DESC
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.Computer AS ComputerName,
+        System.EventID.Value AS EventID,
+        if(condition=System.EventID.Value = 17,
+           then="PipeCreated",
+           else="PipeConnected") AS EventAction,
+        EventData.PipeName AS PipeName,
+        EventData.Image AS Image,
+        EventData.User AS PipeUser,
+        EventData.ProcessId AS Pid,
+        EventData.ProcessGuid AS ProcessGuid,
+        OSPath AS SourceLog
+      FROM foreach(row=LogFiles,
+        query={ SELECT System, EventData, OSPath FROM parse_evtx(filename=OSPath) })
+      WHERE (System.EventID.Value = 17 OR System.EventID.Value = 18)
+        AND EventData.PipeName =~ PipeNameRegex
+        AND EventData.Image =~ ImagePathRegex
+        AND timestamp(epoch=System.TimeCreated.SystemTime) > LookbackTime
 
 column_types:
   - name: EventTime
     type: timestamp
-  - name: FirstSeen
-    type: timestamp
-  - name: LastSeen
-    type: timestamp
-  - name: LogPath
+  - name: Image
+    type: path
+  - name: SourceLog
     type: path
