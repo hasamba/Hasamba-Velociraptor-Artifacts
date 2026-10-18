@@ -1,0 +1,90 @@
+name: Custom.DFIR.SysmonLSASSAccessHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts Sysmon ProcessAccess (EID 10) events targeting lsass.exe with
+  dumping-grade GrantedAccess rights - the classic footprint of LSASS memory
+  credential dumping (MITRE ATT&CK T1003.001).
+
+  Direct LSASS reads with access masks such as 0x1010, 0x1410, 0x1418, 0x1a0fff
+  or 0x1fffff indicate tools like mimikatz, comsvcs MiniDump, hashdump
+  utilities or custom shellcode reading LSASS memory. Legitimate monitoring
+  software (EDR, AV, backup agents) is filtered out via SourceWhitelist.
+
+  Forensic value: identifies the offending source process (SourceImage),
+  the thread that requested access, the exact access rights granted, and the
+  CallTrace stack - enough to confirm credential dump tooling and pivot to the
+  process creation events for the dumping binary.
+
+reference:
+  - https://attack.mitre.org/techniques/T1003.001/
+  - https://learn.microsoft.com/en-us/sysinternals/windows-sysmon-event-10
+
+type: CLIENT
+
+parameters:
+  - name: SysmonLogGlob
+    type: string
+    default: "C:/Windows/System32/winevt/Logs/*Sysmon*.evtx"
+  - name: FilterRegex
+    type: regex
+    default: "lsass"
+  - name: GrantedAccessRegex
+    type: regex
+    default: "0x(1010|1018|1410|1418|1418a|143a|143f|1a0fff|1fffff)"
+  - name: SourceWhitelist
+    type: regex
+    default: "vmtoolsd|MsMpEng|svchost|SearchIndexer|SgrmBroker|NisSrv|MsSense|procexp|procmon|SystemIdleMonitor|backup|Backup"
+  - name: ToolRegex
+    type: regex
+    default: "mimikatz|comsvcs|procdump|pypykatz|nanodump|sharpdump|hashdump|secretsdump"
+
+sources:
+  - name: LSASSProcessAccess
+    description: >
+      Sysmon EID 10 ProcessAccess events where the target image is lsass.exe
+      and GrantedAccess matches dumping-grade access masks, excluding known
+      legitimate monitoring sources.
+    query: |
+      LET SysmonFiles <= SELECT OSPath, Name, Size, Mtime
+        FROM glob(globs=SysmonLogGlob)
+
+      SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.Computer AS Computer,
+        EventData.TargetImage AS TargetImage,
+        EventData.TargetProcessId AS TargetProcessId,
+        EventData.SourceImage AS SourceImage,
+        EventData.SourceProcessId AS SourceProcessId,
+        EventData.SourceThreadId AS SourceThreadId,
+        EventData.GrantedAccess AS GrantedAccess,
+        EventData.CallTrace AS CallTrace,
+        EventData.SourceProcessGUID AS SourceProcessGUID,
+        basename(path=EventData.SourceImage) AS SourceImageName
+      FROM foreach(
+        row=SysmonFiles,
+        query={
+          SELECT * FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 10
+            AND EventData.TargetImage =~ FilterRegex
+            AND EventData.GrantedAccess =~ GrantedAccessRegex
+            AND NOT EventData.SourceImage =~ SourceWhitelist
+        })
+      LIMIT 1000
+
+  - name: SourceProcesses
+    description: >
+      Live-process triage: lists running processes whose name or command line
+      matches known credential-dump tooling, to spot a still-resident dumper.
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username
+      FROM pslist()
+      WHERE Name =~ ToolRegex OR CommandLine =~ ToolRegex
+      LIMIT 1000
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: TargetImage
+    type: path
+  - name: SourceImage
+    type: path
