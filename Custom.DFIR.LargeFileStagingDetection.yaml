@@ -1,0 +1,93 @@
+name: Custom.DFIR.LargeFileStagingDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects large files staged in temp and user-writable directories
+  before potential exfiltration (MITRE ATT&CK T1074.001 - Local Data Staging).
+
+  Adversaries commonly stage collected data — archives, database dumps,
+  copies of sensitive files — in C:\Windows\Temp, per-user AppData\Local\Temp
+  and user directories before moving it out of the network. This artifact
+  enumerates every file above a configurable size threshold in those
+  locations, applies a regex filter, hashes each hit with MD5 and SHA256 and
+  optionally uploads samples for triage. Targets Windows by default; the glob
+  parameters accept alternative platform paths for cross-platform deployments.
+
+reference:
+  - https://attack.mitre.org/techniques/T1074.001/
+
+type: CLIENT
+
+parameters:
+  - name: TempPathGlob
+    type: glob
+    default: C:/Windows/Temp/**
+    description: Glob for machine-wide temp directories.
+
+  - name: UserPathGlob
+    type: glob
+    default: C:/Users/*/AppData/Local/Temp/**
+    description: Glob for per-user temp directories.
+
+  - name: SizeThresholdMB
+    type: int
+    default: 100
+    description: Flag files at or above this size, in MB.
+
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Regex applied to the file path; "." keeps everything.
+
+  - name: UploadFiles
+    type: bool
+    default: false
+    description: Upload flagged files to the server for review.
+
+sources:
+  - name: StagedFiles
+    description: |
+      Individual files above the size threshold found in staging locations,
+      with hashes and optional upload.
+    query: |
+      LET SizeLimit <= SizeThresholdMB * 1024 * 1024
+      LET TempFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=TempPathGlob)
+      LET UserFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=UserPathGlob)
+      LET Candidates <= SELECT * FROM chain(a=TempFiles, b=UserFiles)
+      LET Flagged <= SELECT
+            OSPath,
+            Size,
+            Mtime,
+            hash(path=OSPath, hashselect='MD5,SHA256') AS Hash
+          FROM Candidates
+      SELECT
+        OSPath,
+        Size,
+        Mtime,
+        Hash.MD5 AS MD5,
+        Hash.SHA256 AS SHA256,
+        if(condition=UploadFiles, then=upload(file=OSPath)) AS Upload
+      FROM Flagged
+      WHERE Size >= SizeLimit AND OSPath =~ FilterRegex
+
+  - name: StagingSummary
+    description: |
+      Per-directory rollup of staged data volume for quick triage.
+    query: |
+      LET TempFiles <= SELECT OSPath, Size FROM glob(globs=TempPathGlob)
+      LET UserFiles <= SELECT OSPath, Size FROM glob(globs=UserPathGlob)
+      LET SizeLimit <= SizeThresholdMB * 1024 * 1024
+      SELECT
+        dirname(path=OSPath) AS Directory,
+        count() AS FileCount,
+        sum(item=Size) AS TotalBytes
+      FROM chain(a=TempFiles, b=UserFiles)
+      WHERE Size >= SizeLimit AND OSPath =~ FilterRegex
+      GROUP BY Directory
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: OSPath
+    type: full_path
+  - name: Directory
+    type: full_path
