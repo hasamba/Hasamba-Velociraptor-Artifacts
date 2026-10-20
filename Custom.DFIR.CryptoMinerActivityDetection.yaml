@@ -1,0 +1,98 @@
+name: Custom.DFIR.CryptoMinerActivityDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects cryptocurrency mining activity (T1496 - Resource Hijacking) using
+  two independent detection vectors over live process data.
+
+  1. Process-name matching (cross-platform): scans the running process
+     inventory against a regex of common miner binaries and pool tooling
+     (xmrig, cpuminer, ethminer, monerod, xmr-stak, t-rex, nicehash, etc).
+  2. High sustained CPU usage (Windows): enumerates processes whose total
+     CPU usage exceeds a configurable threshold, which exposes renamed or
+     disguised miners that name matching would miss.
+
+  Miners commonly rename their binaries but still burn CPU; combining both
+  vectors reduces the chance a miner is hidden. The process-name source
+  runs on Linux / Windows / macOS; the CPU source is preconditioned to
+  Windows (performance-counter based).
+
+  Analyst workflow: review flagged processes (Pid, CommandLine, Username),
+  look for pool-URL indicators in the command line, and submit the
+  BinarySHA256 to threat intel for validation. Note the CPU counter is
+  relative to one core, so miners on multi-core hosts routinely show
+  values above 100%.
+
+reference:
+  - https://attack.mitre.org/techniques/T1496/
+
+type: CLIENT
+
+parameters:
+  - name: ProcessNameRegex
+    type: regex
+    default: "(?i)xmrig|minerd|cpuminer|cryptominer|ethminer|monerod|xmr-stak|nanominer|nicehash|minergate|coinhive|nbminer|lolminer|srbminer|t-rex|gminer|miniz|kthreaddi"
+    description: "Regex matching known miner binary / pool-tool names."
+  - name: CommandLineRegex
+    type: regex
+    default: "(?i)stratum[+]tcp|stratum[+]ssl|minexmr|donate[.]ssl|xmrpool|moneropool|nicehash[.]com|--donate-level|randomx|--cpu-priority"
+    description: "Regex matching mining-pool and miner-flag command-line patterns."
+  - name: CPUThresholdPercent
+    type: int
+    default: 80
+    description: "Flag processes with total CPU usage at or above this percent."
+  - name: HashFlaggedBinaries
+    type: bool
+    default: Y
+    description: "If set, SHA256-hash the binary of each flagged process."
+
+sources:
+  - name: SuspiciousMinerProcesses
+    description: |
+      Cross-platform live-process scan: flags any process whose name or
+      command line matches the configured miner regexes, with an optional
+      SHA256 hash of the binary.
+    query: |
+      LET FlaggedProcs <= SELECT Pid, Ppid, Name AS ProcessName, Exe,
+          CommandLine, Username, CreateTime
+        FROM pslist()
+        WHERE Name =~ ProcessNameRegex OR CommandLine =~ CommandLineRegex
+      SELECT Pid, Ppid, ProcessName, Exe, CommandLine, Username, CreateTime,
+             if(condition=HashFlaggedBinaries AND Exe,
+                then=hash(path=Exe, hashselect="SHA256").SHA256) AS BinarySHA256
+      FROM FlaggedProcs
+
+  - name: HighCPUProcesses
+    description: |
+      Windows-only: processes whose total CPU usage from the
+      Win32_PerfFormattedData_PerfProc_Process performance counter meets
+      the threshold, enriched with process details and optional binary
+      hash.
+    precondition: |
+      SELECT OS FROM info() WHERE OS = 'windows'
+    query: |
+      LET Procs <= SELECT Pid AS ProcPid, Name AS ProcessName, Exe,
+          CommandLine, Username, CreateTime
+        FROM pslist()
+      SELECT * FROM foreach(
+        row={
+          SELECT int(int=get(member="IDProcess")) AS OuterPid,
+                 get(member="Name") AS PerfCounterName,
+                 int(int=get(member="PercentProcessorTime")) AS CPUValue
+          FROM wmi(query="SELECT IDProcess, Name, PercentProcessorTime FROM Win32_PerfFormattedData_PerfProc_Process")
+        },
+        query={
+          SELECT ProcPid, PerfCounterName, CPUValue AS TotalCPUPercent,
+                 ProcessName, Exe, CommandLine, Username, CreateTime,
+                 if(condition=HashFlaggedBinaries AND Exe,
+                    then=hash(path=Exe, hashselect="SHA256").SHA256) AS BinarySHA256
+          FROM Procs
+          WHERE ProcPid = OuterPid
+            AND CPUValue >= CPUThresholdPercent
+            AND NOT PerfCounterName =~ "_Total|^Idle"
+        })
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: BinarySHA256
+    type: sha256
