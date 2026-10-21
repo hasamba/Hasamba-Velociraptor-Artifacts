@@ -1,0 +1,225 @@
+name: Custom.DFIR.LinuxSystemdUnitPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects attacker-installed Linux systemd service persistence (T1543.002).
+
+  Enumerates .service unit files across system (/etc/systemd/system),
+  vendor (/usr/lib/systemd/system), volatile (/run/systemd/system) and
+  user (~/.config/systemd/user, including root) unit directories,
+  capturing full content, hashes and MAC timestamps. Flags units whose
+  content matches attacker indicators and extracts ExecStart,
+  ExecStartPre, User, WantedBy and Description metadata for triage.
+  Separate sources cover systemctl override drop-ins
+  (*.service.d/*.conf) that silently modify legitimate units, service
+  enablement symlinks written by systemctl enable under *.target.wants,
+  and a timeline of persistence artifacts created or modified in the
+  last RecentDays.
+
+reference:
+  - https://attack.mitre.org/techniques/T1543.002/
+
+type: CLIENT
+
+parameters:
+  - name: SystemUnitGlob
+    type: glob
+    default: /etc/systemd/system/*.service
+  - name: LibUnitGlob
+    type: glob
+    default: /usr/lib/systemd/system/*.service
+  - name: RunUnitGlob
+    type: glob
+    default: /run/systemd/system/*.service
+  - name: UserUnitGlob
+    type: glob
+    default: /home/*/.config/systemd/user/*.service
+  - name: OverrideGlob
+    type: glob
+    default: /etc/systemd/system/*.service.d/*.conf
+  - name: WantsGlob
+    type: glob
+    default: /etc/systemd/system/*.wants/*
+  - name: ExecSuspicionRegex
+    type: regex
+    default: "(curl|wget|nc\\s|ncat|socat|/dev/tcp|/tmp/|/var/tmp/|/dev/shm/|base64|python3?\\s|perl\\s|ruby\\s|bash\\s+-i|nohup|mkfifo|chmod\\s+\\+x|/root/|/home/)"
+  - name: NetToolRegex
+    type: regex
+    default: "(?i)\\bcurl|wget|nc\\b|ncat|socat|openssl\\s+enc|/dev/tcp/"
+  - name: TempPathRegex
+    type: regex
+    default: "(?i)/tmp/|/var/tmp/|/dev/shm/|/run/user/|/home/[^/]+/\\.(cache|local|tmp)/"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: RecentDays
+    type: int
+    default: 30
+
+sources:
+  - name: UnitFiles
+    description: |
+      Full inventory of systemd service unit files across all
+      persistence-relevant directories, with file content, hashes and
+      timestamps. Use as baseline for new-unit review.
+    precondition: |
+      SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET SysUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=SystemUnitGlob)
+      LET LibUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=LibUnitGlob)
+      LET RunUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=RunUnitGlob)
+      LET UserUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=UserUnitGlob)
+      LET ExtraUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=[
+          "/usr/local/lib/systemd/system/*.service",
+          "/root/.config/systemd/user/*.service"])
+      LET AllUnits <= SELECT * FROM chain(
+        a={ SELECT * FROM SysUnits },
+        b={ SELECT * FROM LibUnits },
+        c={ SELECT * FROM RunUnits },
+        d={ SELECT * FROM UserUnits },
+        e={ SELECT * FROM ExtraUnits })
+      LET Enriched <= SELECT OSPath, Size, Mtime, Ctime,
+          read_file(filename=OSPath, length=65536) AS Content,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM AllUnits
+        WHERE OSPath =~ FilterRegex
+      SELECT OSPath, Size, Mtime, Ctime, Content,
+        Hash.MD5 AS MD5, Hash.SHA256 AS SHA256
+      FROM Enriched
+
+  - name: SuspiciousUnits
+    description: |
+      Flags unit files whose content matches attacker persistence
+      indicators (reverse shells, downloaders, temp-path execution,
+      encoders), and extracts the key unit metadata lines, with triage
+      booleans separating network-tool, temp-path and indicator hits.
+    precondition: |
+      SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET SysUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=SystemUnitGlob)
+      LET LibUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=LibUnitGlob)
+      LET RunUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=RunUnitGlob)
+      LET UserUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=UserUnitGlob)
+      LET ExtraUnits <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=[
+          "/usr/local/lib/systemd/system/*.service",
+          "/root/.config/systemd/user/*.service"])
+      LET AllUnits <= SELECT * FROM chain(
+        a={ SELECT * FROM SysUnits },
+        b={ SELECT * FROM LibUnits },
+        c={ SELECT * FROM RunUnits },
+        d={ SELECT * FROM UserUnits },
+        e={ SELECT * FROM ExtraUnits })
+      LET Enriched <= SELECT OSPath, Size, Mtime, Ctime,
+          read_file(filename=OSPath, length=65536) AS Content,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM AllUnits
+      SELECT OSPath, Mtime, Ctime,
+        parse_string_with_regex(
+          string=Content,
+          regex="(?m)^ExecStart[\\+]?=(?P<Line>.*)").Line AS ExecStartLine,
+        parse_string_with_regex(
+          string=Content,
+          regex="(?m)^ExecStartPre=(?P<Line>.*)").Line AS ExecStartPreLine,
+        parse_string_with_regex(
+          string=Content,
+          regex="(?m)^User=(?P<Line>.*)").Line AS RunAsUser,
+        parse_string_with_regex(
+          string=Content,
+          regex="(?m)^WantedBy=(?P<Line>.*)").Line AS WantedBy,
+        parse_string_with_regex(
+          string=Content,
+          regex="(?m)^Description=(?P<Line>.*)").Line AS UnitDescription,
+        Content =~ NetToolRegex AS NetworkTools,
+        Content =~ TempPathRegex AS TempPaths,
+        Hash.MD5 AS MD5, Hash.SHA256 AS SHA256,
+        Content
+      FROM Enriched
+      WHERE OSPath =~ FilterRegex AND (
+        Content =~ ExecSuspicionRegex OR
+        Content =~ NetToolRegex OR
+        Content =~ TempPathRegex)
+
+  - name: DropInOverrides
+    description: |
+      Collects systemctl override drop-in files (*.service.d/*.conf)
+      under /etc, which modify legitimate units without replacing the
+      original file — a stealthier T1543.002 variant. Drop-ins matching
+      the indicator regexes are flagged inline.
+    precondition: |
+      SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET Drops <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=OverrideGlob)
+      LET EnrichedDrops <= SELECT OSPath, Size, Mtime, Ctime,
+          read_file(filename=OSPath, length=65536) AS Content,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hash
+        FROM Drops
+        WHERE OSPath =~ FilterRegex
+      SELECT OSPath, Size, Mtime, Ctime, Content,
+        Content =~ ExecSuspicionRegex AS Suspicious,
+        Content =~ NetToolRegex AS NetworkTools,
+        Content =~ TempPathRegex AS TempPaths,
+        Hash.MD5 AS MD5, Hash.SHA256 AS SHA256
+      FROM EnrichedDrops
+
+  - name: EnabledWantSymlinks
+    description: |
+      Service enablement symlinks under *.target.wants in /etc and
+      /usr/lib — the records systemctl enable writes. Reveals which
+      services are configured to start at boot, catching disabled-in-
+      config but enabled-at-boot persistence.
+    precondition: |
+      SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET SysWants <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs=WantsGlob)
+      LET LibWants <= SELECT OSPath, Size, Mtime, Ctime
+        FROM glob(globs="/usr/lib/systemd/system/*.wants/*")
+      SELECT OSPath, Size, Mtime, Ctime
+      FROM chain(
+        a={ SELECT * FROM SysWants },
+        b={ SELECT * FROM LibWants })
+      WHERE OSPath =~ FilterRegex
+
+  - name: RecentChanges
+    description: |
+      Timeline pivot: unit files, drop-ins and want-symlinks created or
+      modified within RecentDays, across all persistence-relevant
+      directories. First-stop triage for fresh attacker persistence.
+    precondition: |
+      SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET RecentPaths <= SELECT * FROM chain(
+        a={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=SystemUnitGlob) },
+        b={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=LibUnitGlob) },
+        c={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=RunUnitGlob) },
+        d={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=UserUnitGlob) },
+        e={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=OverrideGlob) },
+        f={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=WantsGlob) },
+        g={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs="/usr/lib/systemd/system/*.wants/*") },
+        h={ SELECT OSPath, Size, Mtime, Ctime FROM glob(globs=[
+              "/usr/local/lib/systemd/system/*.service",
+              "/root/.config/systemd/user/*.service"]) })
+      SELECT OSPath, Size, Mtime, Ctime
+      FROM RecentPaths
+      WHERE Mtime > timestamp(epoch=now() - 86400 * RecentDays)
+        AND OSPath =~ FilterRegex
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: OSPath
+    type: path
+  - name: SHA256
+    type: sha256
