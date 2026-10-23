@@ -1,0 +1,163 @@
+name: Custom.DFIR.AwsCredFilesAfterHoursAccess
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt AWS credential files (unsecured credentials in files, T1552.001)
+  that were created, modified or accessed outside normal working hours.
+
+  Plaintext AWS credential files (~/.aws/credentials, ~/.aws/config and
+  the SSO token cache) are a prime theft target for infostealers, web
+  shells and hands-on-keyboard attackers before cloud takeover
+  (T1078/T1098). Touches on these files at unusual times (nights,
+  weekends, or far outside the profile owner's working window) can
+  reveal exfiltration or staging done by an actor on a different working
+  rhythm than the legitimate user.
+
+  Approach (cross-platform CLIENT artifact):
+  1. AfterHoursAccess - flag every file under any user's .aws directory
+     whose Modify or Access time falls outside the working window
+     (default Mon-Fri 08:00-18:00, endpoint local timezone; weekends
+     toggled by SkipWeekend). Each vector has its own boolean column so
+     the analyst can tell "written after hours" from "read after hours".
+  2. CredentialFilesInventory - full inventory of the .aws directories
+     with MAC(B) times, sizes, MD5/SHA256, key-material presence flags
+     and a MatchesAfterHours summary boolean for easy triage.
+
+  The presence of access-key / secret-key material is detected with a
+  boolean regex on the file content; the key VALUES themselves are never
+  collected or emitted, so the collection does not exfiltrate live
+  secrets. Use the hashes to identify known files and detect rotation.
+
+  Caveats: Atime may be disabled or throttled (Linux relatime, Windows
+  NTFS last-access policy); on such hosts Atime can be zero or equal to
+  Mtime - the ModOffHours/AccOffHours guards mark missing or zero
+  timestamps so flags stay truthful. Hours are evaluated in the
+  endpoint's local timezone. The hash and content read happen after the
+  timestamps were captured by glob, but reading can still refresh the
+  on-disk atime on relatime filesystems.
+
+  Analyst workflow: pivot on flagged Path/Hashes, correlate with logon
+  and process activity at the flagged Modified/Accessed timestamps
+  (T1552.001 + T1078), then rotate exposed keys and remove unused
+  plaintext credentials.
+
+reference:
+  - https://attack.mitre.org/techniques/T1552.001/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: |
+      C:/Users/*/.aws/**
+      /home/*/.aws/**
+      /root/.aws/**
+      /Users/*/.aws/**
+    description: Globs targeting the .aws profile dir of all users (Windows/Linux/macOS), one glob per line.
+
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Only report files whose full path matches this regex.
+
+  - name: StartHour
+    type: int
+    default: 8
+    description: First working hour (inclusive), endpoint local time.
+
+  - name: EndHour
+    type: int
+    default: 18
+    description: Last working hour (exclusive), endpoint local time.
+
+  - name: SkipWeekend
+    type: bool
+    default: "Y"
+    description: Also treat Saturday/Sunday touches as outside working hours.
+
+sources:
+  - name: AfterHoursAccess
+    description: |
+      Files under .aws whose modify or access time falls outside the
+      configured working window (hours and weekend logic per endpoint
+      local time).
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Atime, Btime
+        FROM glob(globs=filter(list=split(string=TargetGlob, sep="\n"), regex="\\S"))
+        WHERE NOT IsDir
+
+      LET Contented <= SELECT OSPath AS Path, Size, Mtime, Atime, Btime,
+             if(condition=Size > 0 AND Size < 1048576,
+                then=read_file(filename=OSPath, length=1048576)) AS Content
+        FROM Files
+
+      LET Enriched <= SELECT Path, Size, Mtime, Atime, Btime, Content,
+             Content =~ "(?i)aws_access_key_id" AS HasAccessKeyID,
+             Content =~ "(?i)aws_secret_access_key" AS HasSecretAccessKey,
+             hash(path=Path, hashselect=["MD5","SHA256"]) AS Hashes,
+             (Mtime.Unix > 0 AND (Mtime.Hour < StartHour OR Mtime.Hour >= EndHour)) AS ModOffHours,
+             (Mtime.Unix > 0 AND Mtime.Weekday.String =~ "Saturday|Sunday") AS ModOnWeekend,
+             (Atime.Unix > 0 AND (Atime.Hour < StartHour OR Atime.Hour >= EndHour)) AS AccOffHours,
+             (Atime.Unix > 0 AND Atime.Weekday.String =~ "Saturday|Sunday") AS AccOnWeekend
+        FROM Contented
+
+      SELECT Path, Size,
+             Mtime AS Modified, Atime AS Accessed, Btime AS Created,
+             ModOffHours, ModOnWeekend, AccOffHours, AccOnWeekend,
+             HasAccessKeyID, HasSecretAccessKey,
+             Hashes.MD5 AS MD5,
+             Hashes.SHA256 AS SHA256
+      FROM Enriched
+      WHERE Path =~ FilterRegex
+            AND (ModOffHours OR AccOffHours OR
+                 (SkipWeekend AND (ModOnWeekend OR AccOnWeekend)))
+
+  - name: CredentialFilesInventory
+    description: |
+      Complete inventory of AWS credential/SSO-cache files with times,
+      hashes, key-material presence and an after-hours summary flag for
+      triage.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Atime, Btime
+        FROM glob(globs=filter(list=split(string=TargetGlob, sep="\n"), regex="\\S"))
+        WHERE NOT IsDir
+
+      LET Contented <= SELECT OSPath AS Path, Size, Mtime, Atime, Btime,
+             if(condition=Size > 0 AND Size < 1048576,
+                then=read_file(filename=OSPath, length=1048576)) AS Content
+        FROM Files
+
+      LET Enriched <= SELECT Path, Size, Mtime, Atime, Btime, Content,
+             Content =~ "(?i)aws_access_key_id" AS HasAccessKeyID,
+             Content =~ "(?i)aws_secret_access_key" AS HasSecretAccessKey,
+             hash(path=Path, hashselect=["MD5","SHA256"]) AS Hashes,
+             (Mtime.Unix > 0 AND (Mtime.Hour < StartHour OR Mtime.Hour >= EndHour)) AS ModOffHours,
+             (Mtime.Unix > 0 AND Mtime.Weekday.String =~ "Saturday|Sunday") AS ModOnWeekend,
+             (Atime.Unix > 0 AND (Atime.Hour < StartHour OR Atime.Hour >= EndHour)) AS AccOffHours,
+             (Atime.Unix > 0 AND Atime.Weekday.String =~ "Saturday|Sunday") AS AccOnWeekend
+        FROM Contented
+
+      SELECT Path, Size,
+             Mtime AS Modified, Atime AS Accessed, Btime AS Created,
+             ModOffHours, AccOffHours,
+             HasAccessKeyID, HasSecretAccessKey,
+             (ModOffHours OR AccOffHours OR
+              (SkipWeekend AND (ModOnWeekend OR AccOnWeekend))) AS MatchesAfterHours,
+             Hashes.MD5 AS MD5,
+             Hashes.SHA256 AS SHA256
+      FROM Enriched
+      WHERE Path =~ FilterRegex
+
+column_types:
+  - name: Path
+    type: fs_path
+  - name: Modified
+    type: timestamp
+  - name: Accessed
+    type: timestamp
+  - name: Created
+    type: timestamp
+  - name: MD5
+    type: md5
+  - name: SHA256
+    type: sha256
