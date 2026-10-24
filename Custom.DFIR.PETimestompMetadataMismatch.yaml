@@ -1,0 +1,76 @@
+name: Custom.DFIR.PETimestompMetadataMismatch
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Timestomping hunter: compares NTFS MACB timestamps against metadata embedded
+  inside PE files (the COFF header linker timestamp) and checks internal
+  timestamp consistency for impossible relationships.
+
+  On NTFS an honest file normally satisfies Modified <= Change time, because
+  every modification also updates the MFT record. When Mtime is later than
+  Ctime (the MFT entry update time), the recorded modification time was
+  written into the record without a matching record update - the classic
+  signature left by timestamp-tampering tools (SetFileTime style timestomp).
+
+  For binaries, the PE header TimeDateStamp is stamped by the linker BEFORE
+  the file exists on disk, so a file whose Mtime precedes its own linker
+  timestamp was back-dated. Mtimes in the future are tampering as well.
+  Btime > Mtime is reported as context only because it frequently reflects
+  plain file copies, not malicious activity.
+
+  Boolean evidence columns: FutureMtime, ModBeforeLink, ModAfterChange.
+  File hashes support pivoting. Cross-platform note: PE metadata comparison is
+  Windows/NTFS oriented.
+
+reference:
+  - https://attack.mitre.org/techniques/T1070.006/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/Users/**/*.exe;C:/Users/**/*.dll;C:/Users/**/*.scr;C:/Users/**/*.cpl;C:/Users/**/*.pif"
+    description: Semicolon-separated globs for files to inspect.
+
+  - name: PathRegex
+    type: regex
+    default: "."
+    description: Only inspect files whose OSPath matches this regex.
+
+sources:
+  - name: Results
+    description: Files with MACB-vs-metadata contradictions indicating timestomping.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Atime, Ctime, Btime,
+            parse_pe(file=OSPath) AS PEInfo
+        FROM glob(globs=split(string=TargetGlob, sep=";"))
+        WHERE NOT IsDir AND OSPath =~ PathRegex
+
+      LET Stamped <= SELECT *, PEInfo.TimeDateStamp AS LinkTime
+        FROM Files
+        WHERE PEInfo.TimeDateStamp
+
+      SELECT OSPath, Size, Mtime, Atime, Ctime, Btime, LinkTime,
+        Mtime > now() AS FutureMtime,
+        Mtime < LinkTime AS ModBeforeLink,
+        Mtime > Ctime AS ModAfterChange,
+        Btime > Mtime AS CreatedAfterModification,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS FileHashes
+      FROM Stamped
+      WHERE Mtime > now() OR Mtime < LinkTime OR Mtime > Ctime
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: LinkTime
+    type: timestamp
+  - name: FileHashes
+    type: hash
