@@ -1,0 +1,165 @@
+name: Custom.DFIR.NTFSADSStreamEvidence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Finds evidence of NTFS Alternate Data Streams (ADS) — hidden named streams
+  grafted onto ordinary files that attackers abuse to stash payloads, tooling
+  and staging data outside the view of users, directory listings and most
+  AV products, e.g. a malicious DLL parked beside the legitimate one or a
+  PowerShell stager living inside Zone.Identifier-adjacent streams
+  (MITRE ATT&CK T1564.004).
+
+  Method: the artifact walks the target path with the NTFS accessor (direct
+  MFT-backed access, so streams remain visible even when the regular
+  filesystem view hides them), then enumerates every named stream attached to
+  each base file with the `:*` stream glob. Result rows are classified
+  (executable content hidden in a stream, unusually large stream, suspicious
+  stream name, or the benign Zone.Identifier Mark-of-the-Web marker), suspicious
+  streams get a content preview plus MD5/SHA256, and clean streams are marked
+  benign. Set UploadStreams=true to upload suspicious stream content to the
+  server for deeper analysis.
+
+reference:
+  - https://attack.mitre.org/techniques/T1564.004/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: "C:/Users/**"
+    description: Root path to scan for Alternate Data Streams. Defaults to all user profiles.
+
+  - name: FilterRegex
+    type: regex
+    default: "."
+    description: Only stream paths matching this regex are reported.
+
+  - name: ExecutableStreamRegex
+    type: regex
+    default: "(?i)\\.(exe|dll|ps1|bat|cmd|vbs|js|jse|vbe|wsf|ws|hta|mof|lnk|iso|img|cab|zip|7z)$"
+    description: Stream names ending in these extensions are classified as executable content hidden in an ADS.
+
+  - name: SuspiciousStreamRegex
+    type: regex
+    default: "(?i)(payload|hidden|stage|stub|implant|backdoor|agent|shell|drop|secret|cred|key|evil|inject)"
+    description: Substrings in the stream name that are considered suspicious.
+
+  - name: LargeStreamThreshold
+    type: int
+    default: 65536
+    description: Streams larger than this many bytes are flagged as unusually large.
+
+  - name: MaxStreamSize
+    type: int
+    default: 65536
+    description: Maximum number of bytes read from each stream for the content preview.
+
+  - name: UploadStreams
+    type: bool
+    default: false
+    description: If true, upload suspicious stream content to the server for analysis.
+
+sources:
+  - name: ADSInventory
+    description: Enumerate every named data stream under TargetGlob with stream name, base file, size and NTFS timestamps.
+    query: |
+      LET RootFiles <= SELECT OSPath AS RootPath, Size AS RootSize,
+             Mtime, Atime, Ctime, Btime
+        FROM glob(globs=TargetGlob, accessor="ntfs")
+       WHERE NOT IsDir AND NOT OSPath =~ ":[^:/]+$"
+
+      LET Streams <= SELECT Parsed.BasePath AS BaseFilePath,
+             Parsed.StreamName AS StreamName,
+             StreamPath AS OSPath, StreamSize AS Size,
+             StreamMtime AS Mtime, StreamAtime AS Atime,
+             StreamCtime AS Ctime, StreamBtime AS Btime
+        FROM foreach(
+          row=RootFiles,
+          query={
+            SELECT OSPath AS StreamPath, Size AS StreamSize,
+                   Mtime AS StreamMtime, Atime AS StreamAtime,
+                   Ctime AS StreamCtime, Btime AS StreamBtime,
+                   parse_string_with_regex(string=OSPath,
+                     regex=["^(?P<BasePath>.+):(?P<StreamName>[^:]+)$"]) AS Parsed
+              FROM glob(globs=RootPath + ":*", accessor="ntfs")
+             WHERE NOT OSPath =~ ":\\$DATA$"
+          })
+
+      SELECT OSPath, BaseFilePath, StreamName, Size, Mtime, Atime, Ctime, Btime
+        FROM Streams
+       WHERE OSPath =~ FilterRegex AND Parsed.StreamName
+
+  - name: SuspiciousADS
+    description: Classify each stream, preview and hash suspicious content, and optionally upload it to the server.
+    query: |
+      LET RootFiles <= SELECT OSPath AS RootPath, Size AS RootSize,
+             Mtime, Atime, Ctime, Btime
+        FROM glob(globs=TargetGlob, accessor="ntfs")
+       WHERE NOT IsDir AND NOT OSPath =~ ":[^:/]+$"
+
+      LET Streams <= SELECT Parsed.BasePath AS BaseFilePath,
+             Parsed.StreamName AS StreamName,
+             StreamPath AS OSPath, StreamSize AS Size,
+             StreamMtime AS Mtime, StreamAtime AS Atime,
+             StreamCtime AS Ctime, StreamBtime AS Btime
+        FROM foreach(
+          row=RootFiles,
+          query={
+            SELECT OSPath AS StreamPath, Size AS StreamSize,
+                   Mtime AS StreamMtime, Atime AS StreamAtime,
+                   Ctime AS StreamCtime, Btime AS StreamBtime,
+                   parse_string_with_regex(string=OSPath,
+                     regex=["^(?P<BasePath>.+):(?P<StreamName>[^:]+)$"]) AS Parsed
+              FROM glob(globs=RootPath + ":*", accessor="ntfs")
+             WHERE NOT OSPath =~ ":\\$DATA$"
+          })
+
+      LET Classified <= SELECT *,
+             if(condition=StreamName =~ ExecutableStreamRegex,
+                then="Executable content hidden in ADS",
+                else=if(condition=StreamName =~ "(?i)^zone\\.identifier$",
+                  then="Zone.Identifier (benign Mark-of-the-Web)",
+                  else=if(condition=Size > LargeStreamThreshold,
+                    then="Unusually large hidden stream",
+                    else=if(condition=StreamName =~ SuspiciousStreamRegex,
+                      then="Suspicious stream name",
+                      else="Benign named stream")))) AS Suspicion
+        FROM Streams
+       WHERE OSPath =~ FilterRegex AND Parsed.StreamName
+
+      LET WithEvidence <= SELECT *,
+             read_file(filename=OSPath, length=MaxStreamSize, accessor="ntfs") AS ContentPreview,
+             hash(path=OSPath, hashselect="MD5,SHA256", accessor="ntfs") AS Hashes
+        FROM Classified
+       WHERE Suspicion != "Zone.Identifier (benign Mark-of-the-Web)"
+         AND Suspicion != "Benign named stream"
+
+      SELECT *, Hashes.MD5 AS MD5, Hashes.SHA256 AS SHA256
+        FROM if(condition=UploadStreams,
+          then={
+            SELECT *, upload(file=OSPath, accessor="ntfs") AS Upload
+            FROM WithEvidence
+          },
+          else={
+            SELECT * FROM WithEvidence
+          })
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: BaseFilePath
+    type: path
+  - name: Size
+    type: number
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
