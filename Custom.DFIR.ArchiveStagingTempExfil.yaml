@@ -1,0 +1,103 @@
+name: Custom.DFIR.ArchiveStagingTempExfil
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects archives staged in temporary directories for exfiltration (T1560.001 Archive via Utility).
+
+  Attackers compress stolen data (zip, 7z, tar) in user or system temp directories before
+  staging the bundle for upload. This artifact provides two detections:
+  1. ArchiveFiles - files with archive extensions under temp locations, with timestamps and hashes.
+  2. RenamedArchives - files whose magic bytes reveal an archive (zip, gzip, 7z, RAR, ustar)
+     but whose extension does not match an archive type, catching the common
+     rename-to-hide staging trick.
+
+  Cross-platform by default: Windows client paths and Linux client paths are both covered;
+  paths on other clients simply return no results.
+reference:
+  - https://attack.mitre.org/techniques/T1560.001/
+type: CLIENT
+parameters:
+  - name: TargetGlob
+    type: glob
+    default: |
+      C:/Users/*/AppData/Local/Temp/**/*.{zip,7z,tar,gz,tgz,xz,bz2,rar,cab}
+      C:/Windows/Temp/**/*.{zip,7z,tar,gz,tgz,xz,bz2,rar,cab}
+      /tmp/**/*.{zip,7z,tar,gz,tgz,xz,bz2,rar,cab}
+      /var/tmp/**/*.{zip,7z,tar,gz,tgz,xz,bz2,rar,cab}
+  - name: AllTempGlob
+    type: glob
+    default: |
+      C:/Users/*/AppData/Local/Temp/**
+      C:/Windows/Temp/**
+      /tmp/**
+      /var/tmp/**
+  - name: ArchiveExtensionRegex
+    type: regex
+    default: '\.(zip\d*|7z|tar|gz|tgz|xz|bz2|rar|cab)$'
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: MaxSizeMB
+    type: int64
+    default: 200
+sources:
+  - name: ArchiveFiles
+    description: |
+      Files with archive extensions found under temporary directories, with hashes and timestamps.
+    query: |
+      LET TargetGlobList <= filter(list=split(string=TargetGlob, sep="\n"), regex="\\S")
+      LET Files <= SELECT OSPath, Size, Mtime, Btime
+        FROM glob(globs=TargetGlobList)
+        WHERE NOT IsDir
+          AND Size > 0
+          AND Size < MaxSizeMB * 1024 * 1024
+          AND OSPath =~ FilterRegex
+      LET Hashed = SELECT OSPath, Size, Mtime, Btime,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+        FROM Files
+      SELECT
+        OSPath,
+        Size,
+        Hashes.MD5 AS MD5,
+        Hashes.SHA256 AS SHA256,
+        Mtime,
+        Btime
+      FROM Hashed
+  - name: RenamedArchives
+    description: |
+      Files whose magic bytes show an archive inside (zip, gzip, 7z, RAR, ustar) but whose
+      extension does not match an archive type - data renamed to hide exfiltration staging.
+    query: |
+      LET MagicRules = '''
+        rule ZipMagic { strings: $m = "PK" condition: $m at 0 }
+        rule GzipMagic { strings: $m = { 1F 8B } condition: $m at 0 }
+        rule SevenZipMagic { strings: $m = { 37 7A BC AF 27 1C } condition: $m at 0 }
+        rule RarMagic { strings: $m = "Rar!" condition: $m at 0 }
+        rule TarMagic { strings: $m = "ustar" condition: $m at 257 }
+      '''
+      LET AllTempGlobList <= filter(list=split(string=AllTempGlob, sep="\n"), regex="\\S")
+      LET TempFiles <= SELECT OSPath, Size, Mtime
+        FROM glob(globs=AllTempGlobList)
+        WHERE NOT IsDir
+          AND Size > 300
+          AND Size < MaxSizeMB * 1024 * 1024
+          AND OSPath =~ FilterRegex
+      SELECT
+        OSPath,
+        Size,
+        Rule AS ArchiveMagic,
+        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256,
+        Mtime
+      FROM yara(files=TempFiles, rules=MagicRules, end=1024)
+      WHERE NOT OSPath =~ ArchiveExtensionRegex
+column_types:
+  - name: OSPath
+    type: path
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
+  - name: Mtime
+    type: timestamp
+  - name: Btime
+    type: timestamp
