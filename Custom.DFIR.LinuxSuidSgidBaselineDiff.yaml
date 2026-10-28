@@ -1,0 +1,74 @@
+name: Custom.DFIR.LinuxSuidSgidBaselineDiff
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Find SUID/SGID binaries that do not match a known-good baseline (T1548.001).
+
+  Enumerates SUID/SGID executables on the endpoint. Files matching a supplied
+  known-good SHA256 baseline (BaselineHashes) are marked baseline_match;
+  anything else is flagged NOT_IN_BASELINE as suspicious permission abuse.
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.001/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: str
+    default: "/usr/bin/*,/usr/sbin/*,/usr/local/bin/*,/usr/local/sbin/*,/bin/*,/sbin/*,/usr/lib/*/*,/home/*/*,/tmp/*,/var/tmp/*,/opt/*/*"
+  - name: BaselineHashes
+    type: str
+    default: ""
+    description: |
+      Comma-separated known-good SHA256 hashes. If empty, path-based default
+      baseline of standard Linux SUID binaries is used instead.
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: ExcludeRegex
+    type: regex
+    default: "^$"
+  - name: UploadSuspicious
+    type: bool
+    default: Y
+
+sources:
+  - name: Results
+    description: SUID/SGID binaries with baseline verdict.
+    query: |
+      LET KnownGood <= if(condition=BaselineHashes =~ ".+",
+           then=split(string=BaselineHashes, sep=","),
+           else=[])
+      LET DefaultBaselines <= split(
+           string="/usr/bin/passwd,/usr/bin/sudo,/usr/bin/su,/usr/bin/chsh,/usr/bin/chfn,/usr/bin/newgrp,/usr/bin/gpasswd,/usr/bin/mount,/usr/bin/umount,/usr/bin/pkexec,/usr/bin/fusermount,/usr/bin/fusermount3,/usr/bin/stap-run,/usr/bin/at,/usr/sbin/pam_extrausers_chkpwd,/usr/lib/openssh/ssh-keysign,/usr/lib/dbus-1.0/dbus-daemon-launch-helper,/usr/lib/eject/dmcrypt-get-device,/usr/lib/xorg/Xorg.wrap",
+           sep=",")
+      LET Files <= SELECT OSPath, Name, Size, Mtime, Mode
+        FROM glob(globs=split(string=TargetGlob, sep=","))
+        WHERE Mode =~ "[sS]"
+      SELECT
+        OSPath AS Path,
+        Mode AS Permissions,
+        Size,
+        Mtime,
+        hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256,
+        if(condition=BaselineHashes =~ ".+",
+           then=if(condition=SHA256 IN KnownGood,
+                 then="baseline_match",
+                 else="NOT_IN_BASELINE"),
+           else=if(condition=Path IN DefaultBaselines,
+                 then="baseline_match_path",
+                 else="NOT_IN_BASELINE")) AS Verdict,
+        if(condition=UploadSuspicious AND Verdict = "NOT_IN_BASELINE" AND Size < 20000000,
+           then=upload(file=OSPath),
+           else=NULL) AS Upload
+      FROM Files
+      WHERE Path =~ FilterRegex
+        AND NOT Path =~ ExcludeRegex
+
+column_types:
+  - name: Path
+    type: lr_string
+  - name: Mtime
+    type: timestamp
+  - name: SHA256
+    type: hash
