@@ -1,0 +1,114 @@
+name: Custom.DFIR.KerberoastingDetection4769
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects Kerberoasting (T1558.003) via Windows Security Event ID 4769
+  TGS request events. Flags requests with weak ticket encryption types
+  (RC4-HMAC family) typical of offline cracking, and aggregates TGS
+  activity per source host and account — the classic signature of
+  Kerberoasting tooling (Rubeus, Impacket GetUserSPNs).
+
+reference:
+  - https://attack.mitre.org/techniques/T1558.003/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: string
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+
+  - name: AccountRegex
+    type: regex
+    default: "."
+
+  - name: ServiceNameRegex
+    type: regex
+    default: "."
+
+  - name: SuspiciousEncTypes
+    type: string
+    default: "^0x17$|^23$|^0x1[789]$"
+    description: |
+      Regex matched against the raw TicketEncryptionType field of 4769
+      events. Covers RC4-HMAC (0x17/23) and RC4-HMAC-EXP (0x18/24)
+      variants regardless of decimal or hex representation.
+
+sources:
+  - name: TGS4769Events
+    description: |
+      Raw 4769 TGS request events with weak/suspicious ticket encryption,
+      filtered by account and service regex.
+    query: |
+      LET EncFilter <= SuspiciousEncTypes
+      SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.EventID.Value AS EventID,
+        System.Computer AS HostName,
+        EventData.TargetUserName AS AccountName,
+        EventData.ServiceName AS ServiceName,
+        EventData.TicketEncryptionType AS TicketEncryptionType,
+        EventData.TicketFlags AS TicketFlags,
+        EventData.TicketStatus AS TicketStatus,
+        EventData.IpAddress AS SourceIP,
+        EventData.IpPort AS SourcePort
+      FROM foreach(
+        row={ SELECT OSPath FROM glob(globs=EvtxGlob) },
+        query={
+          SELECT System, EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 4769
+            AND System.Channel =~ "Security"
+            AND EventData.TargetUserName =~ AccountRegex
+            AND EventData.ServiceName =~ ServiceNameRegex
+            AND EventData.TicketEncryptionType =~ EncFilter
+        })
+
+  - name: KerberoastCandidates
+    description: |
+      Aggregates suspicious 4769 events by source host and requesting
+      account, counting distinct services requested — high counts
+      indicate Kerberoasting enumeration.
+    query: |
+      LET EncFilter <= SuspiciousEncTypes
+      LET Base <= SELECT
+          System.Computer AS HostName,
+          EventData.TargetUserName AS AccountName,
+          EventData.IpAddress AS SourceIP,
+          EventData.ServiceName AS ServiceName,
+          EventData.TicketEncryptionType AS TicketEncryptionType,
+          timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=EvtxGlob) },
+          query={
+            SELECT System, EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4769
+              AND System.Channel =~ "Security"
+              AND EventData.TargetUserName =~ AccountRegex
+              AND EventData.ServiceName =~ ServiceNameRegex
+              AND EventData.TicketEncryptionType =~ EncFilter
+          })
+      SELECT
+        HostName,
+        AccountName,
+        SourceIP,
+        count(items=ServiceName) AS TGSRequestCount,
+        count(items=AccountName) AS DistinctAccounts,
+        min(item=EventTime) AS FirstSeen,
+        max(item=EventTime) AS LastSeen,
+        max(item=EventTime) AS LastSeenTS,
+        if(condition=TGSRequestCount > 5,
+          then="HIGH - likely Kerberoasting",
+          else="Review") AS Assessment
+      FROM Base
+      GROUP BY HostName, AccountName, SourceIP
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp
+  - name: LastSeenTS
+    type: timestamp
