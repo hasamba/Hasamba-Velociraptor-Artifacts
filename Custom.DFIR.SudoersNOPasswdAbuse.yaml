@@ -1,0 +1,68 @@
+name: Custom.DFIR.SudoersNOPasswdAbuse
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects sudo rule abuse and unauthorized NOPASSWD entries in sudoers files.
+
+  Attackers with root or file-write access often add NOPASSWD rules to
+  /etc/sudoers or /etc/sudoers.d/* to maintain persistence and escalate
+  privileges without a password prompt. This artifact enumerates all
+  sudoers files, extracts active (non-comment) rule lines, flags
+  NOPASSWD usage, highlights broad ALL rules, and reports file metadata
+  and hashes for baseline comparison.
+
+reference:
+  - https://attack.mitre.org/techniques/T1548.003/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: string
+    default: "/etc/sudoers*"
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousRegex
+    type: regex
+    default: "(NOPASSWD|ALL=\\(?ALL\\)?|Defaults.*!authenticate)"
+
+sources:
+  - name: SudoersRules
+    description: Extract active sudoers rule lines, flag NOPASSWD and suspicious patterns
+    query: |
+      LET Files = SELECT OSPath, Size, Mtime, Btime FROM glob(globs=TargetGlob) WHERE NOT IsDir
+      SELECT OSPath,
+             Size,
+             Mtime,
+             hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256,
+             Line,
+             if(condition=Line =~ SuspiciousRegex, then="SUSPICIOUS", else="INFO") AS Verdict
+      FROM foreach(
+        row=Files,
+        query={
+          SELECT Line
+          FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
+          WHERE NOT Line =~ "^\\s*(#|$)" AND Line =~ FilterRegex
+        })
+      ORDER BY OSPath
+
+  - name: SudoersFileInfo
+    description: File metadata and hashes of all sudoers files for baseline tracking
+    query: |
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Btime,
+             hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256
+      FROM glob(globs=TargetGlob)
+      WHERE NOT IsDir
+      ORDER BY Btime DESC
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: OSPath
+    type: filepath
+  - name: SHA256
+    type: hash
