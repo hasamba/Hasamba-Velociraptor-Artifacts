@@ -1,0 +1,140 @@
+name: Custom.DFIR.DllSearchOrderHijackHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for evidence of DLL search order hijacking (MITRE ATT&CK T1574.001).
+
+  DLL search order hijacking abuses the Windows loader's search sequence: when an
+  application loads a DLL without a fully qualified path, Windows searches (in order)
+  the application directory, system directories, and — critically — the current
+  working directory and every directory in the PATH environment variable (in legacy
+  safe-search mode). An attacker plants a malicious DLL in a user-writable directory
+  (Temp, Downloads, %PUBLIC%, or any PATH directory that comes before the legitimate
+  one) and waits for a legitimate process to load it side-by-side.
+
+  This artifact hunts from two angles:
+  1. Filesystem sweep for suspicious PE files planted in Temp/PUBLIC/Downloads and
+     in directories listed in the system/User PATH that shadow legitimate DLL names,
+     plus detection of duplicate DLL filenames (same basename as a System32 DLL)
+     outside the system directories.
+  2. Active process exposure analysis — enumerates currently running processes whose
+     executables and CWD sit inside user-writable directories, which is the runtime
+     precondition for the hijack to succeed.
+
+reference:
+  - https://attack.mitre.org/techniques/T1574.001/
+
+type: CLIENT
+
+parameters:
+  - name: SuspiciousDirsGlob
+    type: glob
+    default: |
+      ["C:/Users/*/AppData/Local/Temp/**/*.dll",
+       "C:/Users/*/AppData/Local/Temp/**/*.exe",
+       "C:/Users/Public/**/*.{dll,exe}",
+       "C:/Users/*/Downloads/**/*.{dll,exe}",
+       "C:/Windows/Temp/**/*.{dll,exe}"]
+
+  - name: ShadowFilterRegex
+    type: regex
+    default: ".+(?i)\\.(dll|exe)$"
+
+  - name: ExcludeWriteFilterRegex
+    type: regex
+    default: "^$"
+
+  - name: PathDirsRegex
+    type: regex
+    default: "."
+
+  - name: UploadFiles
+    type: bool
+    default: false
+
+sources:
+  - name: SuspiciousTempDlls
+    description: >
+      PE files planted in user-writable Temp/Public/Downloads locations — the classic
+      drop zone for DLL search order hijack payloads.
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime, Btime FROM glob(globs=SuspiciousDirsGlob)
+      SELECT
+        OSPath,
+        Btime,
+        Mtime,
+        Size,
+        upload(file=OSPath) AS Upload
+      FROM if(condition=UploadFiles,
+        then={ SELECT OSPath, Btime, Mtime, Size, upload(file=OSPath) AS Upload
+               FROM Files
+               WHERE OSPath =~ ShadowFilterRegex
+                 AND NOT OSPath =~ ExcludeWriteFilterRegex },
+        else={ SELECT OSPath, Btime, Mtime, Size, NULL AS Upload
+               FROM Files
+               WHERE OSPath =~ ShadowFilterRegex
+                 AND NOT OSPath =~ ExcludeWriteFilterRegex })
+
+  - name: PathDirectoryShadowing
+    description: >
+      DLL/EXE bearing the same basename as a legitimate System32 DLL found in any
+      directory listed in the PATH environment variable — strong indicator of a
+      planted hijack DLL ahead of the system copy in search order.
+    query: |
+      LET SystemPath <= SELECT Data.Value AS PathValue FROM
+         read_reg_key(globs="HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Control/Session Manager/Environment",
+                      accessor="registry")
+      LET PathDirs <= SELECT PathValue FROM SystemPath
+
+      LET SystemDllNames <= SELECT Name AS SystemName FROM
+         glob(globs="C:/Windows/System32/*.dll")
+
+      LET PathDirFiles <= SELECT * FROM foreach(
+         row=PathDirs,
+         query={ SELECT PathValue AS Dir, OSPath, Name, Size, Mtime
+                 FROM glob(globs=Dir + "/*.dll")
+                 WHERE Dir =~ PathDirsRegex
+                   AND NOT Dir =~ "C:/Windows/System32"
+                   AND NOT Dir =~ "C:/Windows/SysWOW64" })
+      SELECT
+        OSPath AS SuspiciousPath,
+        Name AS PlantedName,
+        Size,
+        Mtime,
+        if(condition={ SELECT * FROM SystemDllNames WHERE
+             SystemName =~ "^" + PlantedName + "$" },
+           then="TRUE", else="FALSE") AS ShadowsSystemDll
+      FROM PathDirFiles
+      WHERE ShadowsSystemDll = "TRUE"
+
+  - name: ExposedProcesses
+    description: >
+      Running processes whose image or current working directory resides in a
+      user-writable path — candidates whose DLL search order can be hijacked from
+      Temp/PATH directories.
+    query: |
+      LET WritableRegex <= "(?i)AppData\\\\(Local\\\\Temp|Roaming|Local)|C:\\\\Users\\\\Public|C:\\\\Windows\\\\Temp|C:\\\\Temp|C:\\\\Users\\\\[^\x5c\x5c]+\\\\(Downloads|Desktop)"
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM pslist()
+      WHERE Exe =~ WritableRegex
+         OR dirname(path=Exe) =~ WritableRegex
+
+column_types:
+  - name: OSPath
+    type: path
+  - name: SuspiciousPath
+    type: path
+  - name: Exe
+    type: path
+  - name: CreateTime
+    type: timestamp
+  - name: Btime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
