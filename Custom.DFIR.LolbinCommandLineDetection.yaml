@@ -1,0 +1,72 @@
+name: Custom.DFIR.LolbinCommandLineDetection
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects abuse of living-off-the-land binaries (LOLBins) by inspecting
+  running process command lines for mshta.exe, regsvr32.exe and certutil.exe
+  with suspicious argument patterns.
+
+  These signed Windows binaries are frequently abused to execute scripts or
+  download payloads while evading application whitelisting (MITRE ATT&CK
+  T1218 - Signed Binary Proxy Execution).
+
+reference:
+  - https://attack.mitre.org/techniques/T1218/
+
+type: CLIENT
+
+parameters:
+  - name: ProcessRegex
+    type: regex
+    default: "(?i)mshta\\.exe|regsvr32\\.exe|certutil\\.exe"
+
+  - name: SuspiciousArgsRegex
+    type: regex
+    default: "(?i)(http|https|ftp)://|urlcache|verifyctl|split|further|\\.hta|vbscript|javascript|/scrobj|/i:|/regsvr|/u.*dll|/c.*script"
+
+  - name: ExclusionRegex
+    type: regex
+    default: "(?i)goodsigning\\.com|microsoftupdate\\.local"
+
+sources:
+  - name: SuspiciousProcesses
+    description: |
+      Lists currently running LOLBin processes whose command lines match
+      suspicious argument patterns.
+    query: |
+      LET LOLBins <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+        FROM pslist()
+        WHERE Name =~ ProcessRegex
+          AND CommandLine =~ SuspiciousArgsRegex
+          AND NOT CommandLine =~ ExclusionRegex
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime
+      FROM LOLBins
+
+  - name: AllLolbinProcesses
+    description: |
+      Shows ALL running mshta/regsvr32/certutil processes regardless of
+      arguments, for manual triage.
+    query: |
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        timestamp(epoch=CreateTime) AS CreateTime
+      FROM pslist()
+      WHERE Name =~ ProcessRegex AND NOT CommandLine =~ ExclusionRegex
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: previewpath
