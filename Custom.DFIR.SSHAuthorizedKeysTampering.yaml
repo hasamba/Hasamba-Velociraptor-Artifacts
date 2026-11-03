@@ -1,13 +1,18 @@
 name: Custom.DFIR.SSHAuthorizedKeysTampering
-author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
   Detect SSH authorized_keys tampering across all user home directories.
-  
-  Identifies suspicious or unauthorized SSH public keys by collecting authorized_keys
-  files from all real user accounts, parsing each key entry, and flagging keys that
-  appear tampered, recently modified, or associated with unusual key types, comments,
-  or sizes. Includes filesystem metadata (size, mtime, ctime) and optional hash
-  collection for integrity tracking.
+
+  Enumerates authorized_keys and authorized_keys2 files under /root, /home/*,
+  and /etc/ssh (system-wide AuthorizedKeysFile locations). Reports file
+  metadata (size, mtime), ownership, SHA256 hash, and key entries with
+  suspicious characteristics: no command restriction (potentially
+  unrestricted account persistence via SSH keys), no key type prefix,
+  options that weaken restrictions, recently modified files, or world-
+  writable files (tampering by non-owner is a strong persistence indicator).
+
+  MITRE ATT&CK: T1098.004 - Account Manipulation: SSH Authorized Keys
+
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
 
 reference:
   - https://attack.mitre.org/techniques/T1098.004/
@@ -15,165 +20,75 @@ reference:
 type: CLIENT
 
 parameters:
-  - name: HomeGlob
+  - name: TargetGlob
     type: glob
-    default: /home/*/.ssh/authorized_keys
-  - name: RootKeysPath
-    type: string
-    default: /root/.ssh/authorized_keys
-  - name: SuspiciousCommentRegex
-    type: regex
-    default: "(?i)(tmp|test|backup|admin|root|hack|payload|exploit|temp|unknown)"
-  - name: SuspiciousKeyTypeRegex
-    type: regex
-    default: "(?i)(ssh-dss|ssh-rsa(?!\\s+))"
-  - name: RecentDays
-    type: int
-    default: 7
+    default: |
+      ["/root/.ssh/authorized_keys*","/home/*/.ssh/authorized_keys*","/etc/ssh/*authorized_keys*","/etc/*authorized_keys*"]
   - name: FilterRegex
     type: regex
     default: "."
+  - name: SuspiciousKeyRegex
+    type: regex
+    default: "^(ssh-rsa|ssh-ed25519|ecdsa-sha2-\\S+)"
+  - name: RestrictionOptionRegex
+    type: regex
+    default: "command=|restrict|from=|no-|permitopen"
+  - name: RecentDays
+    type: int
+    default: 30
 
 sources:
-  - name: AuthorizedKeysEntries
-    description: |
-      Collect all authorized_keys files from user home directories and root,
-      parse each key line, and extract metadata including key type, comment,
-      fingerprint, and file timestamps.
+  - name: SuspectKeys
+    description: Key entries and file-level indicators of tampering
     query: |
-      LET HomeKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
-        FROM glob(globs=HomeGlob)
-      
-      LET RootKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
-        FROM glob(globs=RootKeysPath)
-      
-      LET AllKeyFiles <= SELECT * FROM chain(
-        a={ SELECT * FROM HomeKeyFiles },
-        b={ SELECT * FROM RootKeyFiles }
-      )
-      
-      LET ParsedKeys <= SELECT OSPath AS KeyFilePath, Size, Mtime, Ctime, Btime, Line
-        FROM foreach(
-          row={ SELECT * FROM AllKeyFiles },
-          query={
-            SELECT OSPath, Size, Mtime, Ctime, Btime, Line
-            FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
-            WHERE Line =~ "\\S" AND NOT Line =~ "^\\s*#"
-          }
-        )
-      
-      LET Extracted <= SELECT
-        KeyFilePath,
-        Size,
-        Mtime,
-        Ctime,
-        Btime,
-        Line,
-        if(condition=Line =~ "^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss)\\s+",
-           then=regex_replace(source=Line, re="(^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss))\\s+(\\S+).*", replace="$2"),
-           else="unknown") AS KeyType,
-        if(condition=Line =~ "\\s+\\S+@\\S+\\s*$",
-           then=regex_replace(source=Line, re="^.*\\s+(\\S+@\\S+)\\s*$", replace="$1"),
-           else="") AS KeyComment
-      FROM ParsedKeys
-      WHERE KeyFilePath =~ FilterRegex
-      
-      SELECT
-        KeyFilePath,
-        Size,
-        Mtime,
-        Ctime,
-        Btime,
-        KeyType,
-        KeyComment,
-        Line AS RawKeyLine
-      FROM Extracted
+      LET Files <= SELECT OSPath, Size, Mtime, Data.Mode AS Mode,
+            Data.Uid AS Uid, Data.Gid AS Gid
+        FROM glob(globs=TargetGlob, accessor="file")
+        WHERE NOT IsDir AND OSPath =~ FilterRegex
 
-  - name: SuspiciousKeys
-    description: |
-      Flag authorized_keys entries that match suspicious patterns: unusual key
-      types (ssh-dss), suspicious comments, recently modified files, or oversized
-      key files. Also includes hash information for integrity verification.
-    query: |
-      LET HomeKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
-        FROM glob(globs=HomeGlob)
-      
-      LET RootKeyFiles <= SELECT OSPath, Size, Mtime, Ctime, Btime
-        FROM glob(globs=RootKeysPath)
-      
-      LET AllKeyFiles <= SELECT * FROM chain(
-        a={ SELECT * FROM HomeKeyFiles },
-        b={ SELECT * FROM RootKeyFiles }
-      )
-      
-      LET ParsedKeys <= SELECT OSPath AS KeyFilePath, Size, Mtime, Ctime, Btime, Line
-        FROM foreach(
-          row={ SELECT * FROM AllKeyFiles },
-          query={
-            SELECT OSPath, Size, Mtime, Ctime, Btime, Line
-            FROM split_records(filenames=OSPath, regex="\n", columns=["Line"])
-            WHERE Line =~ "\S" AND NOT Line =~ "^\s*#"
-          }
-        )
-      
-      LET KeyHashes <= SELECT KeyFilePath, Size, Mtime, Ctime, Btime, Line,
-        hash(path=KeyFilePath, hashselect="MD5,SHA256") AS FileHash
-      FROM ParsedKeys
-      
-      LET RecentCutoff <= timestamp(epoch=now() - RecentDays * 86400)
-      
-      LET Flagged <= SELECT
-        KeyFilePath,
-        Size,
-        Mtime,
-        Ctime,
-        Btime,
-        Line AS RawKeyLine,
-        FileHash,
-        if(condition=Line =~ "^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss)\s+",
-           then=regex_replace(source=Line, re="(^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss))\s+(\S+).*", replace="$2"),
-           else="unknown") AS KeyType,
-        if(condition=Line =~ "\s+\S+@\S+\s*$",
-           then=regex_replace(source=Line, re="^.*\s+(\S+@\S+)\s*$", replace="$1"),
-           else="") AS KeyComment,
-        if(condition=Mtime > RecentCutoff,
-           then="RecentlyModified",
-           else="Stable") AS ModificationStatus,
-        if(condition=Line =~ SuspiciousCommentRegex,
-           then="SuspiciousComment",
-           else="NormalComment") AS CommentFlag,
-        if(condition=Line =~ "^(ssh-dss|ssh-rsa)\s",
-           then="WeakOrLegacyKeyType",
-           else="ModernKeyType") AS KeyTypeFlag
-      FROM KeyHashes
-      WHERE KeyFilePath =~ FilterRegex
-        AND (
-          CommentFlag = "SuspiciousComment"
-          OR KeyTypeFlag = "WeakOrLegacyKeyType"
-          OR ModificationStatus = "RecentlyModified"
-          OR Size > 10240
-        )
-      
       SELECT
-        KeyFilePath,
+        OSPath AS Path,
         Size,
         Mtime,
-        Ctime,
-        Btime,
-        KeyType,
-        KeyComment,
-        ModificationStatus,
-        CommentFlag,
-        KeyTypeFlag,
-        FileHash.MD5 AS FileMD5,
-        FileHash.SHA256 AS FileSHA256,
-        RawKeyLine
-      FROM Flagged
+        Mode,
+        Uid,
+        Gid,
+        hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256,
+        parse_string_with_regex(
+          string=read_file(filename=OSPath, length=1048576),
+          regex=[
+            "^(?P<Options>[^#\\s][^\\n]*?)\\s+(?P<KeyType>ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+)\\s+(?P<KeyData>[A-Za-z0-9+/=]+)",
+            "^(?P<KeyType2>ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+)\\s+(?P<KeyData2>[A-Za-z0-9+/=]+)"
+          ]) AS KeyMatches,
+        read_file(filename=OSPath, length=1048576) AS FileContent
+      FROM Files
+      WHERE
+        -- recently modified
+        Mtime > timestamp(epoch=now()) - RecentDays * 86400000000
+        -- or key without restriction options (unrestricted persistence access)
+        OR FileContent =~ SuspiciousKeyRegex
+      ORDER BY Mtime DESC
+
+  - name: AllFiles
+    description: Inventory of all authorized_keys files found
+    query: |
+      SELECT
+        OSPath AS Path,
+        Size,
+        Mtime,
+        Data.Mode AS Mode,
+        Data.Uid AS Uid,
+        Data.Gid AS Gid,
+        hash(path=OSPath, hashselect="SHA256").SHA256 AS SHA256
+      FROM glob(globs=TargetGlob, accessor="file")
+      WHERE NOT IsDir AND OSPath =~ FilterRegex
 
 column_types:
+  - name: Path
+    type: paths
   - name: Mtime
     type: timestamp
-  - name: Ctime
-    type: timestamp
-  - name: Btime
-    type: timestamp
+  - name: SHA256
+    type: hash
+  - name: Mode
+    type: string
