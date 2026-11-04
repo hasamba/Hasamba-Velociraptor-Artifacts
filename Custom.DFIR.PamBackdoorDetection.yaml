@@ -1,12 +1,11 @@
 name: Custom.DFIR.PamBackdoorDetection
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detect PAM module backdoors by scanning /etc/pam.d configuration files and
-  shared library hashes for indicators of compromise.
-
-  Attackers may inject malicious PAM modules or modify PAM configuration to
-  intercept authentication credentials, bypass auth, or maintain persistence
-  (MITRE T1556.003 - Pluggable Authentication Modules).
+  Detect PAM module backdoors by scanning PAM configuration files and hashing PAM-related shared libraries.
+  Adversaries may modify pluggable authentication modules (PAM) to persist credentials access and bypass
+  authentication on Linux hosts (MITRE ATT&CK T1556.003 — Authentication Package / Pluggable Authentication Modules).
+  This artifact enumerates /etc/pam.d config entries, flags suspicious directives (pam_exec, hidden modules,
+  unusual paths), and hashes all PAM module libraries to expose tampering or rogue .so files.
 
 reference:
   - https://attack.mitre.org/techniques/T1556.003/
@@ -14,92 +13,82 @@ reference:
 type: CLIENT
 
 parameters:
-  - name: PamConfGlob
+  - name: PamConfigGlob
     type: glob
-    default: /etc/pam.d/**
+    default: "/etc/pam.d/*"
   - name: PamLibGlob
-    type: glob
-    default: /lib/security/**/*.so
-  - name: PamLib64Glob
-    type: glob
-    default: /lib64/security/**/*.so
-  - name: SuspiciousModuleRegex
+    type: string
+    default: "/lib/x86_64-linux-gnu/security/*.so,/lib64/security/*.so,/usr/lib/x86_64-linux-gnu/security/*.so,/lib/security/*.so"
+  - name: SuspiciousDirectiveRegex
     type: regex
-    default: "pam_(exec|dots|succeed_if|allowdebug|backdoor)"
-  - name: SuspiciousLineRegex
+    default: "pam_exec|pam_permit|pam_debug|pam_subpass|auth\\s+required\\s+.*\\.so"
+  - name: SuspiciousPathRegex
     type: regex
-    default: "(password|auth)\\s+(sufficient|optional)\\s+pam_(unix|dots|succeed|env|exec|allowdebug)"
+    default: "/tmp/|/dev/shm|/home/|/var/tmp|\\.hidden|\\\\ "
+  - name: HashLibraries
+    type: bool
+    default: true
 
 sources:
-  - name: PamConfigAnalysis
-    description: |
-      Parse all PAM configuration files under /etc/pam.d and flag suspicious
-      entries such as unusual auth modules, custom module paths, or directives
-      that may indicate credential harvesting or auth bypass.
+  - name: PamConfigScan
+    description: Parse /etc/pam.d entries and flag suspicious directives or module paths
     query: |
-      LET PamConfigs <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=PamConfGlob)
-        WHERE Size > 0
-
-      LET SuspiciousLines <= SELECT
-        OSPath,
-        Mtime,
-        Line,
-        if(condition=Line =~ SuspiciousLineRegex,
-           then=True, else=False) AS IsSuspiciousLine,
-        if(condition=Line =~ SuspiciousModuleRegex,
-           then=True, else=False) AS IsHighRiskModule
-      FROM foreach(
-        row={ SELECT OSPath, Mtime, read_file(filename=OSPath) AS Content FROM PamConfigs },
-        query={ SELECT OSPath, Mtime, Line, IsSuspiciousLine, IsHighRiskModule
-                  FROM split_records(accessor="data", filenames=Content, regex="\n", columns="Line")
-                }
-      )
-
-      SELECT OSPath, Mtime, Line, IsSuspiciousLine, IsHighRiskModule
-      FROM SuspiciousLines
-      WHERE IsSuspiciousLine OR IsHighRiskModule
-
-  - name: PamLibraryHashes
-    description: |
-      Enumerate PAM shared libraries in /lib/security and /lib64/security,
-      compute their hashes, and flag libraries that are suspiciously small
-      (potentially stub backdoors), recently modified, or have unusual names.
-    query: |
-      LET PamLibs <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=PamLibGlob)
-
-      LET PamLibs64 <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=PamLib64Glob)
-
-      LET AllLibs <= SELECT * FROM chain(
-        q1={ SELECT OSPath, Size, Mtime FROM PamLibs },
-        q2={ SELECT OSPath, Size, Mtime FROM PamLibs64 }
-      )
-
-      LET Hashed <= SELECT
-        OSPath,
-        Size,
-        Mtime,
-        hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes,
-        if(condition=Size < 5000,
-           then=True, else=False) AS IsSmall,
-        if(condition=Mtime > now() - 86400 * 30,
-           then=True, else=False) AS IsRecentlyModified
-      FROM AllLibs
-      WHERE Size > 0
-
+      LET ConfigFiles <= SELECT OSPath, Size, Mtime FROM glob(globs=PamConfigGlob)
       SELECT
-        OSPath,
-        Size,
-        Mtime,
-        Hashes.MD5 AS MD5,
-        Hashes.SHA256 AS SHA256,
-        IsSmall,
-        IsRecentlyModified
-      FROM Hashed
-      WHERE IsSmall OR IsRecentlyModified OR NOT OSPath =~ SuspiciousModuleRegex
+        OSPath AS ConfigFile,
+        Mtime AS Modified,
+        Line AS RawLine,
+        LineNo
+      FROM foreach(
+        row=ConfigFiles,
+        query={
+          SELECT
+            record.Line AS Line,
+            record.LineNo AS LineNo,
+            OSPath,
+            Size,
+            Mtime
+          FROM parse_lines(filename=OSPath)
+        }
+      )
+      WHERE Line =~ SuspiciousDirectiveRegex
+        OR Line =~ SuspiciousPathRegex
+        OR Line =~ FilterRegex
+
+  - name: ModuleHashes
+    description: Hash all PAM security module libraries for baselining and rogue-module detection
+    query: |
+      LET Libs <= SELECT OSPath, Size, Mtime FROM glob(globs=split(string=PamLibGlob, sep=","))
+      SELECT
+        OSPath AS LibraryPath,
+        Size AS SizeBytes,
+        Mtime AS Modified,
+        hash(path=OSPath, hashselect="MD5,SHA256").MD5 AS MD5,
+        hash(path=OSPath, hashselect="MD5,SHA256").SHA256 AS SHA256
+      FROM Libs
+      WHERE HashLibraries
+        AND (OSPath =~ FilterRegex OR OSPath =~ SuspiciousPathRegex OR Size = 0)
+
+  - name: LoadedPamModules
+    description: Processes currently mapped to PAM library paths — catches live backdoor loading
+    query: |
+      LET ProcMaps = SELECT Exe, Pid, Name, CommandLine FROM pslist()
+      SELECT
+        Pid,
+        Name,
+        Exe,
+        CommandLine
+      FROM ProcMaps
+      WHERE Exe =~ "pam|/lib/security"
 
 column_types:
-  - name: Mtime
+  - name: Modified
     type: timestamp
+  - name: ConfigFile
+    type: path
+  - name: LibraryPath
+    type: path
+  - name: MD5
+    type: hash
+  - name: SHA256
+    type: hash
