@@ -1,9 +1,17 @@
 name: Custom.DFIR.RDPLateralMovementDetection
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Detect RDP lateral movement by analyzing Windows Security Event Logs.
-  Correlates Event IDs 4624 (logon), 4648 (explicit credential logon), and 4778 (RDP session reconnection)
-  to identify suspicious RDP activity patterns indicative of lateral movement.
+  Detect RDP lateral movement using Windows Security Event Log IDs 4624 (logon), 4648 (explicit credentials) and 4778 (RDP session reconnection).
+
+  Lateral movement via RDP (MITRE ATT&CK T1021.001) leaves distinctive traces
+  in the Windows Security event log: LogonType 10 interactive/RDP logons
+  (4624), credential usage with explicit credentials (4648 with RDP process
+  names such as mstscax.dll ortermsrv.exe), and session reconnections
+  (4778/4779). Correlating these on each endpoint lets an analyst spot
+  on each endpoint lets an analyst spot workstation-to-workstation RDP hops even when central log aggregation is missing.
+
+  Default filter passes all records; tighten the regex parameters to narrow
+  to specific accounts, source hosts, or process names.
 
 reference:
   - https://attack.mitre.org/techniques/T1021.001/
@@ -13,81 +21,145 @@ type: CLIENT
 parameters:
   - name: EventLogGlob
     type: glob
-    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
-  - name: SuspiciousLogonTypeRegex
-    type: regex
-    default: "^(7|10)$"
-  - name: TargetUserFilter
+    default: "C:/Windows/System32/winevt/Logs/Security*.evtx"
+  - name: TargetUserRegex
     type: regex
     default: "."
-  - name: LookbackHours
+  - name: SourceHostRegex
+    type: regex
+    default: "."
+  - name: ProcessNameRegex
+    type: regex
+    default: "."
+  - name: SearchDays
     type: int
-    default: 72
+    default: "7"
 
 sources:
-  - name: LogonEvents
-    description: RDP-related logon events (4624/4648/4778)
+  - name: RDPLogon4624
+    description: |
+      Successful logons (4624) with LogonType 10 (RemoteInteractive / RDP),
+      excluding machine accounts.
     query: |
-      LET LookbackSeconds <= LookbackHours * 3600
+      LET cutoff <= timestamp(epoch=now() - SearchDays * 86400)
+      LET events <= SELECT EventTime, EventID, EventData
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+          query={
+            SELECT timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+                   System.EventID.Value AS EventID,
+                   EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4624
+          })
+      SELECT EventTime,
+             EventID,
+             EventData.SubjectUserName AS TargetUser,
+             EventData.SubjectDomainName AS TargetDomain,
+             EventData.IpAddress AS SourceIP,
+             EventData.WorkstationName AS SourceHost,
+             EventData.LogonType AS LogonType,
+             EventData.ProcessName AS ProcessName,
+             OSPath AS EventLog
+      FROM events
+      WHERE LogonType = "10"
+        AND EventTime > cutoff
+        AND TargetUser =~ TargetUserRegex
+        AND SourceHost =~ SourceHostRegex
 
-      LET EventLogFiles <= SELECT OSPath FROM glob(globs=EventLogGlob)
+  - name: ExplicitCredentials4648
+    description: |
+      Logons with explicit credentials (4648) referencing RDP-related
+      processes (mstsc.exe, mstscax.dll, termsrv.exe, svchost with
+      TermService).
+    query: |
+      LET cutoff <= timestamp(epoch=now() - SearchDays * 86400)
+      LET events <= SELECT EventTime, EventID, EventData
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+          query={
+            SELECT timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+                   System.EventID.Value AS EventID,
+                   EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4648
+          })
+      SELECT EventTime,
+             EventID,
+             EventData.SubjectUserName AS CallerUser,
+             EventData.TargetUserName AS CredTargetUser,
+             EventData.TargetServerName AS TargetServer,
+             EventData.ProcessName AS ProcessName,
+             EventData.IpAddress AS SourceIP,
+             OSPath AS EventLog
+      FROM events
+      WHERE EventData.ProcessName =~ "(?i)mstsc|termsrv|TermService"
+        AND ProcessName =~ ProcessNameRegex
+        AND EventTime > cutoff
 
-      LET ParsedEvents <= SELECT * FROM foreach(
-        row=EventLogFiles,
-        query={
-          SELECT
-            System.TimeCreated.SystemTime AS EventTime,
-            System.EventID.Value AS EventID,
-            EventData
-          FROM parse_evtx(filename=OSPath)
-          WHERE System.EventID.Value IN (4624, 4648, 4778)
-            AND System.TimeCreated.SystemTime > timestamp(epoch=now() - LookbackSeconds)
-        })
+  - name: SessionReconnect4778
+    description: |
+      RDP session reconnect / enumerations (4778) showing which sessions are
+      alive and from which workstation they were resumed.
+    query: |
+      LET cutoff <= timestamp(epoch=now() - SearchDays * 86400)
+      LET events <= SELECT EventTime, EventID, EventData
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+          query={
+            SELECT timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+                   System.EventID.Value AS EventID,
+                   EventData
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value = 4778
+          })
+      SELECT EventTime,
+             EventID,
+             EventData.AccountName AS Account,
+             EventData.ClientName AS ClientName,
+             EventData.SessionName AS SessionName,
+             OSPath AS EventLog
+      FROM events
+      WHERE EventTime > cutoff
+        AND Account =~ TargetUserRegex
+        AND ClientName =~ SourceHostRegex
 
-      LET RDPLogons <= SELECT
-        EventTime,
-        EventID,
-        EventData.Data.LogonType AS LogonType,
-        EventData.Data.TargetUserName AS TargetUser,
-        EventData.Data.TargetDomainName AS TargetDomain,
-        EventData.Data.IpAddress AS SourceIP,
-        EventData.Data.IpPort AS SourcePort,
-        EventData.Data.WorkstationName AS WorkstationName,
-        EventData.Data.LogonProcessName AS LogonProcess
-      FROM ParsedEvents
-      WHERE EventID = 4624
-        AND LogonType =~ SuspiciousLogonTypeRegex
-        AND TargetUser =~ TargetUserFilter
-
-      LET ExplicitCredLogons <= SELECT
-        EventTime,
-        EventID,
-        EventData.Data.TargetUserName AS TargetUser,
-        EventData.Data.TargetDomainName AS TargetDomain,
-        EventData.Data.IpAddress AS SourceIP,
-        EventData.Data.ProcessName AS ProcessName
-      FROM ParsedEvents
-      WHERE EventID = 4648
-        AND TargetUser =~ TargetUserFilter
-
-      LET RDPSessionReconnects <= SELECT
-        EventTime,
-        EventID,
-        EventData.Data.UserName AS UserName,
-        EventData.Data.DomainName AS Domain,
-        EventData.Data.SessionName AS SessionName,
-        EventData.Data.ClientName AS ClientName,
-        EventData.Data.ClientAddress AS ClientAddress
-      FROM ParsedEvents
-      WHERE EventID = 4778
-
-      SELECT * FROM chain(
-        a={ SELECT EventTime, "4624-RDPLogon" AS EventType, LogonType, TargetUser, TargetDomain, SourceIP, SourcePort, WorkstationName, LogonProcess FROM RDPLogons },
-        b={ SELECT EventTime, "4648-ExplicitCred" AS EventType, TargetUser, TargetDomain, SourceIP, "" AS SourcePort, ProcessName AS WorkstationName, "" AS LogonProcess FROM ExplicitCredLogons },
-        c={ SELECT EventTime, "4778-RDPReconnect" AS EventType, "" AS LogonType, UserName AS TargetUser, Domain AS TargetDomain, ClientAddress AS SourceIP, "" AS SourcePort, ClientName AS WorkstationName, "" AS LogonProcess FROM RDPSessionReconnects },
-        maxrows=10000
-      ) ORDER BY EventTime DESC
+  - name: Summary
+    description: |
+      Timeline of all RDP-related events across the three sources, sorted by
+      time — the quick triage view for lateral movement.
+    query: |
+      LET cutoff <= timestamp(epoch=now() - SearchDays * 86400)
+      LET rdp_events <= SELECT EventTime, EventID, EventData, OSPath AS EventLog
+        FROM foreach(
+          row={ SELECT OSPath FROM glob(globs=EventLogGlob) },
+          query={
+            SELECT timestamp(string=System.TimeCreated.SystemTime) AS EventTime,
+                   System.EventID.Value AS EventID,
+                   EventData,
+                   OSPath
+            FROM parse_evtx(filename=OSPath)
+            WHERE System.EventID.Value in (4624, 4648, 4778)
+          })
+      SELECT EventTime,
+             EventID,
+             if(condition=EventID = 4624,
+                then=EventData.SubjectUserName,
+                else=EventData.AccountName) AS User,
+             if(condition=EventID = 4624,
+                then=EventData.IpAddress,
+                else=EventData.ClientName) AS Source,
+             OSPath AS EventLog
+      FROM rdp_events
+      WHERE EventTime > cutoff
+        AND (EventData.SubjectUserName =~ TargetUserRegex
+             OR EventData.AccountName =~ TargetUserRegex)
+      ORDER BY EventTime
 
 column_types:
   - name: EventTime
     type: timestamp
+  - name: EventLog
+    type: path
+  - name: SourceIP
+    type: text
