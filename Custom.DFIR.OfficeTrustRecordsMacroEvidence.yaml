@@ -1,0 +1,100 @@
+name: Custom.DFIR.OfficeTrustRecordsMacroEvidence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Identifies evidence of Office macro execution configuration via registry
+  TrustRecords and recent document usage (MRU), pointing to T1137.001
+  (Office Application Startup: Office Trust Records).
+
+  Office TrustRecords under HKU are written when a user enables content
+  (macros/ActiveX) in a document — a strong indicator that a macro-laden
+  file was actually trusted and executed. RecentDocs MRU reveals which
+  documents were recently opened, correlating them with the TrustRecords
+  paths to surface macro-enabled documents (.docm, .xlsm, .pptm).
+
+reference:
+  - https://attack.mitre.org/techniques/T1137.001/
+  - https://www.microsoft.com/en-us/security/blog/2021/10/12/detecting-and-preventing-privilege-escalation-attacks-leading-to-ransomware/
+
+type: CLIENT
+
+parameters:
+  - name: TrustRecordGlob
+    type: glob
+    default: "HKEY_USERS/*/Software/Microsoft/Office/**/TrustRecords/*"
+  - name: RecentDocsGlob
+    type: glob
+    default: "HKEY_USERS/*/Software/Microsoft/Office/**/File MRU/*"
+  - name: TrustFilterRegex
+    type: regex
+    default: "."
+  - name: MacroExtRegex
+    type: regex
+    default: "\\.(docm|xlsm|pptm|dotm|xlam|ppam)($|\\?)"
+
+sources:
+  - name: TrustRecords
+    description: |
+      TrustRecords entries indicating documents where the user enabled
+      content (trust decision). Contains the file path in the value name.
+    query: |
+      LET TrustRecords = SELECT
+          OSPath,
+          Data.value AS TrustData,
+          timestamp(epoch=Mtime.Sec) AS RegistryModified,
+          split(string=OSPath.SepComponents[len(OSPath.SepComponents)-2],
+                sep="\\") AS UserKeyHint
+      FROM glob(globs=TrustRecordGlob, accessor="registry")
+      WHERE OSPath =~ TrustFilterRegex
+      SELECT
+          UserKeyHint AS UserHive,
+          OSPath AS RegPath,
+          TrustData,
+          parse_string_with_regex(
+            regex="(?i)(?P<Path>[A-Z]:\\\\[^\\r\\n]*?\\.(doc|docm|xls|xlsx|xlsm|ppt|pptm|dot|dotm))",
+            string=serialize(item=TrustData)).Path AS TrustedDocumentPath,
+          RegistryModified
+      FROM TrustRecords
+
+  - name: RecentDocs
+    description: |
+      Office File MRU entries showing recently opened documents; flags
+      macro-enabled extensions as high interest.
+    query: |
+      SELECT
+          OSPath.SepComponents[1] AS UserHive,
+          Data.value AS MruEntry,
+          timestamp(epoch=Mtime.Sec) AS RegistryModified,
+          if(condition=Data.value =~ MacroExtRegex,
+             then="MACRO_ENABLED",
+             else="Other") AS DocType
+      FROM glob(globs=RecentDocsGlob, accessor="registry")
+      WHERE Data.value =~ MacroExtRegex
+
+  - name: MacroDocsOnDisk
+    description: |
+      Macro-enabled documents present in user directories — candidates
+      for the files seen in TrustRecords/RecentDocs.
+    query: |
+      SELECT
+          OSPath,
+          Size,
+          timestamp(epoch=Mtime.Sec) AS Modified,
+          hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM glob(globs=[
+          "C:/Users/*/Documents/**/*.{docm,xlsm,pptm,dotm,xlam,ppam}",
+          "C:/Users/*/AppData/Roaming/Microsoft/Word/STARTUP/*",
+          "C:/Users/*/AppData/Roaming/Microsoft/Excel/XLSTART/*"
+        ])
+      LIMIT 500
+
+column_types:
+  - name: RegistryModified
+    type: timestamp
+  - name: Modified
+    type: timestamp
+  - name: TrustedDocumentPath
+    type: filepath
+  - name: OSPath
+    type: filepath
+  - name: Hashes
+    type: json
