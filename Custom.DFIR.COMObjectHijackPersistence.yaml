@@ -1,0 +1,100 @@
+name: Custom.DFIR.COMObjectHijackPersistence
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect COM object hijacking persistence (T1546.015) by enumerating
+  HKLM and HKU InprocServer32 / LocalServer32 registry keys under
+  Classes\CLSID, flagging entries pointing to user-writable locations or
+  missing binaries, and resolving the referenced COM server DLL/EXE on disk.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.015/
+
+type: CLIENT
+
+parameters:
+  - name: FilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousImageRegex
+    type: regex
+    default: "(?i)(users|programdata|temp|appdata|downloads|public)"
+  - name: MaxFileSize
+    type: int64
+    default: "20000000"
+
+sources:
+  - name: HKLMCLSID
+    description: CLSID InprocServer32/LocalServer32 entries under HKLM
+    query: |
+      LET Keys <= SELECT OSPath, Mtime FROM glob(globs=[
+            "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/InprocServer32",
+            "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/LocalServer32"
+          ], accessor="registry")
+      SELECT
+        timestamp(epoch=Mtime.Sec) AS Mtime,
+        OSPath AS RegistryKey,
+        Data.value AS DefaultServerValue
+      FROM foreach(row=Keys,
+        query={
+          SELECT OSPath, Mtime,
+                 parse_string_with_regex(string=utf16(string=read_file(
+                    filename=OSPath, accessor="registry", length=4096)),
+                    regex="^(?P<value>.*)$").value AS Data
+          FROM scope()
+        }) WHERE RegistryKey =~ FilterRegex
+
+  - name: HKUCLSID
+    description: User-hive CLSID COM server entries (HKU loaded profiles)
+    query: |
+      LET UserKeys <= SELECT OSPath, Mtime FROM glob(globs=[
+            "HKEY_USERS/*/Software/Classes/CLSID/*/InprocServer32",
+            "HKEY_USERS/*/Software/Classes/CLSID/*/LocalServer32"
+          ], accessor="registry")
+      SELECT
+        timestamp(epoch=Mtime.Sec) AS Mtime,
+        OSPath AS RegistryKey,
+        Data.value AS DefaultServerValue
+      FROM foreach(row=UserKeys,
+        query={
+          SELECT OSPath, Mtime,
+                 parse_string_with_regex(string=utf16(string=read_file(
+                    filename=OSPath, accessor="registry", length=4096)),
+                    regex="^(?P<value>.*)$").value AS Data
+          FROM scope()
+        }) WHERE RegistryKey =~ FilterRegex
+
+  - name: SuspiciousTargets
+    description: COM server binaries resolved on disk pointing to suspicious writable paths or missing
+    query: |
+      LET ServerKeys <= SELECT OSPath, Mtime FROM glob(globs=[
+            "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/InprocServer32",
+            "HKEY_LOCAL_MACHINE/SOFTWARE/Classes/CLSID/*/LocalServer32",
+            "HKEY_USERS/*/Software/Classes/CLSID/*/InprocServer32",
+            "HKEY_USERS/*/Software/Classes/CLSID/*/LocalServer32"
+          ], accessor="registry")
+      LET Values = SELECT
+        OSPath AS RegistryKey,
+        timestamp(epoch=Mtime.Sec) AS Mtime,
+        parse_string_with_regex(string=utf16(string=read_file(
+             filename=OSPath, accessor="registry", length=4096)),
+             regex="^(?P<value>.*)$").value AS DefaultServerValue
+      FROM ServerKeys WHERE DefaultServerValue =~ FilterRegex
+      LET Resolved = SELECT RegistryKey, Mtime, DefaultServerValue,
+        parse_string_with_regex(string=DefaultServerValue,
+          regex="(?i)^[a-zA-Z]:\\\\(?P<ComServerPath>[^\"]+$)").ComServerPath AS ComServerPath
+      FROM Values WHERE ComServerPath =~ SuspiciousImageRegex
+      SELECT RegistryKey, Mtime, DefaultServerValue, ComServerPath,
+             stat(filename=ComServerPath).empty AS FileExists,
+             stat(filename=ComServerPath).Size AS FileSize
+      FROM Resolved
+      WHERE (NOT FileExists) OR FileSize < MaxFileSize
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: RegistryKey
+    type: path
+  - name: ComServerPath
+    type: path
+  - name: FileSize
+    type: size
