@@ -1,0 +1,100 @@
+name: Custom.DFIR.Security4624Type3PassTheHash
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects potential pass-the-hash or pass-the-ticket activity via Windows Security
+  event log 4624 (logon) type 3 (network logon) events.
+
+  Pass-the-hash/over-pass-the-hash and pass-the-ticket result in network logons
+  (Logon Type 3) where the logged-on user account is a local/SERVICE domain account,
+  theAuthenticationPackageName is NTLM (for PtH) or Kerberos with unusual package,
+  LmPackageName contains NTLM with no network target visible, and typically no
+  corresponding Interactive logon. Classic signals:
+  - LogonType 3 with elevated/anonymous accounts (e.g. ANONYMOUS LOGON rare but seen)
+  - AuthenticationPackage NTLM + LmPackageName containing "NTLM" for admin-level accounts
+  - ImpersonationLevel "%%1833" (Impersonation) with RestrictedAdminMode
+  - ElevationToken present, ProcessId unusual for network logon
+
+reference:
+  - https://attack.mitre.org/techniques/T1550.002/
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Security.evtx"
+
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+  - name: ExcludeRegex
+    type: regex
+    default: "(?i)(^$|ANONYMOUS LOGON LocalSystem NETWORK SERVICE DWM-\\d+)"
+
+  - name: TargetLogonTypes
+    type: regex
+    default: "^(3|9|10)$"
+
+  - name: SuspiciousAuthPackages
+    type: regex
+    default: "(?i)^(NTLM|Negotiate)$"
+
+sources:
+  - name: PtH_4624_Events
+    description: >
+      Security.evtx EventID 4624 with LogonType 3 (network) filtered for
+      suspicious authentication package / impersonation signals typical of PtH/PtT.
+    query: |
+      LET Evtx = SELECT OSPath FROM glob(globs=EvtxGlob)
+      LET Events = SELECT
+        System.TimeCreated.SystemTime AS EventTime,
+        System.Computer AS Computer,
+        System.EventID.Value AS EventID,
+        EventData.SubjectUserName AS SubjectUserName,
+        EventData.SubjectDomainName AS SubjectDomainName,
+        EventData.TargetUserName AS TargetUserName,
+        EventData.TargetDomainName AS TargetDomainName,
+        EventData.LogonType AS LogonType,
+        EventData.AuthenticationPackageName AS AuthPackage,
+        EventData.LmPackageName AS LmPackage,
+        EventData.ImpersonationLevel AS ImpersonationLevel,
+        EventData.IpAddress AS IpAddress,
+        EventData.IpPort AS IpPort,
+        EventData.WorkstationName AS Workstation,
+        EventData.ProcessId AS ProcessId,
+        EventData.ProcessName AS ProcessName,
+        EventData.LogonGuid AS LogonGuid,
+        EventData.RestrictedAdminMode AS RestrictedAdminMode,
+        EventData.ElevatedToken AS ElevatedToken
+      FROM parse_evtx(filename=OSPath)
+      WHERE EventID = 4624
+
+      SELECT
+        timestamp(epoch=EventTime) AS EventTime,
+        Computer,
+        SubjectDomainName + "\\" + SubjectUserName AS SubjectUser,
+        TargetDomainName + "\\" + TargetUserName AS TargetUser,
+        LogonType,
+        AuthPackage,
+        LmPackage,
+        ImpersonationLevel,
+        IpAddress,
+        IpPort,
+        Workstation,
+        ProcessId,
+        ProcessName,
+        RestrictedAdminMode,
+        ElevatedToken
+      FROM Events
+      WHERE
+        LogonType =~ TargetLogonTypes
+        AND (AuthPackage =~ SuspiciousAuthPackages
+             OR ImpersonationLevel =~ "%%1833"
+             OR RestrictedAdminMode = "%%1842")
+        AND TargetUser =~ FilterRegex
+        AND NOT TargetUser =~ ExcludeRegex
+
+column_types:
+  - name: EventTime
+    type: timestamp
