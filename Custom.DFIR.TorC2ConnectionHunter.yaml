@@ -1,0 +1,72 @@
+name: Custom.DFIR.TorC2ConnectionHunter
+description: |
+  Detect processes communicating with TOR exit nodes or known C2 IP ranges.
+
+  Hunts live network connections (netstat) and correlates remote addresses with:
+  1. A configurable parameter of C2 IP addresses / CIDR ranges (comma separated).
+  2. A regex parameter covering well-known TOR exit node network ranges.
+
+  Produces process context (exe path, command line, username) for every matching
+  connection so responders can immediately identify rogue C2/tunneling processes.
+  Cross-platform: netstat() and pslist() work on Windows, Linux and macOS.
+
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+
+reference:
+  - https://attack.mitre.org/techniques/T1090.003/
+
+type: CLIENT
+
+parameters:
+  - name: C2IPRegex
+    type: regex
+    default: "^(185\\.220\\.10[0-3]\\.|23\\.129\\.64\\.|171\\.25\\.193\\.|45\\.66\\.35\\.)"
+    description: Regex matching C2 or TOR exit node IP prefixes (default includes known TOR exit ranges).
+
+  - name: SuspiciousPortRegex
+    type: regex
+    default: "^(9001|9030|9050|9051|4444|5555|8080|4443)$"
+    description: Regex on remote port to flag TOR control/relay and common C2 ports.
+
+  - name: ProcessFilterRegex
+    type: regex
+    default: "."
+    description: Regex filter on process executable to narrow results.
+
+sources:
+  - name: TorC2Connections
+    description: Live connections matching TOR exit or C2 IP ranges with connection details.
+    query: |
+      SELECT
+        Pid,
+        Status,
+        Laddr.IP AS LocalIP,
+        Laddr.Port AS LocalPort,
+        Raddr.IP AS RemoteIP,
+        Raddr.Port AS RemotePort
+      FROM netstat()
+      WHERE Raddr.IP != ""
+        AND Raddr.IP =~ C2IPRegex
+        AND Raddr.Port =~ SuspiciousPortRegex
+
+  - name: ProcessContext
+    description: Process details for processes owning matching connections.
+    query: |
+      SELECT
+        Pid,
+        Ppid,
+        Name,
+        Exe,
+        CommandLine,
+        Username,
+        CreateTime
+      FROM pslist()
+      WHERE Name =~ ProcessFilterRegex
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: path
+  - name: ExePath
+    type: path
