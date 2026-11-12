@@ -1,0 +1,162 @@
+name: Custom.DFIR.OfficeSuspiciousNetworkConnections
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect suspicious network connections from Office applications via Sysmon Event 3.
+
+  Malicious macro-enabled documents and exploited Office apps (WINWORD.EXE,
+  EXCEL.EXE, POWERPNT.EXE, OUTLOOK.EXE, and scripting hosts launched by them)
+  commonly beacon to C2 servers over HTTP(S), DNS, SMB, or raw TCP — a hallmark
+  of T1071 (Application Layer Protocol). Sysmon Event ID 3 logs every outbound
+  network connection with process origin, destination IP/port, and hashes.
+
+  This artifact parses the Sysmon operational EVTX log, correlates Office-originated
+  Event 3 records with live process state, flags suspicious destination ports,
+  non-corporate/private IPs, and executable paths outside standard Office install
+  locations, and enriches results with SHA256 hashes of the source binaries.
+
+reference:
+  - https://attack.mitre.org/techniques/T1071/
+  - https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+
+type: CLIENT
+
+parameters:
+  - name: EvtxGlob
+    type: glob
+    default: C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx
+
+  - name: OfficeProcessRegex
+    type: regex
+    default: (?i)^(WINWORD|EXCEL|POWERPNT|OUTLOOK|ONENOTE|MSACCESS|MSPUB)\.EXE$
+
+  - name: SuspiciousPortRegex
+    type: regex
+    default: ^(4444|8080|1337|4443|8443|9996|5555)$
+
+  - name: ExcludedIPRegex
+    type: regex
+    default: ^(?:10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|::1|fe80)
+
+  - name: MaxEvents
+    type: int
+    default: 500
+
+sources:
+  - name: SuspiciousConnections
+    description: |
+      Sysmon Event 3 (network connection) records whose initiating process is an
+      Office application, filtered to suspicious ports and non-private destinations.
+    query: |
+      LET SysmonLogs <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET EventRows = SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.EventID.Value AS EventID,
+        System.Computer AS Computer,
+        EventData.Image AS Image,
+        EventData.ProcessGuid AS ProcessGuid,
+        EventData.ProcessId AS Pid,
+        EventData.User AS User,
+        EventData.DestinationIp AS DestinationIp,
+        EventData.DestinationPort AS DestinationPort,
+        EventData.DestinationHostname AS DestinationHostname,
+        EventData.Initiated AS Initiated,
+        EventData.Protocol AS Protocol
+      FROM foreach(row=SysmonLogs,
+        query={ SELECT System, EventData FROM parse_evtx(filename=OSPath) })
+      WHERE EventID = 3
+      LIMIT 200
+
+      LET OfficeEvents = SELECT * FROM EventRows
+        WHERE Image =~ OfficeProcessRegex
+          AND Initiated = "true"
+
+      SELECT
+        EventTime,
+        Computer,
+        basename(path=Image) AS ProcessName,
+        Image,
+        Pid,
+        User,
+        Protocol,
+        DestinationIp,
+        DestinationHostname,
+        DestinationPort,
+        DestinationIp AS SuspiciousIP
+      FROM OfficeEvents
+      WHERE
+        NOT DestinationIp =~ ExcludedIPRegex
+        AND (DestinationPort =~ SuspiciousPortRegex
+             OR DestinationHostname =~ FilterRegex)
+
+  - name: AllOfficeConnections
+    description: |
+      All Sysmon Event 3 connections initiated by Office processes, unfiltered,
+      for triage context.
+    query: |
+      LET SysmonLogs <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      SELECT
+        timestamp(epoch=System.TimeCreated.SystemTime) AS EventTime,
+        System.Computer AS Computer,
+        basename(path=EventData.Image) AS ProcessName,
+        EventData.Image AS Image,
+        EventData.ProcessId AS Pid,
+        EventData.User AS User,
+        EventData.Protocol AS Protocol,
+        EventData.DestinationIp AS DestinationIp,
+        EventData.DestinationHostname AS DestinationHostname,
+        EventData.DestinationPort AS DestinationPort
+      FROM foreach(row=SysmonLogs,
+        query={ SELECT System, EventData FROM parse_evtx(filename=OSPath) })
+      WHERE System.EventID.Value = 3
+        AND EventData.Image =~ OfficeProcessRegex
+        AND EventData.Initiated = "true"
+      LIMIT 200
+
+  - name: ProcessBinaryHashes
+    description: |
+      For each unique Office process image seen initiating connections, resolve
+      the on-disk path and compute MD5/SHA256 hashes; path anomaly is flagged
+      when the binary is outside standard Office/Program Files locations.
+    query: |
+      LET SysmonLogs <= SELECT OSPath FROM glob(globs=EvtxGlob)
+
+      LET EventRows = SELECT
+        System.TimeCreated.SystemTime AS EventTime,
+        System.EventID.Value AS EventID,
+        EventData.Image AS Image
+      FROM foreach(row=SysmonLogs,
+        query={ SELECT System, EventData FROM parse_evtx(filename=OSPath) })
+
+      LET UniqueImages <= SELECT Image AS ImagePath FROM EventRows
+        WHERE EventID = 3
+          AND Image =~ OfficeProcessRegex
+        GROUP BY ImagePath
+
+      SELECT
+        ImagePath,
+        basename(path=ImagePath) AS BinaryName,
+        OSPath AS ResolvedPath,
+        hash(path=OSPath, hashselect="MD5,SHA256") AS FileHash,
+        stat(filename=OSPath).Size AS FileSize,
+        timestamp(epoch=stat(filename=OSPath).Mtime.Sec) AS FileMtime,
+        NOT (ResolvedPath =~ "(?i)^C:/(Program Files|Program Files \\(x86\\))/Microsoft (Office|365)") AS PathAnomaly
+      FROM foreach(row=UniqueImages,
+        query={ SELECT OSPath FROM glob(globs=ImagePath) })
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: FileMtime
+    type: timestamp
+  - name: Image
+    type: filepath
+  - name: ImagePath
+    type: filepath
+  - name: FileHash
+    type: hash
+  - name: SHA256
+    type: hash
+  - name: MD5
+    type: hash
