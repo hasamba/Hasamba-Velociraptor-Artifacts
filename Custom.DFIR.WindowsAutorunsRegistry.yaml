@@ -1,0 +1,73 @@
+name: Custom.DFIR.WindowsAutorunsRegistry
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Enumerate autorun entries from Run and RunOnce keys across HKCU and HKLM hives.
+
+  Registry Run/RunOnce persistence is a common technique (MITRE ATT&CK T1547.001).
+  This artifact parses user NTUSER.DAT hives for HKCU Run/RunOnce values and the
+  SOFTWARE/ntuser-style hives for HKLM Run/RunOnce via the registry accessor,
+  without needing live hive mounting.
+
+reference:
+  - https://attack.mitre.org/techniques/T1547.001/
+
+type: CLIENT
+
+parameters:
+  - name: ValueFilterRegex
+    type: regex
+    default: "."
+  - name: UserFilterRegex
+    type: regex
+    default: "."
+
+sources:
+  - name: HKLM
+    description: HKLM Run/RunOnce values from the SYSTEM-view registry accessor
+    query: |
+      SELECT
+        timestamp(epoch=ModTime) AS ModTime,
+        OSPath AS KeyPath,
+        Name AS ValueName,
+        Value AS ValueData
+      FROM glob(
+        globs=[
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/Run/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Wow6432Node/Microsoft/Windows/CurrentVersion/Run/*",
+          "HKEY_LOCAL_MACHINE/SOFTWARE/Wow6432Node/Microsoft/Windows/CurrentVersion/RunOnce/*"
+        ],
+        accessor="registry")
+      WHERE Name =~ ValueFilterRegex
+
+  - name: HKCU
+    description: Per-user HKCU Run/RunOnce values parsed from NTUSER.DAT files
+    query: |
+      LET NtuserFiles <= SELECT OSPath, Mtime
+        FROM glob(globs="C:/Users/*/NTUSER.DAT")
+        WHERE OSPath =~ UserFilterRegex
+      SELECT
+        timestamp(epoch=Mtime) AS HiveMtime,
+        OSPath AS KeyPath,
+        Name AS ValueName,
+        Value AS ValueData
+      FROM foreach(
+        row=NtuserFiles,
+        query={
+          SELECT OSPath, Name, Value, ModTime
+          FROM chain(
+            a={ SELECT * FROM glob(globs="Software/Microsoft/Windows/CurrentVersion/Run/*", accessor="registry", root=OSPath) },
+            b={ SELECT * FROM glob(globs="Software/Microsoft/Windows/CurrentVersion/RunOnce/*", accessor="registry", root=OSPath) }
+          )
+        })
+      WHERE Name =~ ValueFilterRegex
+
+column_types:
+  - name: ModTime
+    type: timestamp
+  - name: HiveMtime
+    type: timestamp
+  - name: KeyPath
+    type: preview_upload
+  - name: ValueData
+    type: preview_upload
