@@ -1,0 +1,74 @@
+name: Custom.DFIR.SuspectOutboundLongRunning
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for suspicious outbound connections from long-running processes (T1041 - Exfiltration Over C2 Channel).
+
+  Joins live network connections with the process list, keeping only processes
+  that have been running longer than AgeThresholdHours and hold an outbound
+  (ESTABLISHED) connection to a non-private address. Long-lived processes with
+  fresh external connections are a classic beacon / exfiltration pattern. A
+  regex parameter lets the analyst focus on specific process names (default: all).
+
+reference:
+  - https://attack.mitre.org/techniques/T1041/
+
+type: CLIENT
+
+parameters:
+  - name: AgeThresholdHours
+    type: int
+    default: "24"
+  - name: ProcessFilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousPortWhitelistRegex
+    type: regex
+    default: "^(80|443|53)$"
+
+sources:
+  - name: Results
+    description: Long-running processes with outbound external connections
+    query: |
+      LET ThresholdSec <= int(int=AgeThresholdHours) * 3600
+      LET PrivateRegex <= "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.|127\\.|169\\.254\\.|::1|fe80:)"
+      LET Procs <= SELECT Pid, Name, Exe, CommandLine, Username, CreateTime
+           FROM pslist()
+           WHERE Name =~ ProcessFilterRegex
+      LET Conns <= SELECT Pid AS ConnPid, Status,
+             Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+             Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+           FROM netstat()
+           WHERE Raddr.IP
+             AND Status =~ "ESTABLISHED"
+             AND NOT Raddr.IP =~ PrivateRegex
+      SELECT
+             ConnPid AS Pid,
+             Name AS Name,
+             Exe AS Exe,
+             CommandLine AS CommandLine,
+             Username AS Username,
+             CreateTime AS CreateTime,
+             Status AS ConnStatus,
+             RemoteIP AS RemoteIP,
+             RemotePort AS RemotePort,
+             LocalIP AS LocalIP,
+             LocalPort AS LocalPort
+      FROM foreach(
+        row=Procs,
+        query={
+          SELECT ConnPid, Status, LocalIP, LocalPort, RemoteIP, RemotePort
+          FROM Conns
+          WHERE ConnPid = Pid
+        })
+      WHERE CreateTime < now() - ThresholdSec
+        AND NOT RemotePort =~ SuspiciousPortWhitelistRegex
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Exe
+    type: filepath
+  - name: LocalIP
+    type: ip
+  - name: RemoteIP
+    type: ip
