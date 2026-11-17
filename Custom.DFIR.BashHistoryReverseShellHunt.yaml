@@ -1,11 +1,13 @@
 name: Custom.DFIR.BashHistoryReverseShellHunt
 author: Yaniv Radunsky @ tenroot & Hohit (AI)
 description: |
-  Hunt for reverse shell patterns in bash history files across local users on Linux endpoints.
-  
-  This artifact inspects common bash history locations, parses commands line by line,
-  and flags entries matching suspicious reverse shell, shell redirection, and network
-  callback patterns associated with interactive command execution abuse.
+  Hunts for reverse shell patterns in bash history files across all users.
+
+  Attackers with interactive shell access (T1059.004 - Unix Shell) often spawn
+  reverse shells to callback infrastructure. Commands like "bash -i >& /dev/tcp/...",
+  "nc -e /bin/sh", or socat EXEC pipelines leave traces in user .bash_history
+  files. This artifact scans all users' shell history files for such patterns
+  and returns matching command lines with surrounding file metadata for triage.
 
 reference:
   - https://attack.mitre.org/techniques/T1059.004/
@@ -15,75 +17,56 @@ type: CLIENT
 parameters:
   - name: TargetGlob
     type: glob
-    default: "/root/.bash_history,/home/*/.bash_history"
-  - name: FilterRegex
+    default: |
+      ["/root/.bash_history","/root/.zsh_history","/home/*/.bash_history","/home/*/.zsh_history"]
+  - name: ReverseShellRegex
     type: regex
-    default: '(?i)(bash\s+-i|sh\s+-i|nc\s+-e|ncat\s+.*(--exec|-e)|socat\s+.*exec:|/dev/tcp/|mkfifo\s+.*\|\s*(sh|bash)|python(3)?\s+-c\s+.*socket|perl\s+-e\s+.*socket|php\s+-r\s+.*fsockopen|ruby\s+-rsocket|openssl\s+s_client\s+.*\|\s*(sh|bash)|curl\s+.*\|\s*(sh|bash)|wget\s+.*\|\s*(sh|bash))'
-  - name: ContextLines
-    type: int
-    default: 0
-  - name: UploadHits
-    type: bool
-    default: false
+    default: "(bash +-i[^\\n]*>&[^\\n]*/dev/(tcp|udp)/|/dev/(tcp|udp)/|nc [^\\n]*(-e|-c)[^\\n]*sh|socat [^\\n]*EXEC[^\\n]*sh|openssl s_client[^\\n]*(sh|bash)|mkfifo[^\\n]*(nc|netcat))"
+  - name: ExcludeUserRegex
+    type: regex
+    default: "^$"
 
 sources:
   - name: Results
-    description: Parse bash history files and surface lines matching reverse shell patterns.
+    description: Reverse shell command lines found in user shell history files
     query: |
-      LET HistoryFiles <= SELECT OSPath, Size, Mtime
-        FROM glob(globs=split(string=TargetGlob, sep=","))
-        WHERE Size > 0
+      LET Files = SELECT OSPath, Size, Mtime AS FileMtime
+        FROM glob(globs=TargetGlob)
+        WHERE Size > 0 AND NOT OSPath =~ ExcludeUserRegex
 
-      LET ParsedLines <= SELECT
-          OSPath,
-          Size,
-          Mtime,
-          Line,
-          LineNumber
-        FROM foreach(
-          row=HistoryFiles,
-          query={
-            SELECT
-              HistoryFiles.OSPath AS OSPath,
-              HistoryFiles.Size AS Size,
-              HistoryFiles.Mtime AS Mtime,
-              Line,
-              LineNumber
-            FROM split_records(
-              filenames=HistoryFiles.OSPath,
-              regex="\n",
-              columns=["Line"])
-          })
+      SELECT
+        OSPath AS HistoryFile,
+        User,
+        LineNumber,
+        Line,
+        FileMtime
+      FROM foreach(
+        row=Files,
+        query={
+          SELECT
+            OSPath,
+            parse_string_with_regex(
+              string=OSPath,
+              regex="(?:^|home|^root/)([^/]+)/[^/]+$"
+            ).field_0 AS User,
+            LineNumber,
+            Line,
+            FileMtime
+          FROM split_records(
+            filenames=OSPath,
+            regex="\\n",
+            columns=["Line"]
+          )
+          WHERE Line =~ ReverseShellRegex
+        })
 
-      LET Hits <= SELECT
-          OSPath,
-          Size,
-          Mtime,
-          LineNumber,
-          Line,
-          if(condition=Line =~ "^\s*#\d+$", then="HistoryTimestampMarker", else="Command") AS EntryType
-        FROM ParsedLines
-        WHERE Line =~ FilterRegex
-
-      LET Uploaded <= SELECT
-          Hits.OSPath AS OSPath,
-          Hits.Size AS Size,
-          Hits.Mtime AS Mtime,
-          Hits.LineNumber AS LineNumber,
-          Hits.Line AS Line,
-          Hits.EntryType AS EntryType,
-          upload(file=Hits.OSPath) AS Upload
-        FROM Hits
-
-      SELECT * FROM if(
-        condition=UploadHits,
-        then={ SELECT * FROM Uploaded },
-        else={ SELECT OSPath, Size, Mtime, LineNumber, Line, EntryType FROM Hits })
+  - name: FileInventory
+    description: All shell history files examined and their metadata
+    query: |
+      SELECT OSPath, Size, Mtime AS FileMtime
+      FROM glob(globs=TargetGlob)
+      WHERE NOT OSPath =~ ExcludeUserRegex
 
 column_types:
-  - name: OSPath
-    type: path
-  - name: Mtime
+  - name: FileMtime
     type: timestamp
-  - name: LineNumber
-    type: int
