@@ -1,0 +1,106 @@
+name: Custom.DFIR.PythonSitePackagesPersistenceHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for recently installed or modified Python/pip packages in site-packages directories (T1195.001 — Compromise Software Dependencies and Development Tools).
+
+  Attackers abuse pip install and setup.py for persistence: dist-info RECORD tampering, malicious .pth files executed at interpreter startup, and eggs planted in site-packages. This artifact enumerates site-packages locations on Linux, macOS and Windows, flags packages modified within a time window, hashes new or modified files, and surfaces suspicious .pth/.dist-info/egg content.
+
+reference:
+  - https://attack.mitre.org/techniques/T1195.001/
+
+type: CLIENT
+
+parameters:
+  - name: SitePackagesGlob
+    type: glob
+    description: Glob for site-packages directories (multi-platform).
+    default: |
+      ["/usr/lib/python*/site-packages/**",
+       "/usr/lib/python3/dist-packages/**",
+       "/usr/local/lib/python*/dist-packages/**",
+       "/usr/local/lib/python*/site-packages/**",
+       "/opt/*/lib/python*/site-packages/**",
+       "/home/*/.local/lib/python*/site-packages/**",
+       "/Library/Python/*/lib/python/site-packages/**",
+       "C:/Program Files/Python*/Lib/site-packages/**",
+       "C:/Users/*/AppData/Local/Programs/Python/**/site-packages/**",
+       "C:/Python*/Lib/site-packages/**"]
+  - name: PathFilterRegex
+    type: regex
+    description: Only include entries whose OSPath matches this regex (empty matches all).
+    default: "."
+  - name: NameExcludeRegex
+    type: regex
+    description: Exclude paths matching this regex (e.g. compiler caches).
+    default: "__pycache__|\\.pyc$"
+  - name: AgeThresholdHours
+    type: int
+    description: Flag files modified/created within this many hours.
+    default: 168
+  - name: HashFiles
+    type: bool
+    description: Compute MD5/SHA256 for flagged files.
+    default: false
+  - name: PthInspectRegex
+    type: regex
+    description: Patterns to flag as suspicious inside .pth file contents.
+    default: "(?i)(import|exec|eval|__import__|subprocess|urllib|socket|http)"
+  - name: SuspiciousNamesRegex
+    type: regex
+    description: Flag suspicious filenames anywhere in site-packages.
+    default: "(?i)(\\.pth$|\\.egg$|\\.egg-info|\\.dist-info|setup\\.py$|sitecustomize\\.py$|usercustomize\\.py$)"
+
+sources:
+  - name: RecentFiles
+    description: Files under site-packages modified/created within the age window.
+    query: |
+      LET Cutoff <= timestamp(epoch=now() - (AgeThresholdHours * 3600))
+      LET Files <= SELECT OSPath,
+        Size, Mtime AS ModTime, Btime AS CreateTime, Attime AS AccessTime
+        FROM glob(globs=SitePackagesGlob, accessor="file")
+        WHERE NOT IsDir AND OSPath =~ PathFilterRegex
+          AND NOT OSPath =~ NameExcludeRegex
+          AND (Mtime > Cutoff OR Btime > Cutoff)
+      SELECT OSPath, Size, ModTime, CreateTime,
+        if(condition=HashFiles,
+           then=hash(path=OSPath, hashselect="MD5,SHA256")) AS Hash
+      FROM Files
+      ORDER BY ModTime DESC
+
+  - name: SuspiciousNames
+    description: Suspicious filenames (.pth, egg, dist-info, setup.py, sitecustomize).
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime AS ModTime
+        FROM glob(globs=SitePackagesGlob, accessor="file")
+        WHERE NOT IsDir AND NOT OSPath =~ NameExcludeRegex
+      SELECT OSPath, Size, ModTime
+      FROM Files
+      WHERE basename(path=OSPath) =~ SuspiciousNamesRegex
+        AND OSPath =~ PathFilterRegex
+
+  - name: PthSuspiciousContent
+    description: .pth files whose content matches suspicious patterns (executed at interpreter startup).
+    query: |
+      LET Files <= SELECT OSPath, Size, Mtime AS ModTime
+        FROM glob(globs=SitePackagesGlob, accessor="file")
+        WHERE NOT IsDir AND basename(path=OSPath) =~ "\\.pth$"
+          AND OSPath =~ PathFilterRegex AND NOT OSPath =~ NameExcludeRegex
+      LET PthPaths <= SELECT OSPath AS Path FROM Files
+      SELECT OSPath, ModTime, Size,
+        read_file(filename=Path, length=4096) AS Content
+      FROM PthPaths
+      WHERE Content =~ PthInspectRegex
+
+column_types:
+  - name: OSPath
+    type: preview_upload
+  - name: ModTime
+    type: timestamp
+  - name: CreateTime
+    type: timestamp
+  - name: AccessTime
+    type: timestamp
+  - name: Size
+    type: int
+  - name: Hash
+    type: md5
