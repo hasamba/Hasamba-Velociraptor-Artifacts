@@ -1,0 +1,84 @@
+name: Custom.DFIR.TunnelingToolUsage
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for evidence of port forwarding / tunneling tools (T1572): chisel,
+  socat, plink, ngrok and similar utilities running on the endpoint.
+
+  Checks three angles: (1) live or recently-run processes with tunneling
+  tool names, (2) processes with tunnel-style CLI arguments such as
+  remote/local forwarding flags, and (3) artifacts left on disk -
+  tunneling binaries and ngrok config/log files, with hashes.
+  Cross-platform; the on-disk glob defaults to Windows paths and accepts
+  a TargetGlob override.
+
+reference:
+  - https://attack.mitre.org/techniques/T1572/
+
+type: CLIENT
+
+parameters:
+  - name: ToolNameRegex
+    type: regex
+    default: "(?i)(chisel|ngrok|socat|plink| stunnel|frpc|frps|revsocks|iox)"
+  - name: SuspiciousArgRegex
+    type: regex
+    default: "(?i)(\\b[RL]\\s?:?\\s?[0-9]+:|socks|tunnel|forward|ngrok\\.(?:com|io)|\\.ngrok2|\\.plink)"
+  - name: TargetGlob
+    type: glob
+    default: "C:/Windows/**/{chisel,ngrok,socat,plink,stunnel,frpc,frps,iox,revsocks}*.exe"
+
+sources:
+  - name: RunningProcesses
+    description: Live processes whose executable or command line matches a known tunneling tool.
+    query: |
+      LET Procs = SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+        WHERE Exe =~ ToolNameRegex OR CommandLine =~ ToolNameRegex
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+      FROM Procs
+
+  - name: TunnelEstablished
+    description: Matching processes with live ESTABLISHED remote connections (typical of active tunnels).
+    query: |
+      LET Procs = SELECT Pid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist()
+        WHERE Exe =~ ToolNameRegex OR CommandLine =~ ToolNameRegex
+      LET Net = SELECT Pid, Status,
+        format(format='%v:%v', args=[Laddr.IP, Laddr.Port]) AS LocalAddr,
+        format(format='%v:%v', args=[Raddr.IP, Raddr.Port]) AS RemoteAddr
+        FROM netstat()
+        WHERE Status =~ 'ESTABLISHED'
+             AND NOT (Raddr.IP =~ '^(127[.]|0[.]0[.]0[.]0$|::1)')
+      SELECT Procs.Pid AS Pid, Procs.Name AS Name, Procs.Exe AS Exe,
+             Procs.CommandLine AS Commandline, Procs.Username AS Username,
+             Procs.CreateTime AS CreateTime, Net.LocalAddr AS LocalAddr,
+             Net.RemoteAddr AS RemoteAddr, Net.Status AS Status
+      FROM Procs WHERE Net
+
+  - name: TunnelArgMatches
+    description: Any process carrying tunnel-style arguments (local/remote forward flags, socks, ngrok endpoints).
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+      FROM pslist()
+      WHERE CommandLine =~ SuspiciousArgRegex
+
+  - name: OnDiskArtifacts
+    description: Tunneling binaries and ngrok config/log files on disk, with hashes.
+    query: |
+      LET Binaries = SELECT OSPath, Mtime, Size, 'binary' AS Kind
+        FROM glob(globs=TargetGlob)
+      LET NgrokPaths = SELECT OSPath, Mtime, Size, 'ngrok_config_or_log' AS Kind
+        FROM glob(globs='C:/Users/*/.ngrok2/*')
+      SELECT Kind, OSPath, Size, Mtime,
+             hash(path=OSPath, hashselect='MD5,SHA256') AS Hash
+      FROM chain(a=Binaries, b=NgrokPaths)
+
+column_types:
+  - name: CreateTime
+    type: timestamp
+  - name: Mtime
+    type: timestamp
+  - name: OSPath
+    type: lr_string
+  - name: Hash
+    type: hash

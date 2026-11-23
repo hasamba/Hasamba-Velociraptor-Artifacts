@@ -1,0 +1,105 @@
+name: Custom.DFIR.TimestompingMtimeMismatch
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect timestomping (T1070.006) by comparing file MAC times against intrinsic metadata timestamps.
+
+  Timestomping tools (e.g. timestomp, SetFileTime API abuse) rewrite the on-disk
+  $STANDARD_INFORMATION timestamps, but the NTFS $FILE_NAME attribute in the MFT records
+  true create/modify times maintained by the file system and is not touched by SetFileTime.
+  Comparing $SI vs $FN timestamps exposes forged dates. For PE files, the linker
+  TimeDateStamp in the PE header (set at build time) compared against disk mtime exposes
+  files whose timestamps were moved. Cross-platform: the PE source works anywhere; the
+  $MFT source is Windows-only.
+
+reference:
+  - https://attack.mitre.org/techniques/T1070.006/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    description: Files to inspect for the PE build-time check.
+    default: "C:/Windows/System32/**/*.exe"
+
+  - name: FilterRegex
+    type: regex
+    description: Only report files whose OSPath matches this regex.
+    default: "."
+
+  - name: MftPath
+    type: string
+    description: |
+      The MFT to parse for SI vs FN timestamp comparison. Empty disables that source.
+    default: "C:/$MFT"
+
+  - name: TimeThresholdSeconds
+    type: int64
+    description: Minimum SI-vs-FN (or content-vs-disk) discrepancy in seconds.
+    default: "1800"
+
+sources:
+  - name: SIvsFN
+    description: |
+      Compare $STANDARD_INFORMATION timestamps (forgeable via SetFileTime) with
+      $FILE_NAME timestamps (MFT-managed, untouched by timestomping tools) using
+      parse_ntfs_mft. Report any file where the two disagree by more than the threshold,
+      in either direction.
+    query: |
+      LET Threshold <= TimeThresholdSeconds
+      SELECT FullPath AS OSPath,
+             FileSize AS Size,
+             SI.modification_time AS SIModified,
+             FN.modification_time AS FNModified,
+             SI.creation_time AS SICreated,
+             FN.creation_time AS FNCreated
+      FROM parse_mft(filename=MftPath)
+      WHERE NOT SI.modification_time.IsZero()
+        AND NOT FN.modification_time.IsZero()
+        AND FullPath =~ FilterRegex
+        AND (
+          SI.modification_time.Unix - FN.modification_time.Unix > Threshold
+          OR FN.modification_time.Unix - SI.modification_time.Unix > Threshold
+        )
+
+  - name: PEBuildTimeMismatch
+    description: |
+      For PE files, compare the linker TimeDateStamp inside the PE header (set at build
+      time) against the file's on-disk modification time. A forged mtime will not match
+      the embedded build time by more than the threshold.
+    query: |
+      LET Threshold <= TimeThresholdSeconds
+      LET Files <= SELECT OSPath, Size, Mtime
+             FROM glob(globs=TargetGlob)
+             WHERE NOT IsDir AND Size > 0
+      SELECT OSPath,
+             Size,
+             Mtime AS FileModified,
+            timestamp(epoch=PE.time_date_stamp) AS PEBuildTime
+      FROM foreach(row=Files,
+        query={ SELECT OSPath, Size, Mtime, parse_pe(file=OSPath) AS PE
+                FROM scope() })
+      WHERE PE.time_date_stamp != 0
+        AND OSPath =~ FilterRegex
+        AND Mtime.Unix - PE.time_date_stamp > Threshold
+        AND PE.time_date_stamp > 0
+        AND (Mtime.Unix - PE.time_date_stamp > Threshold
+             OR PE.time_date_stamp - Mtime.Unix > Threshold)
+
+column_types:
+  - name: OSPath
+    type: lr_string
+  - name: SIModified
+    type: timestamp
+  - name: FNModified
+    type: timestamp
+  - name: SICreated
+    type: timestamp
+  - name: FNCreated
+    type: timestamp
+  - name: FileModified
+    type: timestamp
+  - name: PEBuildTime
+    type: timestamp
+  - name: Size
+    type: int64
