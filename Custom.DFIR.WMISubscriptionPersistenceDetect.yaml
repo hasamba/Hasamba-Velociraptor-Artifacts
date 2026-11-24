@@ -1,0 +1,88 @@
+name: Custom.DFIR.WMISubscriptionPersistenceDetect
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detect WMI subscription persistence (event filters, consumers, bindings) in the Windows registry and MOF files.
+
+  WMI event subscription persistence (T1546.003) abuses __EventFilter, __EventConsumer
+  (CommandLineEventConsumer / ActiveScriptEventConsumer) and __FilterToConsumerBinding
+  objects stored under HKLM\SOFTWARE\Microsoft\Wbem\CIMOM and HKLM\SOFTWARE\Classes (via
+  the CIM repository) to run arbitrary code on events such as boot or interval timers.
+  Attackers may also drop compiled .mof files that register these subscriptions and
+  store .mof/.mfl payloads on disk. This artifact enumerates registry artifacts of
+  permanent subscriptions, flags suspicious consumer command lines/scripts, checks
+  bindings that tie filters to consumers, and scans Wbem directories for
+  suspicious .mof/.mfl files containing registration keywords.
+
+reference:
+  - https://attack.mitre.org/techniques/T1546.003/
+
+type: CLIENT
+
+parameters:
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+  - name: ConsumerPathRegex
+    type: regex
+    default: "__(EVENTCONSUMER|EVENTFILTER|FILTERTOCONSUMERBINDING)"
+
+  - name: ConsumerScriptRegex
+    type: regex
+    default: "(?i)(powershell|cmd\\.exe|wscript|cscript|rundll32|regsvr32|mshta|bitsadmin|certutil|FromBase64String|-enc |download)|(?i)(VBScript|JScript)"
+
+  - name: MofGlob
+    type: glob
+    default: "C:/Windows/System32/wbem/**/*.mo[f]"
+
+  - name: UploadMof
+    type: bool
+    default: "N"
+
+sources:
+  - name: RegistrySubscriptionObjects
+    description: |
+      WMI CIMOM registry objects related to event subscriptions (filters,
+      consumers, bindings) whose key/value names match ConsumerPathRegex.
+    query: |
+      LET RegRows <= SELECT OSPath AS RegPath,
+                            Key.OSPath AS KeyPath,
+                            Name AS ValueName,
+                            Data.value AS ValueData,
+                            timestamp(epoch=Key.mtime) AS Mtime
+        FROM read_reg_key(globs="HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Wbem/CIMOM/**/*", accessor="registry")
+      SELECT RegPath, KeyPath, ValueName, ValueData, Mtime
+      FROM RegRows
+      WHERE ValueName =~ ConsumerPathRegex
+        AND ValueName =~ FilterRegex
+
+  - name: SuspiciousConsumers
+    description: |
+      CommandLineEventConsumer and ActiveScriptEventConsumer instances recovered
+      from the CIMOM registry hive with suspicious command lines or scripts.
+    query: |
+      LET Hive = "C:/Windows/System32/wbem/Repository/OBJECTS.DATA"
+      LET Hits <= SELECT parse_string_with_regex(
+              string=read_file(filename=Hive, accessor="file", length=536870912),
+              regex="(?i)CommandLineTemplate(?P<cmd>[^\\x00]{3,2048})"
+            ) AS Match
+        FROM scope()
+      SELECT Match.cmd AS SuspiciousCommandLine
+      FROM Hits
+      WHERE Match.cmd =~ FilterRegex
+
+  - name: MofFiles
+    description: |
+      .mof/.mfl files under wbem directories whose content registers WMI
+      subscriptions (EventFilter / EventConsumer / FilterToConsumerBinding).
+    query: |
+      LET MofRows <= SELECT OSPath,
+                            Size,
+                            timestamp(epoch=Mtime) AS Mtime,
+                            read_file(filename=OSPath, length=262144) AS Content
+        FROM glob(globs=MofGlob)
+      SELECT OSPath, Size, Mtime,
+             Content =~ "(?i)(EventFilter|EventConsumer|FilterToConsumerBinding)" AS LooksLikeSubscription,
+             hash(path=OSPath, hashselect="MD5,SHA256") AS Hashes
+      FROM MofRows
+      WHERE Content =~ FilterRegex
