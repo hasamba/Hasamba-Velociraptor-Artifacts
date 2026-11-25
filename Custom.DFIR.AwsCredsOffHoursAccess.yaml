@@ -1,0 +1,82 @@
+name: Custom.DFIR.AwsCredsOffHoursAccess
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunts for AWS credential files accessed outside normal working hours.
+
+  Locates common AWS credential and config files (credentials, config, sso
+  cache, .env) under user profile directories on Windows, Linux, and macOS,
+  then flags any file whose modification time falls outside a configurable
+  normal working window. Off-hours mtime on credential files is a strong
+  indicator of interactive credential theft or staging (T1552.001 -
+  Unsecured Credentials: Credentials In Files).
+
+reference:
+  - https://attack.mitre.org/techniques/T1552.001/
+
+type: CLIENT
+
+parameters:
+  - name: TargetGlob
+    type: glob
+    description: Glob patterns for AWS credential-related files.
+    default: |
+      [
+        "C:/Users/*/.aws/**",
+        "C:/Users/*/.env",
+        "/home/*/.aws/**",
+        "/home/*/.env",
+        "/Users/*/.aws/**",
+        "/Users/*/.env"
+      ]
+  - name: FilterRegex
+    type: regex
+    description: Restrict file names to credential-related ones.
+    default: "(credentials|config|\\.env$|\\.json$)"
+  - name: ExcludeRegex
+    type: regex
+    description: Skip noisy or irrelevant paths.
+    default: "node_modules|\\.cache/"
+  - name: WorkDayStartHour
+    type: int
+    description: Start of the normal working window (local hour, inclusive).
+    default: "7"
+  - name: WorkDayEndHour
+    type: int
+    description: End of the normal working window (local hour, exclusive).
+    default: "20"
+  - name: UploadContent
+    type: bool
+    description: Also collect file hashes and first 4KB of content.
+    default: "Y"
+
+sources:
+  - name: Results
+    description: |
+      Credential files whose Mtime falls outside the working window.
+    query: |
+      LET Files <= SELECT OSPath,
+             Size,
+             Mtime,
+             Atime
+      FROM glob(globs=TargetGlob)
+      WHERE NOT IsDir
+        AND OSPath =~ FilterRegex
+        AND NOT OSPath =~ ExcludeRegex
+
+      SELECT OSPath,
+             Size,
+             Mtime,
+             Atime,
+             if(condition=UploadContent,
+                then=hash(path=OSPath, hashselect="MD5,SHA256").SHA256) AS SHA256,
+             if(condition=UploadContent,
+                then=read_file(filename=OSPath, length=4096)) AS Content
+      FROM Files
+      WHERE Mtime.Hour < WorkDayStartHour
+         OR Mtime.Hour >= WorkDayEndHour
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
