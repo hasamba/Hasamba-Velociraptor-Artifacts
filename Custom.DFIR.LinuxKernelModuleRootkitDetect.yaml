@@ -1,0 +1,78 @@
+name: Custom.DFIR.LinuxKernelModuleRootkitDetect
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Detects loaded kernel modules and gathers rootkit loading artifacts from /proc and module metadata.
+  Enumerates loaded modules via /proc/modules, cross-checks module file metadata from /sys/module,
+  and inspects /proc/kallsyms and /proc/sys/kernel for signs of hidden or tampered modules (MITRE T1014).
+
+reference:
+  - https://attack.mitre.org/techniques/T1014/
+
+type: CLIENT
+
+parameters:
+  - name: ModuleFilterRegex
+    type: regex
+    default: "."
+  - name: SuspiciousNameRegex
+    type: regex
+    default: "(?i)(rootkit|hide|hidden|stealth|diamorphine|reptile|kprobe|rknit|suterusu|morph|hook)"
+
+sources:
+  - name: LoadedModules
+    description: Loaded kernel module list from /proc/modules
+    query: |
+      LET Lines = SELECT parse_string_with_regex(string=Line,
+            regex=['^(?P<Module>\\S+)\\s+(?P<Size>\\d+)\\s+(?P<UsedBy>\\S+)'] ) AS Rec
+        FROM split_records(filenames='/proc/modules', regex='\\n', columns=['Line'])
+      SELECT Rec.Module AS Module,
+             Rec.Size AS Size,
+             Rec.UsedBy AS UsedBy,
+             Rec.Module =~ SuspiciousNameRegex AS SuspiciousName
+      FROM Lines
+      WHERE Module =~ ModuleFilterRegex
+
+  - name: SysfsModuleMetadata
+    description: Module metadata from /sys/module, including refcount and load-time state
+    query: |
+      LET Names = SELECT OSPath.Basename AS Module FROM glob(globs='/sys/module/*')
+      SELECT Module,
+             Module =~ SuspiciousNameRegex AS SuspiciousName
+      FROM Names
+      WHERE Module =~ ModuleFilterRegex
+
+  - name: KallsymsHooks
+    description: Inspect /proc/kallsyms for suspicious hooked syscalls and module-owned symbols
+    query: |
+      LET K = SELECT Line FROM split_records(filenames='/proc/kallsyms',
+            regex='\\n', columns=['Line'])
+      SELECT parse_string_with_regex(string=Line,
+            regex=['^(?P<Address>\\S+)\\s+(?P<Type>\\S+)\\s+(?P<Symbol>\\S+)\\s+\\[(?P<Owner>[^\\]]+)\\]']) AS Rec
+      FROM K
+      WHERE Rec.Symbol =~ SuspiciousNameRegex OR Rec.Owner =~ SuspiciousNameRegex
+
+  - name: ModuleLoadHistory
+    description: System logs referencing module loads (auditd / syslog / journals) for T1014 evidence
+    query: |
+      LET LogPaths = SELECT OSPath FROM glob(globs=['/var/log/syslog*', '/var/log/messages*', '/var/log/kern.log*', '/var/log/audit/audit.log*'])
+      SELECT OSPath,
+             Line
+      FROM foreach(row=LogPaths,
+        query={ SELECT OSPath, Line FROM split_records(filenames=OSPath, regex='\\n', columns=['Line'])
+                WHERE Line =~ '(?i)(installs?ed?.*module|load.*module|insmod|modprobe|kernel.*module)' })
+      WHERE Line =~ ModuleFilterRegex
+
+  - name: ModulesFiles
+    description: Module definition artifacts under /etc (modules-load, modules.conf) that persist kernel module loading
+    query: |
+      LET Files = SELECT OSPath, Size, Mtime FROM glob(globs=['/etc/modules', '/etc/modules-load/*', '/etc/modprobe.d/*'])
+      SELECT OSPath, Size, Mtime,
+             read_file(filename=OSPath, length=4096) AS Content
+      FROM Files
+      WHERE Size > 0
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Size
+    type: number
