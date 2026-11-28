@@ -1,0 +1,84 @@
+name: Custom.DFIR.SysmonLsassAccessHunt
+author: Yaniv Radunsky @ tenroot & Hohit (AI)
+description: |
+  Hunt for evidence of credential dumping via LSASS memory access (T1003.001) in Sysmon logs.
+
+  Detects Sysmon EventID 10 (ProcessAccess) where the target process is lsass.exe
+  and the requested GrantedAccess mask includes process-VM read (0x0010), process
+  VM operation (0x0020), or the classic 0x1FFFFF full access commonly used by
+  tools like Mimikatz, comsvcs MiniDump, and similar dumpers.
+
+  Forensic value: correlates the accessing process, source image, call trace,
+  and user context to distinguish legitimate security tooling from dumping tools.
+
+reference:
+  - https://attack.mitre.org/techniques/T1003.001/
+
+type: CLIENT
+
+parameters:
+  - name: SysmonGlob
+    type: glob
+    default: "C:/Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx"
+
+  - name: FilterRegex
+    type: regex
+    default: "."
+
+  - name: HighRiskAccessMaskRegex
+    type: regex
+    default: "0x(1fffff|fffaf|1010|101|110|1[0-9a-f]1f|.*10|.*20)$"
+
+  - name: SuspiciousSourceImageRegex
+    type: regex
+    default: "(?i)mimikatz|comsvcs|dump|powershell|wmi|cmd\\.exe|rundll32"
+
+sources:
+  - name: Results
+    description: Sysmon ProcessAccess (EventID 10) events targeting lsass.exe, with risk filtering.
+    query: |
+      LET SysmonLogs <= SELECT OSPath FROM glob(globs=SysmonGlob)
+
+      LET LsassAccess <= SELECT
+        EventTime,
+        Computer,
+        EventData.Image AS Image,
+        EventData.SourceImage AS SourceImage,
+        EventData.SourceProcessGUID AS SourceProcessGUID,
+        EventData.TargetImage AS TargetImage,
+        EventData.GrantedAccess AS GrantedAccess,
+        EventData.CallTrace AS CallTrace,
+        EventData.SourceUser AS SourceUser,
+        EventData.TargetUser AS TargetUser
+      FROM foreach(
+        row=SysmonLogs,
+        query={
+          SELECT System.TimeCreated.SystemTime AS EventTime,
+                 System.Computer AS Computer,
+                 EventData
+          FROM parse_evtx(filename=OSPath)
+          WHERE System.EventID.Value = 10
+            AND EventData.TargetImage =~ "(?i)lsass\\.exe"
+        })
+
+      SELECT
+        EventTime,
+        Computer,
+        SourceImage,
+        Image,
+        GrantedAccess,
+        SourceUser,
+        TargetUser,
+        CallTrace
+      FROM LsassAccess
+      WHERE GrantedAccess =~ HighRiskAccessMaskRegex
+        AND (SourceImage =~ FilterRegex OR FilterRegex = ".")
+      ORDER BY EventTime
+
+column_types:
+  - name: EventTime
+    type: timestamp
+  - name: SourceImage
+    type: path
+  - name: Image
+    type: path
